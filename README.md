@@ -108,6 +108,17 @@ When `AUTH_TOKEN` is not set, `pair` / `serve` reuse or generate `.cloudex-state
 | `HOST` | `0.0.0.0` | Listening address |
 | `AUTH_TOKEN` | auto-generated | Bearer token for the API; required for non-loopback access |
 | `CODEX_BIN` | auto-detected | Path to the Codex CLI executable |
+| `CLOUDEX_AGENT_PROVIDER` | Auto-detected | Select `codex`, `qwen`, `claude`, `both`, or `all` |
+| `QWEN_BIN` | `qwen` on `PATH` | Path to the Qwen Code executable |
+| `QWEN_MODELS` | unset | Comma-separated Qwen model IDs |
+| `QWEN_DEFAULT_MODEL` | first `QWEN_MODELS` entry | Default model for new Qwen sessions |
+| `QWEN_COMMAND_ARGS` | `--output-format stream-json --prompt` | Headless Qwen arguments |
+| `QWEN_RESUME_ARGS` | `-r {sessionId}` | Resume arguments; `{sessionId}` is replaced with the Qwen session ID |
+| `CLAUDE_BIN` | `claude` on `PATH` | Path to the Claude Code executable |
+| `CLAUDE_MODELS` | unset | Comma-separated Claude model IDs |
+| `CLAUDE_DEFAULT_MODEL` | unset | Default model for new Claude sessions |
+| `CLAUDE_COMMAND_ARGS` | `--print --output-format stream-json --verbose` | Headless Claude arguments |
+| `CLAUDE_RESUME_ARGS` | `--resume {sessionId}` | Resume arguments; `{sessionId}` is replaced with the Claude session ID |
 | `FILE_ROOTS` | current directory | Root paths browsable from the phone (path-delimiter separated, `;` on Windows) |
 | `CLOUDEX_PUBLIC_URL` | auto-inferred | Fixed server URL shown in the QR code |
 | `CLOUDEX_STATE_DIR` | `.cloudex-state` | State directory for the token, approval history, etc. |

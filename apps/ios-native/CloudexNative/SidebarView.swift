@@ -170,6 +170,9 @@ struct CloudexRootView: View {
             .scrollDismissesKeyboard(.interactively)
             .navigationTitle("Cloudex")
             .navigationBarTitleDisplayMode(.inline)
+            .safeAreaInset(edge: .top, spacing: 4) {
+                agentProviderSwitcher
+            }
             .toolbar {
                 rootToolbar
                 homeTitleToolbar
@@ -331,6 +334,9 @@ struct CloudexRootView: View {
                 rootToolbar
                 homeTitleToolbar
             }
+            .safeAreaInset(edge: .top, spacing: 4) {
+                agentProviderSwitcher
+            }
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 conversationSearchBar(isWindowedIPad: windowed, bottomSafeArea: bottomSafeArea)
             }
@@ -339,12 +345,42 @@ struct CloudexRootView: View {
     @ToolbarContentBuilder
     private var rootToolbar: some ToolbarContent {
         ToolbarItem(placement: .topBarLeading) {
+            Menu {
+                if viewModel.serverProfiles.isEmpty {
+                    Text("暂无已保存服务器")
+                } else {
+                    ForEach(viewModel.serverProfiles) { profile in
+                        Button {
+                            Task { await viewModel.switchToServerProfile(profile) }
+                        } label: {
+                            Label(profile.name, systemImage: viewModel.selectedServerProfileID == profile.id ? "checkmark" : "server.rack")
+                        }
+                    }
+                }
+                Divider()
+                Button {
+                    showingSettings = true
+                } label: {
+                    Label("管理服务器", systemImage: "slider.horizontal.3")
+                }
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "server.rack")
+                    Text(viewModel.serverProfileTitle)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .font(.caption.weight(.semibold))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+            }
+            .accessibilityLabel("切换服务器")
+        }
+        ToolbarItemGroup(placement: .topBarTrailing) {
             Button { showingQRCodeScanner = true } label: {
                 Image(systemName: "qrcode.viewfinder")
             }
             .accessibilityLabel("扫描服务器二维码")
-        }
-        ToolbarItem(placement: .topBarTrailing) {
             Button { showingSettings = true } label: {
                 Image(systemName: "gearshape")
             }
@@ -441,9 +477,11 @@ struct CloudexRootView: View {
         showingQRCodeScanner = false
         Task {
             let mode = payload.preferredConnectionMode
-            await viewModel.applySettings(
-                lanServerURL: mode == .lan ? payload.serverURL : viewModel.lanServerURL,
-                tailscaleServerURL: mode == .tailscale ? payload.serverURL : viewModel.tailscaleServerURL,
+            await viewModel.saveServerProfile(
+                id: nil,
+                name: "",
+                lanURL: mode == .lan ? payload.serverURL : viewModel.lanServerURL,
+                tailscaleURL: mode == .tailscale ? payload.serverURL : viewModel.tailscaleServerURL,
                 connectionMode: mode,
                 token: payload.token
             )
@@ -452,7 +490,7 @@ struct CloudexRootView: View {
 
     private var filteredProjects: [CloudexProject] {
         let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        return viewModel.projects.compactMap { project in
+        return viewModel.agentProjects.compactMap { project in
             let threads = project.threads
                 .filter { thread in
                     !viewModel.isPinned(thread.id)
@@ -480,7 +518,7 @@ struct CloudexRootView: View {
     }
 
     private var iPadProjects: [CloudexProject] {
-        viewModel.projects.sorted { lhs, rhs in
+        viewModel.agentProjects.sorted { lhs, rhs in
             if lhs.isNoProjectLike != rhs.isNoProjectLike {
                 return !lhs.isNoProjectLike
             }
@@ -535,7 +573,7 @@ struct CloudexRootView: View {
 
     private var pinnedConversations: [PinnedConversation] {
         let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        return viewModel.projects
+        return viewModel.agentProjects
             .flatMap { project in
                 project.threads.map { PinnedConversation(project: project, thread: $0) }
             }
@@ -971,6 +1009,44 @@ struct CloudexRootView: View {
         .animation(.easeInOut(duration: 0.2), value: searchFieldFocused)
     }
 
+    private var agentProviderSwitcher: some View {
+        Group {
+            if viewModel.availableAgentProviders.count > 1 {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 7) {
+                        ForEach(viewModel.availableAgentProviders) { provider in
+                            Button {
+                                withAnimation(.easeInOut(duration: 0.18)) {
+                                    viewModel.selectAgentProvider(provider)
+                                }
+                            } label: {
+                                Text(provider.title)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(viewModel.selectedAgentProvider == provider ? .primary : .secondary)
+                                    .padding(.horizontal, 11)
+                                    .padding(.vertical, 7)
+                            }
+                            .buttonStyle(.plain)
+                            .contentShape(Capsule())
+                            .liquidGlass(
+                                in: Capsule(),
+                                interactive: true,
+                                tint: viewModel.selectedAgentProvider == provider
+                                    ? Color.accentColor.opacity(0.2)
+                                    : nil
+                            )
+                            .accessibilityLabel("切换到\(provider.title)对话")
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 3)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .background(.clear)
+    }
+
 }
 
 private struct PinnedConversation: Identifiable, Equatable {
@@ -1250,10 +1326,10 @@ struct SidebarView: View {
                 }
             }
             .onAppear {
-                snapshot = SidebarSnapshot(projects: viewModel.projects)
+                snapshot = SidebarSnapshot(projects: viewModel.agentProjects)
             }
             .onReceive(viewModel.$projects.removeDuplicates()) { projects in
-                snapshot = SidebarSnapshot(projects: projects)
+                snapshot = SidebarSnapshot(projects: viewModel.agentProjects)
             }
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {

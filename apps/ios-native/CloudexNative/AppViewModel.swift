@@ -8,6 +8,7 @@ final class AppViewModel: ObservableObject {
     @Published var tailscaleServerURL: String
     @Published var connectionMode: ConnectionMode
     @Published var authToken: String
+    @Published var selectedAgentProvider: AgentProvider
     @Published var selectedModelID: String
     @Published var selectedEffortID: String
     @Published var codexMode: CodexExecutionMode
@@ -47,6 +48,8 @@ final class AppViewModel: ObservableObject {
     @Published var notifyTaskSuccess: Bool
     @Published var notifyTaskFailure: Bool
     @Published private(set) var connectionHistory: [ConnectionHistoryItem] = []
+    @Published private(set) var serverProfiles: [ServerProfile] = []
+    @Published var selectedServerProfileID: String?
 
     private let globalSSE = SSEClient()
     private let threadSSE = SSEClient()
@@ -90,7 +93,10 @@ final class AppViewModel: ObservableObject {
         // The Codex CLI config is authoritative on each launch. An in-app
         // selection still applies for the current run and subsequent turns.
         selectedModelID = ""
-        selectedEffortID = defaults.string(forKey: "cloudex.effort") ?? ""
+        selectedAgentProvider = AgentProvider(rawValue: defaults.string(forKey: "cloudex.agentProvider") ?? "") ?? .codex
+        selectedEffortID = defaults.bool(forKey: "cloudex.effort.userSelected")
+            ? (defaults.string(forKey: "cloudex.effort") ?? "")
+            : ""
         draft = defaults.string(forKey: "cloudex.draft") ?? ""
         pendingSteerDraft = defaults.string(forKey: "cloudex.pendingSteerDraft") ?? ""
         codexMode = CodexExecutionMode(
@@ -107,19 +113,63 @@ final class AppViewModel: ObservableObject {
         defaults.set(authToken, forKey: "cloudex.authToken")
         projects = conversationCache.loadProjects() ?? []
         connectionHistory = Self.loadConnectionHistory(defaults: defaults)
+        serverProfiles = Self.loadServerProfiles(defaults: defaults)
+        if serverProfiles.isEmpty {
+            serverProfiles = connectionHistory.map { item in
+                let lan = item.connectionMode == .tailscale ? "" : item.serverURL
+                let tailscale = item.connectionMode == .tailscale ? item.serverURL : ""
+                return ServerProfile(
+                    name: Self.serverName(for: item.serverURL),
+                    lanURL: lan,
+                    tailscaleURL: tailscale,
+                    token: item.token,
+                    connectionMode: item.connectionMode,
+                    lastUsedAt: item.lastUsedAt
+                )
+            }
+            persistServerProfiles(defaults: defaults)
+        }
+        selectedServerProfileID = defaults.string(forKey: "cloudex.selectedServerProfileID") ?? serverProfiles.first?.id
+        if let profile = activeServerProfile {
+            lanServerURL = profile.lanURL.isEmpty ? lanServerURL : profile.lanURL
+            tailscaleServerURL = profile.tailscaleURL.isEmpty ? tailscaleServerURL : profile.tailscaleURL
+            connectionMode = profile.connectionMode
+            authToken = profile.token
+            serverURL = profile.activeURL.isEmpty ? profile.preferredURL : profile.activeURL
+        }
         rebuildRenderedMessages()
     }
 
     var client: APIClient { APIClient(serverURL: serverURL, token: authToken) }
+    var activeServerProfile: ServerProfile? {
+        serverProfiles.first { $0.id == selectedServerProfileID }
+    }
+    var serverProfileTitle: String {
+        activeServerProfile?.name ?? activeConnectionTitle
+    }
     var activeConnectionTitle: String {
         serverURL == normalizedURL(tailscaleServerURL) ? "Tailscale" : cloudexLocalized("局域网")
     }
     var selectedProject: CloudexProject? { projects.first { $0.cwd == selectedProjectCWD } }
     var selectedThread: CloudexThread? { detail?.thread }
     var allThreads: [CloudexThread] { projects.flatMap(\.threads) }
+    var availableAgentProviders: [AgentProvider] {
+        let found = Set(allThreads.map(\.agentProvider)).union(models.map(\.agentProvider))
+        return AgentProvider.allCases.filter { found.contains($0) || $0 == selectedAgentProvider }
+    }
+    var agentProjects: [CloudexProject] {
+        projects.compactMap { project in
+            let threads = project.threads.filter { $0.agentProvider == selectedAgentProvider }
+            guard !threads.isEmpty else { return nil }
+            return CloudexProject(id: project.id, name: project.name, cwd: project.cwd, threads: threads, updatedAt: project.updatedAt)
+        }
+    }
     var isConnected: Bool { isServerReachable }
     var active: Bool { liveRunning || selectedThread?.isActive == true }
     var selectedModel: CodexModel? { models.first { $0.identifier == selectedModelID } }
+    var modelsForSelectedProvider: [CodexModel] {
+        models.filter { $0.agentProvider == selectedAgentProvider }
+    }
     var availableEfforts: [ReasoningEffortOption] { selectedModel?.supportedReasoningEfforts ?? [] }
     var selectedEffortTitle: String {
         availableEfforts.first { $0.reasoningEffort == selectedEffortID }?.title ?? cloudexLocalized("默认")
@@ -251,7 +301,7 @@ final class AppViewModel: ObservableObject {
         if detail?.turns.isEmpty == true {
             result.append(contentsOf: liveMessages)
         }
-        return mergeSemanticExecutionItems(result).enumerated().sorted { lhs, rhs in
+        let ordered = mergeSemanticExecutionItems(result).enumerated().sorted { lhs, rhs in
             switch (lhs.element.createdAt, rhs.element.createdAt) {
             case let (left?, right?):
                 if left != right { return left < right }
@@ -261,6 +311,27 @@ final class AppViewModel: ObservableObject {
             case (nil, nil): return lhs.offset < rhs.offset
             }
         }.map(\.element)
+
+        // SwiftUI's ForEach requires IDs to be unique. A compact snapshot and
+        // a live item can occasionally carry the same fallback ID while a
+        // turn is being replaced, causing rows to disappear or go blank.
+        var usedIDs = Set<String>()
+        return ordered.enumerated().map { index, message in
+            guard usedIDs.contains(message.id) else {
+                usedIDs.insert(message.id)
+                return message
+            }
+            var unique = message
+            var candidate = "\(message.id)-duplicate-\(index)"
+            var suffix = 1
+            while usedIDs.contains(candidate) {
+                candidate = "\(message.id)-duplicate-\(index)-\(suffix)"
+                suffix += 1
+            }
+            unique.id = candidate
+            usedIDs.insert(candidate)
+            return unique
+        }
     }
 
     private func rebuildRenderedMessages() {
@@ -1085,6 +1156,63 @@ final class AppViewModel: ObservableObject {
         if let selectedThreadID { connectThreadStream(threadID: selectedThreadID) }
     }
 
+    func saveServerProfile(
+        id: String?,
+        name: String,
+        lanURL: String,
+        tailscaleURL: String,
+        connectionMode: ConnectionMode,
+        token: String
+    ) async {
+        let normalizedLAN = normalizedURL(lanURL)
+        let normalizedTailscale = normalizedURL(tailscaleURL)
+        let trimmedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedLAN.isEmpty || !normalizedTailscale.isEmpty else { return }
+        let existingID = id ?? UUID().uuidString
+        let fallbackName = Self.serverName(for: normalizedLAN.isEmpty ? normalizedTailscale : normalizedLAN)
+        let profile = ServerProfile(
+            id: existingID,
+            name: name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? fallbackName : name.trimmingCharacters(in: .whitespacesAndNewlines),
+            lanURL: normalizedLAN,
+            tailscaleURL: normalizedTailscale,
+            token: trimmedToken,
+            connectionMode: connectionMode
+        )
+        if let index = serverProfiles.firstIndex(where: { $0.id == existingID }) {
+            serverProfiles[index] = profile
+        } else {
+            serverProfiles.append(profile)
+        }
+        persistServerProfiles()
+        await switchToServerProfile(profile)
+    }
+
+    func switchToServerProfile(_ profile: ServerProfile) async {
+        selectedServerProfileID = profile.id
+        UserDefaults.standard.set(profile.id, forKey: "cloudex.selectedServerProfileID")
+        await applySettings(
+            lanServerURL: profile.lanURL,
+            tailscaleServerURL: profile.tailscaleURL,
+            connectionMode: profile.connectionMode,
+            token: profile.token
+        )
+        if let index = serverProfiles.firstIndex(where: { $0.id == profile.id }) {
+            serverProfiles[index].lastUsedAt = Date().timeIntervalSince1970
+            persistServerProfiles()
+        }
+    }
+
+    func deleteServerProfile(_ profile: ServerProfile) {
+        serverProfiles.removeAll { $0.id == profile.id }
+        persistServerProfiles()
+        guard selectedServerProfileID == profile.id else { return }
+        selectedServerProfileID = serverProfiles.first?.id
+        UserDefaults.standard.set(selectedServerProfileID, forKey: "cloudex.selectedServerProfileID")
+        if let next = activeServerProfile {
+            Task { await switchToServerProfile(next) }
+        }
+    }
+
     func switchToConnection(_ item: ConnectionHistoryItem) async {
         let lanURL = item.connectionMode == .tailscale ? lanServerURL : item.serverURL
         let tailscaleURL = item.connectionMode == .tailscale ? item.serverURL : tailscaleServerURL
@@ -1119,6 +1247,23 @@ final class AppViewModel: ObservableObject {
         guard let data = defaults.data(forKey: "cloudex.connectionHistory"),
               let items = try? JSONDecoder().decode([ConnectionHistoryItem].self, from: data) else { return [] }
         return items.sorted { $0.lastUsedAt > $1.lastUsedAt }
+    }
+
+    private static func loadServerProfiles(defaults: UserDefaults) -> [ServerProfile] {
+        guard let data = defaults.data(forKey: "cloudex.serverProfiles"),
+              let items = try? JSONDecoder().decode([ServerProfile].self, from: data) else { return [] }
+        return items.sorted { $0.lastUsedAt > $1.lastUsedAt }
+    }
+
+    private func persistServerProfiles(defaults: UserDefaults = .standard) {
+        if let data = try? JSONEncoder().encode(serverProfiles) {
+            defaults.set(data, forKey: "cloudex.serverProfiles")
+        }
+    }
+
+    private static func serverName(for url: String) -> String {
+        guard let host = URL(string: url)?.host, !host.isEmpty else { return "Cloudex 服务器" }
+        return host
     }
 
     func refresh() async {
@@ -1183,10 +1328,15 @@ final class AppViewModel: ObservableObject {
                 models = visibleModels
                 modelsLoaded = true
                 if normalizedURL(serverURL) != candidate { serverURL = candidate }
-                let fallbackModelID = visibleModels.first(where: { $0.isDefault == true })?.identifier
+                let providerModels = visibleModels.filter { $0.agentProvider == selectedAgentProvider }
+                let providerDefault = providerModels.first { $0.isDefault == true }
+                let globalDefault = visibleModels.first { $0.isDefault == true }
+                let fallbackModelID = providerDefault?.identifier
+                    ?? providerModels.first?.identifier
+                    ?? globalDefault?.identifier
                     ?? visibleModels.first?.identifier
                     ?? ""
-                if !visibleModels.contains(where: { $0.identifier == selectedModelID }) {
+                if !providerModels.contains(where: { $0.identifier == selectedModelID }) {
                     selectedModelID = fallbackModelID
                 }
                 normalizeEffortForSelectedModel()
@@ -1265,6 +1415,8 @@ final class AppViewModel: ObservableObject {
         }
         selectedProjectCWD = projectCWD
         selectedThreadID = thread.id
+        selectedAgentProvider = thread.agentProvider
+        UserDefaults.standard.set(selectedAgentProvider.rawValue, forKey: "cloudex.agentProvider")
         isCreatingNew = false
         clearLiveMessages()
         localError = nil
@@ -1459,7 +1611,7 @@ final class AppViewModel: ObservableObject {
 
     private func mergingLatestPage(_ latest: ThreadDetail, into current: ThreadDetail?) -> ThreadDetail {
         guard let current, !current.turns.isEmpty else { return latest }
-        let currentByID = Dictionary(uniqueKeysWithValues: current.turns.map { ($0.id, $0) })
+        let currentByID = Dictionary(current.turns.map { ($0.id, $0) }, uniquingKeysWith: { _, newer in newer })
         let turns = latest.turns.map { compactTurn in
             guard let existing = currentByID[compactTurn.id], existing.processDetailsAreLoaded else { return compactTurn }
             // Active compact responses intentionally contain the complete,
@@ -1517,6 +1669,17 @@ final class AppViewModel: ObservableObject {
         guard !prompt.isEmpty else { return }
         guard !active else {
             queueSteerDraft()
+            return
+        }
+        _ = await submitPrompt(prompt, steering: false)
+    }
+
+    func sendBuiltInCommand(_ command: String) async {
+        guard selectedAgentProvider != .codex else { return }
+        let prompt = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty else { return }
+        guard !active else {
+            status = "当前任务仍在运行，命令将在任务结束后执行"
             return
         }
         _ = await submitPrompt(prompt, steering: false)
@@ -1608,6 +1771,7 @@ final class AppViewModel: ObservableObject {
                     return false
                 }
                 body["prompt"] = prompt
+                body["provider"] = selectedAgentProvider.rawValue
                 if let selectedProjectCWD {
                     body["cwd"] = selectedProjectCWD
                 } else {
@@ -1804,10 +1968,23 @@ final class AppViewModel: ObservableObject {
         UserDefaults.standard.set(selectedEffortID, forKey: "cloudex.effort")
     }
 
+    func selectAgentProvider(_ provider: AgentProvider) {
+        selectedAgentProvider = provider
+        UserDefaults.standard.set(provider.rawValue, forKey: "cloudex.agentProvider")
+        selectedModelID = models.first(where: { $0.agentProvider == provider && $0.isDefault == true })?.identifier
+            ?? models.first(where: { $0.agentProvider == provider })?.identifier
+            ?? ""
+        normalizeEffortForSelectedModel()
+        if selectedThread?.agentProvider != provider {
+            startNewChat(projectCWD: selectedProjectCWD)
+        }
+    }
+
     func selectEffort(_ effortID: String) {
         guard availableEfforts.contains(where: { $0.reasoningEffort == effortID }) else { return }
         selectedEffortID = effortID
         UserDefaults.standard.set(selectedEffortID, forKey: "cloudex.effort")
+        UserDefaults.standard.set(true, forKey: "cloudex.effort.userSelected")
     }
 
     func selectCodexMode(_ mode: CodexExecutionMode) {
@@ -1849,7 +2026,8 @@ final class AppViewModel: ObservableObject {
     private func normalizeEffortForSelectedModel() {
         guard let model = models.first(where: { $0.identifier == selectedModelID }) else { return }
         let supported = model.supportedReasoningEfforts ?? []
-        if !supported.contains(where: { $0.reasoningEffort == selectedEffortID }) {
+        let userSelected = UserDefaults.standard.bool(forKey: "cloudex.effort.userSelected")
+        if !userSelected || !supported.contains(where: { $0.reasoningEffort == selectedEffortID }) {
             selectedEffortID = model.defaultReasoningEffort ?? supported.first?.reasoningEffort ?? ""
         }
     }
@@ -1918,7 +2096,8 @@ final class AppViewModel: ObservableObject {
               let snapshotThread = snapshotProjects
                 .flatMap(\.threads)
                 .first(where: { $0.id == selectedThreadID }),
-              snapshotThread.isActive || active else { return }
+              snapshotThread.isActive || active ||
+                (snapshotThread.updatedAt ?? 0) > (selectedThread?.updatedAt ?? 0) else { return }
 
         let wasActive = active
         guard self.selectedThreadID == selectedThreadID else { return }

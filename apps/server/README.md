@@ -1,6 +1,6 @@
 # Local Server
 
-本地服务器通过 standalone Codex CLI 的 `app-server daemon` 和 `app-server proxy` 控制任务，并把任务通知转换成手机端可消费的 HTTP/SSE API。历史记录直接读取 `~/.codex/sessions`，整个运行过程不依赖 Codex Desktop。
+本地服务器默认通过 standalone Codex CLI 的 `app-server daemon` 和 `app-server proxy` 控制任务，并把任务通知转换成手机端可消费的 HTTP/SSE API。也支持 Qwen Code 和 Claude Code 的本地 headless CLI，会从 `~/.qwen/projects` 和 `~/.claude/projects` 导入会话；Claude Desktop 的 3P 会话同样由 Claude Code 写入这些 JSONL 文件，因此可以在同一列表中控制。
 
 ## CLI（npm 包 `cloudex`）
 
@@ -31,6 +31,46 @@ npx cloudex about
 printenv OPENAI_API_KEY | ~/.codex/packages/standalone/current/codex login --with-api-key
 ~/.codex/packages/standalone/current/codex app-server daemon bootstrap
 ```
+
+同时扫描 Codex 和 Qwen（iOS 聊天列表可切换 provider）：
+
+```bash
+export CLOUDEX_AGENT_PROVIDER=both
+export QWEN_BIN="$(command -v qwen)"
+npm run server
+```
+
+同时扫描三种 provider：
+
+```bash
+export CLOUDEX_AGENT_PROVIDER=all
+export QWEN_BIN="$(command -v qwen)"
+export CLAUDE_BIN="$(command -v claude)"
+npm run server
+```
+
+仅使用 Claude Code（包含 Claude Desktop 3P 历史会话）：
+
+```bash
+export CLOUDEX_AGENT_PROVIDER=claude
+export CLAUDE_BIN="$(command -v claude)"
+npm run server
+```
+
+Claude 新消息使用 `claude --print --output-format stream-json --verbose`，已有会话使用 `--resume <sessionId>` 恢复。可用 `CLAUDE_COMMAND_ARGS` 和 `CLAUDE_RESUME_ARGS` 覆盖不同版本 CLI 的参数。
+
+仅使用 Qwen Code：
+
+```bash
+export CLOUDEX_AGENT_PROVIDER=qwen
+export QWEN_BIN="$(command -v qwen)"
+npm run server
+```
+
+Qwen 模式使用 `qwen -p ... --output-format stream-json`，后续消息默认通过
+`qwen -r <sessionId> -p ...` 恢复原生会话。`steer`、`fork` 和 Cloudex 审批路由在
+当前 Qwen headless provider 中返回 `501`；需要这些能力时应使用 Qwen `serve`
+daemon 协议作为后续 provider 实现。
 
 默认 control socket 是 `~/.codex/app-server-control/app-server-control.sock`；如有需要，可通过 `CODEX_CONTROL_SOCKET` 覆盖。
 

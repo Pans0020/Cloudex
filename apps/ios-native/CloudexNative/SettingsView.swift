@@ -5,84 +5,54 @@ import UIKit
 struct SettingsView: View {
     @EnvironmentObject private var viewModel: AppViewModel
     @Binding var isPresented: Bool
-    @State private var lanServerURL: String
-    @State private var tailscaleServerURL: String
-    @State private var connectionMode: ConnectionMode
-    @State private var token: String
     @State private var notifyApprovals: Bool
     @State private var notifyTaskSuccess: Bool
     @State private var notifyTaskFailure: Bool
+    @State private var editingProfile: ServerProfile?
+    @State private var showingNewProfile = false
 
     init(isPresented: Binding<Bool>, viewModel: AppViewModel? = nil) {
         _isPresented = isPresented
-        let model = viewModel
-        _lanServerURL = State(initialValue: model?.lanServerURL ?? "")
-        _tailscaleServerURL = State(initialValue: model?.tailscaleServerURL ?? "")
-        _connectionMode = State(initialValue: model?.connectionMode ?? .automatic)
-        _token = State(initialValue: model?.authToken ?? "")
-        _notifyApprovals = State(initialValue: model?.notifyApprovals ?? true)
-        _notifyTaskSuccess = State(initialValue: model?.notifyTaskSuccess ?? true)
-        _notifyTaskFailure = State(initialValue: model?.notifyTaskFailure ?? true)
+        _notifyApprovals = State(initialValue: viewModel?.notifyApprovals ?? true)
+        _notifyTaskSuccess = State(initialValue: viewModel?.notifyTaskSuccess ?? true)
+        _notifyTaskFailure = State(initialValue: viewModel?.notifyTaskFailure ?? true)
     }
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("连接") {
-                    Picker("连接方式", selection: $connectionMode) {
-                        ForEach(ConnectionMode.allCases) { mode in
-                            Text(mode.title).tag(mode)
-                        }
+                Section {
+                    Button {
+                        showingNewProfile = true
+                    } label: {
+                        Label("新建服务器", systemImage: "plus.circle.fill")
                     }
-                    .pickerStyle(.segmented)
-
-                    TextField("局域网地址", text: $lanServerURL)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .keyboardType(.URL)
-
-                    TextField("Tailscale 地址", text: $tailscaleServerURL)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .keyboardType(.URL)
-
-                    SecureField("AUTH_TOKEN", text: $token)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                    Text(viewModel.status)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
-
-                Section("最近连接") {
-                    if viewModel.connectionHistory.isEmpty {
-                        Text("保存设置后会在这里显示连接记录")
+                    if viewModel.serverProfiles.isEmpty {
+                        Text("添加一个局域网或 Tailscale 服务器")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     } else {
-                        ForEach(viewModel.connectionHistory) { item in
+                        ForEach(viewModel.serverProfiles) { profile in
                             Button {
-                                Task {
-                                    await viewModel.switchToConnection(item)
-                                    lanServerURL = viewModel.lanServerURL
-                                    tailscaleServerURL = viewModel.tailscaleServerURL
-                                    connectionMode = viewModel.connectionMode
-                                    token = viewModel.authToken
-                                }
+                                editingProfile = profile
                             } label: {
                                 HStack(spacing: 10) {
-                                    Image(systemName: "arrow.triangle.2.circlepath")
+                                    Image(systemName: "server.rack")
                                         .foregroundStyle(.secondary)
                                     VStack(alignment: .leading, spacing: 2) {
-                                        Text(item.serverURL)
+                                        Text(profile.name)
+                                            .fontWeight(.medium)
+                                        Text(profile.preferredURL.isEmpty ? "未配置地址" : profile.preferredURL)
                                             .lineLimit(1)
                                             .truncationMode(.middle)
-                                        Text("Token \(item.maskedToken) · \(item.connectionMode.title)")
                                             .font(.caption)
                                             .foregroundStyle(.secondary)
+                                        Text("\(profile.connectionMode.title) · Token \(profile.maskedToken)")
+                                            .font(.caption2)
+                                            .foregroundStyle(.tertiary)
                                     }
                                     Spacer(minLength: 0)
-                                    if viewModel.serverURL == item.serverURL && viewModel.authToken == item.token {
+                                    if viewModel.selectedServerProfileID == profile.id {
                                         Image(systemName: "checkmark")
                                             .foregroundStyle(.tint)
                                     }
@@ -90,17 +60,16 @@ struct SettingsView: View {
                             }
                             .buttonStyle(.plain)
                         }
-                        .onDelete { offsets in
-                            viewModel.removeConnectionHistory(at: offsets)
-                        }
                     }
                 }
 
-                Section("Tailscale") {
-                    Text("电脑和 iPhone 需登录同一 Tailnet，并在手机上开启 Tailscale VPN。自动模式会先尝试局域网，失败后切换到 Tailscale。")
+                Section("当前连接") {
+                    LabeledContent("服务器", value: viewModel.serverProfileTitle)
+                    LabeledContent("地址", value: viewModel.serverURL)
+                    LabeledContent("状态", value: viewModel.status)
+                    Text("自动模式会优先尝试局域网，失败后切换到 Tailscale。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
-                    LabeledContent("当前连接", value: viewModel.activeConnectionTitle)
                 }
 
                 Section("通知") {
@@ -115,7 +84,7 @@ struct SettingsView: View {
             }
             .navigationTitle("设置")
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
+                ToolbarItem(placement: .topBarLeading) {
                     Button {
                         Task {
                             await viewModel.reconnect()
@@ -125,40 +94,90 @@ struct SettingsView: View {
                     }
                     .accessibilityLabel("重新连接")
                 }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("保存") {
-                        Task {
-                            await viewModel.applySettings(
-                                lanServerURL: lanServerURL,
-                                tailscaleServerURL: tailscaleServerURL,
-                                connectionMode: connectionMode,
-                                token: token
-                            )
-                            viewModel.updateNotificationSettings(
-                                approvals: notifyApprovals,
-                                taskSuccess: notifyTaskSuccess,
-                                taskFailure: notifyTaskFailure
-                            )
-                            isPresented = false
-                        }
-                    }
-                    .disabled(
-                        connectionMode == .lan && lanServerURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        || connectionMode == .tailscale && tailscaleServerURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        || connectionMode == .automatic
-                            && lanServerURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                            && tailscaleServerURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    )
-                }
             }
             .onAppear {
-                lanServerURL = viewModel.lanServerURL
-                tailscaleServerURL = viewModel.tailscaleServerURL
-                connectionMode = viewModel.connectionMode
-                token = viewModel.authToken
                 notifyApprovals = viewModel.notifyApprovals
                 notifyTaskSuccess = viewModel.notifyTaskSuccess
                 notifyTaskFailure = viewModel.notifyTaskFailure
+            }
+            .onChange(of: notifyApprovals) { _, _ in viewModel.updateNotificationSettings(approvals: notifyApprovals, taskSuccess: notifyTaskSuccess, taskFailure: notifyTaskFailure) }
+            .onChange(of: notifyTaskSuccess) { _, _ in viewModel.updateNotificationSettings(approvals: notifyApprovals, taskSuccess: notifyTaskSuccess, taskFailure: notifyTaskFailure) }
+            .onChange(of: notifyTaskFailure) { _, _ in viewModel.updateNotificationSettings(approvals: notifyApprovals, taskSuccess: notifyTaskSuccess, taskFailure: notifyTaskFailure) }
+            .sheet(item: $editingProfile) { profile in
+                ServerProfileEditorView(profile: profile, isNew: false)
+                    .environmentObject(viewModel)
+            }
+            .sheet(isPresented: $showingNewProfile) {
+                ServerProfileEditorView(profile: nil, isNew: true)
+                    .environmentObject(viewModel)
+            }
+        }
+    }
+}
+
+private struct ServerProfileEditorView: View {
+    @EnvironmentObject private var viewModel: AppViewModel
+    @Environment(\.dismiss) private var dismiss
+    let profile: ServerProfile?
+    let isNew: Bool
+    @State private var name = ""
+    @State private var lanURL = ""
+    @State private var tailscaleURL = ""
+    @State private var token = ""
+    @State private var mode: ConnectionMode = .automatic
+    @State private var showingDeleteConfirmation = false
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("服务器") {
+                    TextField("名称", text: $name)
+                    Picker("默认连接方式", selection: $mode) {
+                        ForEach(ConnectionMode.allCases) { Text($0.title).tag($0) }
+                    }
+                }
+                Section("地址") {
+                    TextField("局域网地址", text: $lanURL)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
+                    TextField("Tailscale 地址", text: $tailscaleURL)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
+                }
+                Section("认证") {
+                    SecureField("AUTH_TOKEN", text: $token)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled()
+                }
+                if !isNew {
+                    Section {
+                        Button("删除服务器", role: .destructive) { showingDeleteConfirmation = true }
+                    }
+                }
+            }
+            .navigationTitle(isNew ? "新建服务器" : "编辑服务器")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("保存") {
+                        Task {
+                            await viewModel.saveServerProfile(id: profile?.id, name: name, lanURL: lanURL, tailscaleURL: tailscaleURL, connectionMode: mode, token: token)
+                            dismiss()
+                        }
+                    }
+                    .disabled(lanURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && tailscaleURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+            .onAppear {
+                guard let profile else { return }
+                name = profile.name
+                lanURL = profile.lanURL
+                tailscaleURL = profile.tailscaleURL
+                token = profile.token
+                mode = profile.connectionMode
+            }
+            .confirmationDialog("删除这个服务器？", isPresented: $showingDeleteConfirmation, titleVisibility: .visible) {
+                Button("删除", role: .destructive) {
+                    if let profile { viewModel.deleteServerProfile(profile) }
+                    dismiss()
+                }
             }
         }
     }

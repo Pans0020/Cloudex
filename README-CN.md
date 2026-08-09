@@ -8,16 +8,16 @@
 
 </div>
 
-从手机远程操控 Codex 的本地控制台：一台电脑上运行的轻量 HTTP/SSE 服务 + 原生 iOS 客户端 + 可通过 `npx` 分发的 CLI。你可以在手机上查看电脑里的 Codex 会话、新建和继续任务、实时看流式输出、审批命令执行，甚至浏览和审阅电脑上的代码。
+从手机远程操控 Codex 或 Qwen Code 的本地控制台：一台电脑上运行的轻量 HTTP/SSE 服务 + 原生 iOS 客户端 + 可通过 `npx` 分发的 CLI。你可以在手机上查看会话、新建和继续任务、实时看流式输出，甚至浏览和审阅电脑上的代码。
 
 ## 它是什么
 
 Cloudex 由两部分组成：
 
-- **本地控制服务器**（`apps/server`）：包一层 Codex CLI，把任务控制、会话历史、文件浏览、审批等能力封装成手机端可消费的 HTTP/SSE API。全程使用 standalone Codex CLI，不依赖 Codex Desktop；Windows 上在 app-server 控制通道不可用时还会自动降级为直接驱动 Codex CLI 子进程。
+- **本地控制服务器**（`apps/server`）：通过 provider 包装 Codex 或 Qwen Code，把任务控制、会话历史、文件浏览等能力封装成手机端可消费的 HTTP/SSE API。Codex 默认使用 app-server；Qwen 使用 `stream-json` headless CLI 和 `-r` 会话恢复。
 - **原生 iOS 客户端**（`apps/ios-native`）：纯 SwiftUI 实现，不依赖 Expo / React Native / 第三方 Swift 包。通过局域网或 Tailscale 连接服务器，扫码即可完成配对。
 
-手机的访问链路是 `Codex CLI ⇄ 本地服务器 ⇄ iOS App`。服务器只在本地运行，手机通过局域网或 Tailscale 访问它，所有对话历史仍留在电脑的 `~/.codex/sessions` 中。
+手机的访问链路是 `Agent CLI ⇄ 本地服务器 ⇄ iOS App`。服务器只在本地运行，手机通过局域网或 Tailscale 访问它。
 
 ## 核心功能
 
@@ -60,7 +60,7 @@ resources/
 
 ## 快速开始
 
-要求：Node.js ≥ 22，standalone Codex CLI。
+要求：Node.js ≥ 22，以及 standalone Codex CLI 或 Qwen Code CLI。
 
 ### 1. 启动服务器
 
@@ -108,6 +108,18 @@ cloudex --help
 | `HOST` | `0.0.0.0` | 监听地址 |
 | `AUTH_TOKEN` | 自动生成 | API 访问 Bearer Token；非本机访问必填 |
 | `CODEX_BIN` | 自动探测 | Codex CLI 可执行文件路径 |
+| `CLOUDEX_AGENT_PROVIDER` | 自动检测 provider | 使用 `codex`、`qwen`、`claude`、`both` 或 `all` |
+| `QWEN_BIN` | PATH 中的 `qwen` | Qwen Code CLI 可执行文件路径 |
+| `QWEN_MODELS` | 未设置 | 逗号分隔的 Qwen 模型 ID |
+| `QWEN_DEFAULT_MODEL` | `QWEN_MODELS` 第一项 | Qwen 新会话使用的模型 |
+| `QWEN_COMMAND_ARGS` | `--output-format stream-json --prompt` | Qwen headless 参数，可按版本覆盖 |
+| `QWEN_RESUME_ARGS` | `-r {sessionId}` | 恢复参数，`{sessionId}` 替换为 Qwen session ID |
+| `QWEN_APPROVAL_MODE` | 未设置 | 可选 Qwen 权限模式，传给 `--approval-mode` |
+| `CLAUDE_BIN` | PATH 中的 `claude` | Claude Code CLI 可执行文件路径 |
+| `CLAUDE_MODELS` | 未设置 | 逗号分隔的 Claude 模型 ID |
+| `CLAUDE_DEFAULT_MODEL` | 未设置 | Claude 新会话默认模型 |
+| `CLAUDE_COMMAND_ARGS` | `--print --output-format stream-json --verbose` | Claude headless 参数 |
+| `CLAUDE_RESUME_ARGS` | `--resume {sessionId}` | 恢复参数；`{sessionId}` 替换为 Claude session ID |
 | `FILE_ROOTS` | 当前目录 | 手机端可浏览的文件根路径（`;` 分隔） |
 | `CLOUDEX_PUBLIC_URL` | 自动推断 | 二维码中固定展示的服务器地址 |
 | `CLOUDEX_STATE_DIR` | `.cloudex-state` | Token、审批历史等状态目录 |

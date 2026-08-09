@@ -1,6 +1,7 @@
 import http from "node:http";
 import os from "node:os";
 import fs from "node:fs/promises";
+import syncFs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { execFile as execFileCallback } from "node:child_process";
@@ -17,8 +18,12 @@ import {
 import { printConnectionQRCode } from "./connection-qr.js";
 import { normalizeAllowedPath } from "./file-roots.js";
 import { listModelsViaStdio } from "./app-server-stdio.js";
+import { QwenProvider } from "./qwen-provider.js";
+import { ClaudeProvider } from "./claude-provider.js";
 
 const client = new CodexClient();
+const qwenProvider = new QwenProvider();
+const claudeProvider = new ClaudeProvider();
 const execFile = promisify(execFileCallback);
 const subscribers = new Map();
 const globalSubscribers = new Set();
@@ -125,7 +130,16 @@ async function mergeApprovalHistory(threadId, turns) {
   });
 }
 
-function normalizeModel(model) {
+function configuredCodexReasoningEffort() {
+  try {
+    const raw = syncFs.readFileSync(config.codexConfigPath, "utf8");
+    return raw.match(/^\s*model_reasoning_effort\s*=\s*["']([^"']+)["']/m)?.[1] || null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeModel(model, configuredDefault = null) {
   const id = model?.id || model?.model || model?.slug;
   if (!id) return null;
   const rawLevels = model.supportedReasoningEfforts
@@ -145,7 +159,12 @@ function normalizeModel(model) {
     effort: reasoningEffort,
     description,
   }));
-  const defaultReasoningEffort = model.defaultReasoningEffort
+  const configuredSupportedDefault = configuredDefault
+    && supportedReasoningEfforts.some(({ reasoningEffort }) => reasoningEffort === configuredDefault)
+    ? configuredDefault
+    : null;
+  const defaultReasoningEffort = configuredSupportedDefault
+    || model.defaultReasoningEffort
     || model.defaultReasoningLevel
     || model.default_reasoning_level
     || supportedReasoningEfforts[0]?.reasoningEffort
@@ -167,22 +186,81 @@ function usesWindowsCliFallback() {
   return isWindowsPlatform() && (!client.socket || client.socket.closed);
 }
 
-function normalizeModelsResponse(result) {
+function usesQwenProvider() {
+  return config.agentProvider === "qwen";
+}
+
+function usesClaudeProvider() {
+  return config.agentProvider === "claude";
+}
+
+function usesBothProviders() {
+  return config.agentProvider === "both";
+}
+
+function usesAllProviders() {
+  return config.agentProvider === "all";
+}
+
+function hasCodexProvider() {
+  return ["codex", "both", "all"].includes(config.agentProvider);
+}
+
+async function isQwenThread(threadId) {
+  return usesQwenProvider() || usesBothProviders() && await qwenProvider.hasThread(threadId) || usesAllProviders() && await qwenProvider.hasThread(threadId);
+}
+
+async function isClaudeThread(threadId) {
+  return usesClaudeProvider() || usesAllProviders() && await claudeProvider.hasThread(threadId);
+}
+
+function normalizeModelsResponse(result, configuredDefault = null) {
   const data = Array.isArray(result?.data)
     ? result.data
     : (Array.isArray(result?.models) ? result.models : []);
   return {
     ...result,
-    data: data.map(normalizeModel).filter(Boolean),
+    data: data.map((model) => normalizeModel(model, configuredDefault)).filter(Boolean),
   };
 }
 
 async function listModels() {
+  if (usesQwenProvider()) return qwenProvider.listModels();
+  if (usesClaudeProvider()) return claudeProvider.listModels();
+  if (usesBothProviders()) {
+    const configuredDefault = configuredCodexReasoningEffort();
+    const [codexResult, qwenResult] = await Promise.allSettled([
+      (async () => normalizeModelsResponse(
+        usesWindowsCliFallback()
+          ? await listModelsViaStdio({ codexBin: config.codexBin })
+          : await client.request("model/list", { limit: 100 }),
+        configuredDefault,
+      ))(),
+      qwenProvider.listModels(),
+    ]);
+    const data = [];
+    if (codexResult.status === "fulfilled") data.push(...(codexResult.value.data || []).map((model) => ({ ...model, provider: "codex" })));
+    if (qwenResult.status === "fulfilled") data.push(...(qwenResult.value.data || []));
+    return { data };
+  }
+  if (usesAllProviders()) {
+    const [codexResult, qwenResult, claudeResult] = await Promise.allSettled([
+      listModelsViaStdio({ codexBin: config.codexBin }).then((result) => normalizeModelsResponse(result, configuredCodexReasoningEffort())),
+      qwenProvider.listModels(),
+      claudeProvider.listModels(),
+    ]);
+    const data = [];
+    if (codexResult.status === "fulfilled") data.push(...(codexResult.value.data || []).map((model) => ({ ...model, provider: "codex" })));
+    if (qwenResult.status === "fulfilled") data.push(...(qwenResult.value.data || []));
+    if (claudeResult.status === "fulfilled") data.push(...(claudeResult.value.data || []));
+    return { data };
+  }
   if (usesWindowsCliFallback()) {
-    return normalizeModelsResponse(await listModelsViaStdio({ codexBin: config.codexBin }));
+    return normalizeModelsResponse(await listModelsViaStdio({ codexBin: config.codexBin }), configuredCodexReasoningEffort());
   }
   return normalizeModelsResponse(
     await client.request("model/list", { limit: 100 }),
+    configuredCodexReasoningEffort(),
   );
 }
 
@@ -637,6 +715,27 @@ async function projectReview(candidate) {
 }
 
 async function listAllThreads(archived = false) {
+  if (usesQwenProvider()) return qwenProvider.listThreads({ archived });
+  if (usesClaudeProvider()) return claudeProvider.listThreads({ archived });
+  if (usesBothProviders()) {
+    const [codexResult, qwenResult] = await Promise.allSettled([
+      config.historySource === "cli-local" ? listCliThreads({ archived }) : client.request("thread/list", { limit: 100, archived, sortDirection: "desc" }).then((result) => result.data || []),
+      qwenProvider.listThreads({ archived }),
+    ]);
+    const codexThreads = codexResult.status === "fulfilled"
+      ? codexResult.value.map((thread) => ({ ...thread, provider: "codex" }))
+      : [];
+    const qwenThreads = qwenResult.status === "fulfilled" ? qwenResult.value : [];
+    return [...codexThreads, ...qwenThreads].sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0));
+  }
+  if (usesAllProviders()) {
+    const [codexResult, qwenResult, claudeResult] = await Promise.allSettled([
+      listCliThreads({ archived }), qwenProvider.listThreads({ archived }), claudeProvider.listThreads({ archived }),
+    ]);
+    const codexThreads = codexResult.status === "fulfilled" ? codexResult.value.map((thread) => ({ ...thread, provider: "codex" })) : [];
+    return [...codexThreads, ...(qwenResult.status === "fulfilled" ? qwenResult.value : []), ...(claudeResult.status === "fulfilled" ? claudeResult.value : [])]
+      .sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0));
+  }
   if (config.historySource === "cli-local") return listCliThreads({ archived });
   const threads = [];
   let cursor = null;
@@ -654,7 +753,11 @@ async function listAllThreads(archived = false) {
 }
 
 async function readThreadDetail(threadId, { limit = Number.MAX_SAFE_INTEGER, before = null, around = null } = {}) {
-  const fullDetail = config.historySource === "cli-local"
+  const fullDetail = await isQwenThread(threadId)
+    ? await qwenProvider.readThread(threadId)
+    : await isClaudeThread(threadId)
+    ? await claudeProvider.readThread(threadId)
+    : config.historySource === "cli-local"
     ? await readCliThreadById(threadId)
     : await client.request("thread/read", { threadId, includeTurns: true }).then((result) => {
         const thread = result.thread || result;
@@ -904,10 +1007,6 @@ async function syncThreads(reason = "manual") {
   syncInFlight = true;
   try {
     const threads = await listAllThreads(false);
-    if (!usesWindowsCliFallback()) {
-      const runningThreads = threads.filter((thread) => thread.status?.type === "active");
-      await Promise.allSettled(runningThreads.map((thread) => client.subscribeThread(thread.id)));
-    }
     const signature = threadSignature(threads);
     if (signature !== latestThreadSignature) {
       latestThreadSignature = signature;
@@ -1018,9 +1117,20 @@ async function handle(req, res, url) {
     return json(res, 200, {
       ok: true,
       controller: "cloudex-codex-control",
-      codexConnected: Boolean(client.socket && !client.socket.closed),
+      codexConnected: hasCodexProvider() && Boolean(client.socket && !client.socket.closed),
+      qwenAvailable: usesBothProviders() || usesQwenProvider(),
+      claudeAvailable: usesClaudeProvider() || usesAllProviders(),
+      agentProvider: config.agentProvider,
       controlSocket: config.controlSocketPath,
-      mode: config.historySource === "cli-local" ? "cli-local-history" : "api-only",
+      mode: usesQwenProvider()
+        ? "qwen-cli"
+        : (usesClaudeProvider()
+          ? "claude-cli"
+          : (usesAllProviders()
+            ? "multi-provider"
+            : (usesBothProviders()
+              ? "multi-provider"
+              : (config.historySource === "cli-local" ? "cli-local-history" : "api-only")))),
       historySource: config.historySource,
       codexSessionsDir: config.codexSessionsDir,
       host: config.host,
@@ -1140,6 +1250,8 @@ async function handle(req, res, url) {
   const streamMatch = url.pathname.match(/^\/api\/threads\/([^/]+)\/stream$/);
   if (req.method === "GET" && streamMatch) {
     const threadId = decodeURIComponent(streamMatch[1]);
+    const qwenThread = await isQwenThread(threadId);
+    const claudeThread = await isClaudeThread(threadId);
     res.writeHead(200, {
       "content-type": "text/event-stream; charset=utf-8",
       "cache-control": "no-cache",
@@ -1151,7 +1263,11 @@ async function handle(req, res, url) {
     replayEvents(threadId, res);
     // Let clients distinguish replayed history from newly arriving events.
     writeSse(res, "replay-complete", { threadId });
-    if (usesWindowsCliFallback()) {
+    if (qwenThread) {
+      writeSse(res, "subscribed", { threadId, provider: "qwen" });
+    } else if (claudeThread) {
+      writeSse(res, "subscribed", { threadId, provider: "claude" });
+    } else if (usesWindowsCliFallback()) {
       // Windows runs the Codex CLI as a child process. Its JSONL events are
       // bridged into publish() below, so the SSE channel stays open and the
       // app receives live notifications instead of polling only.
@@ -1175,7 +1291,28 @@ async function handle(req, res, url) {
     const cwd = noProject ? null : await normalizeThreadCwd(data.cwd || config.defaultCwd);
     let thread = null;
     let turn = null;
-    if (usesWindowsCliFallback()) {
+    if (usesQwenProvider() || (usesBothProviders() && data.provider === "qwen") || (usesAllProviders() && data.provider === "qwen")) {
+      const result = await qwenProvider.startThread({
+        cwd: cwd || config.defaultCwd,
+        prompt: data.prompt,
+        files: data.files || [],
+        model: data.model || null,
+        onEvent: (message) => publish(message),
+      });
+      thread = result.thread;
+      turn = result.turn;
+    } else if (usesClaudeProvider() || usesAllProviders() && data.provider === "claude") {
+      const result = await claudeProvider.startThread({
+        cwd: cwd || config.defaultCwd,
+        prompt: data.prompt,
+        files: data.files || [],
+        model: data.model || null,
+        effort: data.effort || null,
+        onEvent: (message) => publish(message),
+      });
+      thread = result.thread;
+      turn = result.turn;
+    } else if (usesWindowsCliFallback()) {
       const threadId = await startWindowsThread({
         cwd: cwd || config.defaultCwd,
         prompt: data.prompt,
@@ -1228,7 +1365,31 @@ async function handle(req, res, url) {
       const data = await body(req);
       let thread = null;
       let turn = null;
-      if (usesWindowsCliFallback()) {
+      const qwenThread = await isQwenThread(threadId);
+      if (qwenThread) {
+        const input = await inputFrom(data);
+        const prompt = input.map((part) => part.type === "text" ? part.text : "").join("\n").trim();
+        const result = await qwenProvider.sendMessage(threadId, {
+          prompt,
+          files: input.filter((part) => part.type === "localImage"),
+          model: data.model || null,
+          onEvent: (message) => publish(message),
+        });
+        thread = result.thread;
+        turn = result.turn;
+      } else if (await isClaudeThread(threadId)) {
+        const input = await inputFrom(data);
+        const prompt = input.map((part) => part.type === "text" ? part.text : "").join("\n").trim();
+        const result = await claudeProvider.sendMessage(threadId, {
+          prompt,
+          files: input.filter((part) => part.type === "localImage"),
+          model: data.model || null,
+          effort: data.effort || null,
+          onEvent: (message) => publish(message),
+        });
+        thread = result.thread;
+        turn = result.turn;
+      } else if (usesWindowsCliFallback()) {
         const input = await inputFrom(data);
         const prompt = input.map((part) => part.type === "text" ? part.text : "").join("\n").trim();
         const images = input.filter((part) => part.type === "localImage");
@@ -1261,6 +1422,16 @@ async function handle(req, res, url) {
       return json(res, 202, { thread, turn });
     }
     if (req.method === "POST" && action === "steer") {
+      if (await isQwenThread(threadId)) {
+        const error = new Error("Qwen Code provider does not support turn steering");
+        error.status = 501;
+        throw error;
+      }
+      if (await isClaudeThread(threadId)) {
+        const error = new Error("Claude Code provider does not support turn steering");
+        error.status = 501;
+        throw error;
+      }
       if (usesWindowsCliFallback()) {
         const error = new Error("Codex turn steering is not supported by the Windows CLI fallback");
         error.status = 501;
@@ -1303,6 +1474,16 @@ async function handle(req, res, url) {
       });
     }
     if (req.method === "POST" && action === "fork") {
+      if (await isQwenThread(threadId)) {
+        const error = new Error("Qwen Code provider does not support thread forking");
+        error.status = 501;
+        throw error;
+      }
+      if (await isClaudeThread(threadId)) {
+        const error = new Error("Claude Code provider does not support thread forking");
+        error.status = 501;
+        throw error;
+      }
       if (usesWindowsCliFallback()) {
         const error = new Error("Fork is not supported on Windows CLI mode");
         error.status = 501;
@@ -1340,6 +1521,26 @@ async function handle(req, res, url) {
       return json(res, 201, { thread: forkedThread, turn });
     }
     if (req.method === "POST" && action === "stop") {
+      if (await isQwenThread(threadId)) {
+        const stopped = await qwenProvider.stopThread(threadId);
+        if (!stopped) {
+          const error = new Error("No active Qwen Code turn for this thread");
+          error.status = 409;
+          throw error;
+        }
+        scheduleThreadSync("turn-stopped", 100);
+        return json(res, 200, { stopped: true, threadId, turnId: null, source: "qwen" });
+      }
+      if (await isClaudeThread(threadId)) {
+        const stopped = await claudeProvider.stopThread(threadId);
+        if (!stopped) {
+          const error = new Error("No active Claude Code turn for this thread");
+          error.status = 409;
+          throw error;
+        }
+        scheduleThreadSync("turn-stopped", 100);
+        return json(res, 200, { stopped: true, threadId, turnId: null, source: "claude" });
+      }
       if (usesWindowsCliFallback()) {
         const stopped = stopWindowsThread(threadId);
         if (!stopped) {
@@ -1363,6 +1564,16 @@ async function handle(req, res, url) {
       return json(res, 200, { stopped: true, threadId, turnId, source, result });
     }
     if (req.method === "POST" && action === "archive") {
+      if (await isQwenThread(threadId)) {
+        const result = await qwenProvider.archiveThread(threadId);
+        scheduleThreadSync("thread-archived", 100);
+        return json(res, 200, result);
+      }
+      if (await isClaudeThread(threadId)) {
+        const result = await claudeProvider.archiveThread(threadId);
+        scheduleThreadSync("thread-archived", 100);
+        return json(res, 200, result);
+      }
       if (config.historySource === "cli-local") {
         const result = await archiveCliThread(threadId);
         scheduleThreadSync("thread-archived", 100);
@@ -1389,14 +1600,15 @@ export async function startServer() {
   // can take a moment, but the phone can already capture the connection data.
   printConnectionQRCode({ host: config.host, port: config.port, authToken: config.authToken });
   try {
-    await client.start();
+    if (hasCodexProvider()) await client.start();
   } catch (error) {
-    if (config.historySource !== "cli-local") throw error;
+    if (config.historySource !== "cli-local" && hasCodexProvider()) throw error;
     console.warn(`Codex app-server control unavailable; local history will still be served: ${error.message}`);
   }
   startThreadSync();
   server.listen(config.port, config.host, () => {
     console.log(`Cloudex controller listening on http://${config.host}:${config.port}`);
+    console.log(`Agent provider: ${config.agentProvider}`);
     console.log(`History source: ${config.historySource}`);
     if (config.historySource === "cli-local") console.log(`Codex sessions: ${config.codexSessionsDir}`);
     console.log(`Allowed file roots: ${config.fileRoots.join(", ")}`);
@@ -1404,8 +1616,8 @@ export async function startServer() {
   });
 }
 
-process.on("SIGINT", async () => { stopThreadSync(); await client.stop(); server.close(); process.exit(0); });
-process.on("SIGTERM", async () => { stopThreadSync(); await client.stop(); server.close(); process.exit(0); });
+process.on("SIGINT", async () => { stopThreadSync(); await qwenProvider.stop(); await claudeProvider.stop(); await client.stop(); server.close(); process.exit(0); });
+process.on("SIGTERM", async () => { stopThreadSync(); await qwenProvider.stop(); await claudeProvider.stop(); await client.stop(); server.close(); process.exit(0); });
 
 const entrypoint = process.argv[1] ? pathToFileURL(process.argv[1]).href : "";
 if (import.meta.url === entrypoint) {

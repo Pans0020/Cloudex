@@ -139,6 +139,28 @@ enum CodexExecutionMode: String, CaseIterable, Identifiable, Codable {
     }
 }
 
+enum AgentProvider: String, CaseIterable, Identifiable, Codable {
+    case codex
+    case qwen
+    case claude
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .codex: return "Codex"
+        case .qwen: return "Qwen"
+        case .claude: return "Claude"
+        }
+    }
+    var systemImage: String {
+        switch self {
+        case .codex: return "sparkles"
+        case .qwen: return "q.circle"
+        case .claude: return "c.circle"
+        }
+    }
+}
+
 struct HealthResponse: Codable {
     let ok: Bool
     let codexConnected: Bool?
@@ -169,6 +191,54 @@ struct ConnectionHistoryItem: Codable, Identifiable, Equatable {
     }
 }
 
+struct ServerProfile: Codable, Identifiable, Equatable {
+    var id: String
+    var name: String
+    var lanURL: String
+    var tailscaleURL: String
+    var token: String
+    var connectionMode: ConnectionMode
+    var lastUsedAt: Double
+
+    var preferredURL: String {
+        switch connectionMode {
+        case .tailscale: return tailscaleURL
+        case .lan, .automatic: return lanURL.isEmpty ? tailscaleURL : lanURL
+        }
+    }
+
+    var activeURL: String {
+        connectionMode == .tailscale ? tailscaleURL : lanURL
+    }
+
+    var maskedToken: String {
+        let characters = Array(token)
+        guard characters.count > 8 else {
+            guard characters.count > 4 else { return String(repeating: "•", count: max(4, characters.count)) }
+            return "\(String(characters.prefix(4)))••••\(String(characters.suffix(4)))"
+        }
+        return "\(token.prefix(4))••••\(token.suffix(4))"
+    }
+
+    init(
+        id: String = UUID().uuidString,
+        name: String,
+        lanURL: String,
+        tailscaleURL: String,
+        token: String,
+        connectionMode: ConnectionMode,
+        lastUsedAt: Double = Date().timeIntervalSince1970
+    ) {
+        self.id = id
+        self.name = name
+        self.lanURL = lanURL
+        self.tailscaleURL = tailscaleURL
+        self.token = token
+        self.connectionMode = connectionMode
+        self.lastUsedAt = lastUsedAt
+    }
+}
+
 struct ProjectsResponse: Codable {
     let data: [CloudexProject]
     let total: Int?
@@ -183,7 +253,7 @@ struct ApprovalsResponse: Codable {
 }
 
 struct ApprovalResolvedEvent: Codable {
-    let id: String
+    var id: String
     let threadId: String?
     let decision: String?
     let approval: ApprovalRequest?
@@ -278,6 +348,7 @@ struct CloudexThread: Codable, Identifiable, Equatable {
     let createdAt: Double?
     let updatedAt: Double?
     let usage: CloudexUsage?
+    let provider: String?
 
     var title: String {
         let value = name?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -288,6 +359,10 @@ struct CloudexThread: Codable, Identifiable, Equatable {
     }
 
     var isActive: Bool { status?.type == "active" }
+
+    var agentProvider: AgentProvider {
+        AgentProvider(rawValue: provider ?? "") ?? .codex
+    }
 
     private static func isNoiseTitle(_ value: String) -> Bool {
         let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -572,6 +647,7 @@ struct CodexModel: Codable, Equatable {
     let isDefault: Bool?
     let supportedReasoningEfforts: [ReasoningEffortOption]?
     let defaultReasoningEffort: String?
+    let provider: String?
 
     private enum CodingKeys: String, CodingKey {
         case rawID = "id"
@@ -585,6 +661,7 @@ struct CodexModel: Codable, Equatable {
         case defaultReasoningEffort
         case defaultReasoningLevel
         case defaultReasoningLevelSnake = "default_reasoning_level"
+        case provider
     }
 
     init(from decoder: Decoder) throws {
@@ -602,6 +679,7 @@ struct CodexModel: Codable, Equatable {
         let camelDefault = try container.decodeIfPresent(String.self, forKey: .defaultReasoningLevel)
         let snakeDefault = try container.decodeIfPresent(String.self, forKey: .defaultReasoningLevelSnake)
         defaultReasoningEffort = nativeDefault ?? camelDefault ?? snakeDefault
+        provider = try container.decodeIfPresent(String.self, forKey: .provider)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -613,10 +691,12 @@ struct CodexModel: Codable, Equatable {
         try container.encodeIfPresent(isDefault, forKey: .isDefault)
         try container.encodeIfPresent(supportedReasoningEfforts, forKey: .supportedReasoningEfforts)
         try container.encodeIfPresent(defaultReasoningEffort, forKey: .defaultReasoningEffort)
+        try container.encodeIfPresent(provider, forKey: .provider)
     }
 
     var identifier: String { rawID ?? model ?? displayName ?? "unknown" }
     var title: String { displayName ?? model ?? rawID ?? cloudexLocalized("未知模型") }
+    var agentProvider: AgentProvider { AgentProvider(rawValue: provider ?? "") ?? .codex }
 }
 
 struct ReasoningEffortOption: Codable, Equatable, Identifiable {
@@ -768,7 +848,7 @@ struct ChatMessage: Identifiable, Equatable {
         case taskSummary
     }
 
-    let id: String
+    var id: String
     let role: Role
     let text: String
     var executionStatus: String? = nil

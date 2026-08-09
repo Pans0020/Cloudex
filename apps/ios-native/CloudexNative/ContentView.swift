@@ -607,7 +607,7 @@ struct ContentView: View {
                                 get: { viewModel.selectedModelID },
                                 set: { viewModel.selectModel($0) }
                             )) {
-                                ForEach(viewModel.models, id: \.identifier) { model in
+                                ForEach(viewModel.modelsForSelectedProvider, id: \.identifier) { model in
                                     Text(model.title).tag(model.identifier)
                                 }
                             }
@@ -645,12 +645,15 @@ struct ContentView: View {
                     .font(.caption.weight(.medium))
                     .padding(.horizontal, 10)
                     .padding(.vertical, 6)
-                    .fixedSize(horizontal: true, vertical: false)
+                    .frame(maxWidth: 172, alignment: .leading)
                     .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
                 .liquidGlass(in: Capsule(), interactive: true)
                 .accessibilityLabel("切换模型和推理强度")
+                .simultaneousGesture(TapGesture().onEnded {
+                    Task { await viewModel.loadModelsIfNeeded(force: true) }
+                })
 
                 Menu {
                     Picker("模式", selection: Binding(
@@ -719,6 +722,49 @@ struct ContentView: View {
         }
     }
 
+    private var agentBuiltInCommands: [AgentBuiltInCommand] {
+        guard viewModel.selectedAgentProvider != .codex else { return [] }
+        return [
+            AgentBuiltInCommand(command: "/model", title: "model", detail: "查看或切换模型", argumentHint: "<name>"),
+            AgentBuiltInCommand(command: "/effort", title: "effort", detail: "设置推理强度", argumentHint: "<low|medium|high|xhigh|max|ultracode|auto>"),
+            AgentBuiltInCommand(command: "/branch", title: "branch", detail: "创建当前对话分支", argumentHint: "[name]"),
+            AgentBuiltInCommand(command: "/cd", title: "cd", detail: "查看或切换工作目录", argumentHint: "<path>"),
+            AgentBuiltInCommand(command: "/compact", title: "compact", detail: "压缩当前上下文", argumentHint: "[instructions]"),
+            AgentBuiltInCommand(command: "/context", title: "context", detail: "查看上下文使用情况", argumentHint: nil),
+            AgentBuiltInCommand(command: "/status", title: "status", detail: "查看当前会话状态", argumentHint: nil),
+            AgentBuiltInCommand(command: "/usage", title: "usage", detail: "查看用量", argumentHint: nil),
+            AgentBuiltInCommand(command: "/cost", title: "cost", detail: "查看本轮成本", argumentHint: nil),
+            AgentBuiltInCommand(command: "/resume", title: "resume", detail: "恢复会话", argumentHint: "[session]"),
+            AgentBuiltInCommand(command: "/rename", title: "rename", detail: "重命名当前会话", argumentHint: "<name>"),
+            AgentBuiltInCommand(command: "/permissions", title: "permissions", detail: "查看权限设置", argumentHint: nil),
+            AgentBuiltInCommand(command: "/memory", title: "memory", detail: "查看记忆设置", argumentHint: nil),
+            AgentBuiltInCommand(command: "/mcp", title: "mcp", detail: "管理 MCP 连接", argumentHint: nil),
+            AgentBuiltInCommand(command: "/agents", title: "agents", detail: "管理子代理", argumentHint: nil),
+            AgentBuiltInCommand(command: "/skills", title: "skills", detail: "查看可用技能", argumentHint: nil),
+            AgentBuiltInCommand(command: "/doctor", title: "doctor", detail: "诊断 Claude 环境", argumentHint: nil),
+            AgentBuiltInCommand(command: "/debug", title: "debug", detail: "查看调试信息", argumentHint: nil),
+            AgentBuiltInCommand(command: "/verify", title: "verify", detail: "验证当前任务", argumentHint: nil),
+            AgentBuiltInCommand(command: "/init", title: "init", detail: "初始化项目配置", argumentHint: nil),
+        ]
+    }
+
+    private var slashSuggestions: [AgentBuiltInCommand] {
+        let input = viewModel.draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard input.hasPrefix("/"), !input.contains("\n") else { return [] }
+        let parts = input.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: false)
+        let command = String(parts[0]).lowercased()
+        if parts.count > 1 {
+            guard let item = agentBuiltInCommands.first(where: { $0.command == command }), command == "/effort" else { return [] }
+            let prefix = String(parts[1]).lowercased()
+            return ["low", "medium", "high", "xhigh", "max", "ultracode", "auto"]
+                .filter { prefix.isEmpty || $0.hasPrefix(prefix) }
+                .map { AgentBuiltInCommand(command: "\(command) \($0)", title: $0, detail: item.detail, argumentHint: nil) }
+        }
+        return agentBuiltInCommands.filter { item in
+            command == "/" || item.command.hasPrefix(command)
+        }
+    }
+
     private var composerControlStack: some View {
         HStack(alignment: .bottom, spacing: 10) {
             Button { showingFilePicker = true } label: {
@@ -731,6 +777,36 @@ struct ContentView: View {
             .liquidGlass(in: Circle(), interactive: true)
             .disabled((viewModel.selectedProjectCWD ?? viewModel.selectedThread?.cwd ?? viewModel.projects.first?.cwd) == nil)
             .accessibilityLabel("上传文件")
+
+            if !agentBuiltInCommands.isEmpty {
+                Menu {
+                    ForEach(agentBuiltInCommands) { item in
+                        Button {
+                            if item.argumentHint != nil {
+                                viewModel.draft = "\(item.command) "
+                                composerFocused = true
+                            } else {
+                                Task { await viewModel.sendBuiltInCommand(item.command) }
+                            }
+                        } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("/\(item.title)")
+                                Text(item.argumentHint.map { "\(item.detail)  \($0)" } ?? item.detail)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                } label: {
+                    Text("/")
+                        .font(.system(size: 22, weight: .medium, design: .rounded))
+                        .frame(width: 46, height: 46)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .liquidGlass(in: Circle(), interactive: true)
+                .accessibilityLabel("打开内置命令")
+            }
 
             HStack(alignment: .bottom, spacing: 4) {
                 ZStack(alignment: .topLeading) {
@@ -800,6 +876,46 @@ struct ContentView: View {
             .padding(.trailing, 6)
             .padding(.leading, 3)
             .liquidGlass(in: RoundedRectangle(cornerRadius: 27, style: .continuous), interactive: true)
+            .overlay(alignment: .bottomLeading) {
+                if !slashSuggestions.isEmpty {
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(slashSuggestions.prefix(8)) { item in
+                            Button {
+                                if item.argumentHint != nil {
+                                    viewModel.draft = "\(item.command) "
+                                    composerFocused = true
+                                } else {
+                                    viewModel.draft = ""
+                                    Task { await viewModel.sendBuiltInCommand(item.command) }
+                                }
+                            } label: {
+                                HStack(spacing: 8) {
+                                    Text(item.command)
+                                        .font(.callout.weight(.semibold))
+                                    if let hint = item.argumentHint {
+                                        Text(hint)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer(minLength: 0)
+                                    Text(item.detail)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 9)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .frame(maxWidth: 340, alignment: .leading)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .shadow(color: .black.opacity(0.16), radius: 12, y: 4)
+                    .offset(y: -52)
+                }
+            }
         }
         .padding(.horizontal, 24)
         .padding(.top, 10)
@@ -970,16 +1086,15 @@ struct ContentView: View {
     }
 
     private func mergeLiveChatContent(from latest: ChatScrollContent) {
-        var latestByID: [String: ChatMessage] = [:]
-        for message in latest.messages {
-            latestByID[message.id] = message
-        }
-
         let existingIDs = Set(chatContentSnapshot.messages.map(\.id))
-        var messages = chatContentSnapshot.messages.map { current in
-            latestByID[current.id] ?? current
-        }
-        messages.append(contentsOf: latest.messages.filter { !existingIDs.contains($0.id) })
+        let latestIDs = Set(latest.messages.map(\.id))
+        // Keep the server's canonical order. Only retain rows that are still
+        // live and have not reached the persisted snapshot yet; preserving
+        // removed rows in the old order caused jumps and blank sections.
+        var messages = latest.messages
+        messages.append(contentsOf: chatContentSnapshot.messages.filter {
+            existingIDs.contains($0.id) && !latestIDs.contains($0.id)
+        })
 
         chatContentSnapshot = ChatScrollContent(
             messages: messages,
@@ -1183,6 +1298,15 @@ private struct ChatScrollContent: Equatable {
     let active: Bool
 
     static let empty = ChatScrollContent(messages: [], approvals: [], active: false)
+}
+
+private struct AgentBuiltInCommand: Identifiable {
+    let command: String
+    let title: String
+    let detail: String
+    let argumentHint: String?
+
+    var id: String { command }
 }
 
 private final class ChatScrollController: ObservableObject {
@@ -1675,6 +1799,7 @@ private struct MessageBubble: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 11)
+        .frame(minWidth: 0)
         .frame(
             maxWidth: message.role == .assistant || message.role == .error ? .infinity : nil,
             alignment: .leading
@@ -2263,6 +2388,16 @@ private struct MarkdownText: View {
                         case let .paragraph(value):
                             Text(Self.parseInline(value, highlightQuery: highlightQuery))
                                 .frame(maxWidth: .infinity, alignment: .leading)
+                        case let .quote(value):
+                            HStack(alignment: .top, spacing: 9) {
+                                Rectangle()
+                                    .fill(Color.secondary.opacity(0.45))
+                                    .frame(width: 3)
+                                Text(Self.parseInline(value, highlightQuery: highlightQuery))
+                                    .foregroundStyle(.secondary)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .padding(.vertical, 2)
                         case let .list(items):
                             VStack(alignment: .leading, spacing: 4) {
                                 ForEach(items) { item in
@@ -2288,6 +2423,7 @@ private struct MarkdownText: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
+        .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
         .fixedSize(horizontal: false, vertical: true)
         .environment(\.openURL, OpenURLAction { url in
             guard let onFileLink else { return .systemAction }
@@ -2389,6 +2525,17 @@ private struct MarkdownText: View {
                 continue
             }
 
+            if Self.isQuoteLine(line) {
+                flushParagraph()
+                var quoteLines: [String] = []
+                while index < lines.count, Self.isQuoteLine(lines[index]) {
+                    quoteLines.append(Self.quoteText(from: lines[index]))
+                    index += 1
+                }
+                appendBlock(.quote(quoteLines.joined(separator: "\n")))
+                continue
+            }
+
             if Self.isIndentedCode(line) {
                 flushParagraph()
                 var codeLines: [String] = []
@@ -2428,6 +2575,15 @@ private struct MarkdownText: View {
 
     private static func isIndentedCode(_ line: String) -> Bool {
         line.hasPrefix("    ") || line.hasPrefix("\t")
+    }
+
+    private static func isQuoteLine(_ line: String) -> Bool {
+        line.trimmingCharacters(in: .whitespaces).hasPrefix(">")
+    }
+
+    private static func quoteText(from line: String) -> String {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        return String(trimmed.dropFirst()).trimmingCharacters(in: .whitespaces)
     }
 
     private static func listItem(from line: String, id: Int) -> MarkdownListItem? {
@@ -2533,6 +2689,7 @@ private struct AdaptiveConversationLayout: Layout {
 private struct MarkdownBlock: Identifiable {
     enum Content {
         case paragraph(String)
+        case quote(String)
         case list([MarkdownListItem])
         case code(String, String)
         case table([[String]])
@@ -3155,7 +3312,7 @@ private struct MessageJumpItem: Identifiable, Equatable {
     static func paired(from items: [MessageIndexItem], turns: [CloudexTurn]) -> [MessageJumpItem] {
         var result: [MessageJumpItem] = []
         var pendingUser: MessageIndexItem?
-        let turnsByID = Dictionary(uniqueKeysWithValues: turns.map { ($0.id, $0) })
+        let turnsByID = Dictionary(turns.map { ($0.id, $0) }, uniquingKeysWith: { _, newer in newer })
 
         func makeItem(user: MessageIndexItem, assistant: MessageIndexItem?) -> MessageJumpItem {
             let turn = turnsByID[user.turnId]
@@ -3274,7 +3431,8 @@ private struct MessageJumpListView: View {
                     .tag(ConversationSubpage.review)
             }
             .pickerStyle(.segmented)
-            .padding(.horizontal, 16)
+                .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 16)
             .padding(.vertical, 8)
             .background(.bar)
 
@@ -3403,7 +3561,7 @@ private struct DirectoryNavigationChromeModifier: ViewModifier {
     }
 }
 
-private extension View {
+extension View {
     @ViewBuilder
     func nativeTopScrollEdgeEffect() -> some View {
         if #available(iOS 26.0, *) {
