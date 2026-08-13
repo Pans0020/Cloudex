@@ -12,6 +12,7 @@ final class AppViewModel: ObservableObject {
     @Published var selectedModelID: String
     @Published var selectedEffortID: String
     @Published var codexMode: CodexExecutionMode
+    @Published var claudeMode: ClaudeExecutionMode
     @Published private(set) var pinnedThreadIDs: Set<String>
     @Published var projects: [CloudexProject] = []
     @Published var renderedMessages: [ChatMessage] = []
@@ -102,6 +103,9 @@ final class AppViewModel: ObservableObject {
         codexMode = CodexExecutionMode(
             rawValue: defaults.string(forKey: "cloudex.codexMode") ?? ""
         ) ?? .requestApproval
+        claudeMode = ClaudeExecutionMode(
+            rawValue: defaults.string(forKey: "cloudex.claudeMode") ?? ""
+        ) ?? .manual
         pinnedThreadIDs = Set(defaults.stringArray(forKey: "cloudex.pinnedThreadIDs") ?? [])
         notifyApprovals = defaults.object(forKey: "cloudex.notifyApprovals") as? Bool ?? true
         notifyTaskSuccess = defaults.object(forKey: "cloudex.notifyTaskSuccess") as? Bool ?? true
@@ -166,9 +170,15 @@ final class AppViewModel: ObservableObject {
     }
     var isConnected: Bool { isServerReachable }
     var active: Bool { liveRunning || selectedThread?.isActive == true }
-    var selectedModel: CodexModel? { models.first { $0.identifier == selectedModelID } }
+    var selectedModel: CodexModel? {
+        models.first { $0.agentProvider == selectedAgentProvider && $0.identifier == selectedModelID }
+    }
     var modelsForSelectedProvider: [CodexModel] {
-        models.filter { $0.agentProvider == selectedAgentProvider }
+        var seen = Set<String>()
+        return models.filter {
+            guard $0.agentProvider == selectedAgentProvider else { return false }
+            return seen.insert($0.identifier).inserted
+        }
     }
     var availableEfforts: [ReasoningEffortOption] { selectedModel?.supportedReasoningEfforts ?? [] }
     var selectedEffortTitle: String {
@@ -360,6 +370,16 @@ final class AppViewModel: ObservableObject {
                 isCompressed: true
             )
         }
+        if item.type == "thinking" {
+            return ChatMessage(
+                id: item.id ?? "\(turnID)-thinking-\(fallbackIndex)",
+                role: .execution,
+                text: item.renderedText,
+                executionStatus: item.status,
+                executionKind: "thinking",
+                createdAt: item.createdAt
+            )
+        }
         if item.type == "commandExecution" || item.command != nil || item.activity == "edited" || item.diff != nil {
             let command = item.command?.trimmingCharacters(in: .whitespacesAndNewlines)
             let execution = command.map { semanticExecution(command: $0, activity: item.activity, status: item.status) }
@@ -526,6 +546,9 @@ final class AppViewModel: ObservableObject {
 
     private func semanticExecution(command: String, activity: String?, status: String?) -> (text: String, kind: String) {
         let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let operation = abstractOperationDisplay(from: trimmed) {
+            return operation
+        }
         if let readTargets = readTargets(from: trimmed) {
             return ("Read \(joinedTargets(readTargets))", "read")
         }
@@ -550,9 +573,17 @@ final class AppViewModel: ObservableObject {
     }
 
     private func readTargets(from command: String) -> [String]? {
-        guard containsCommand(command, names: ["sed", "cat", "head", "tail"]) else { return nil }
+        guard containsCommand(command, names: ["read", "sed", "cat", "head", "tail"]) else { return nil }
         let targets = fileTargets(from: command)
         return targets.isEmpty ? ["files"] : targets
+    }
+
+    private func abstractOperationDisplay(from command: String) -> (text: String, kind: String)? {
+        let tokens = semanticCommandTokens(command)
+        guard let operation = tokens.first?.lowercased(), ["browse", "search"].contains(operation) else { return nil }
+        let value = tokens.dropFirst().joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return (operation == "browse" ? "Browse web" : "Search workspace", operation) }
+        return ("\(operation == "browse" ? "Browse" : "Search") \(value)", operation)
     }
 
     private func searchDisplay(from command: String) -> (query: String, targets: [String])? {
@@ -670,7 +701,7 @@ final class AppViewModel: ObservableObject {
 
     private func fileTargets(from command: String) -> [String] {
         let tokens = semanticCommandTokens(command)
-        let ignoredCommands = Set(["sed", "cat", "head", "tail", "rg", "grep", "find", "fd", "git", "ps", "aux", "ls", "pwd", "wc", "stat", "which", "sh", "bash", "zsh", "fish", "env"])
+        let ignoredCommands = Set(["read", "sed", "cat", "head", "tail", "rg", "grep", "find", "fd", "git", "ps", "aux", "ls", "pwd", "wc", "stat", "which", "sh", "bash", "zsh", "fish", "env"])
         let ignoredOptionArguments = Set(["-n", "-e", "-f", "-m", "-A", "-B", "-C", "--max-count", "--after-context", "--before-context", "--context", "--glob", "-g", "--type", "-t"])
         var values: [String] = []
         var skipNext = false
@@ -1027,6 +1058,7 @@ final class AppViewModel: ObservableObject {
         let rawCommand = (item["command"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
             ?? (item["path"] as? String)
             ?? (!changedPaths.isEmpty ? changedPaths.joined(separator: ", ") : nil)
+        let rawText = liveText(from: item).trimmingCharacters(in: .whitespacesAndNewlines)
         let execution = rawCommand.map { semanticExecution(command: $0, activity: activity, status: status) }
         let duration: String? = {
             guard let milliseconds = (item["durationMs"] as? NSNumber)?.doubleValue else { return nil }
@@ -1038,6 +1070,7 @@ final class AppViewModel: ObservableObject {
             role: .execution,
             text: editText
                 ?? execution?.text
+                ?? (activity == "thinking" ? rawText : nil)
                 ?? previous?.text
                 ?? (activity == "edited" ? "Edited files" : activity == "explored" ? "Explored workspace" : "Ran tool"),
             executionStatus: status,
@@ -1059,6 +1092,8 @@ final class AppViewModel: ObservableObject {
         let type = (item["type"] as? String ?? "").lowercased()
         return type == "commandexecution"
             || type.contains("commandexecution")
+            || type == "thinking"
+            || type.contains("thinking")
             || type.contains("filechange")
             || type.contains("toolcall")
             || item["command"] != nil
@@ -1751,7 +1786,7 @@ final class AppViewModel: ObservableObject {
         if !steering {
             if !selectedModelID.isEmpty { body["model"] = selectedModelID }
             if !selectedEffortID.isEmpty { body["effort"] = selectedEffortID }
-            body.merge(codexModePayload) { _, new in new }
+            body.merge(agentModePayload) { _, new in new }
         }
         if !attachedFiles.isEmpty { body["files"] = attachedFiles.map { ["path": $0.path] } }
         do {
@@ -1843,7 +1878,7 @@ final class AppViewModel: ObservableObject {
         if let editedMessage { payload["message"] = editedMessage }
         if !selectedModelID.isEmpty { payload["model"] = selectedModelID }
         if !selectedEffortID.isEmpty { payload["effort"] = selectedEffortID }
-        payload.merge(codexModePayload) { _, new in new }
+        payload.merge(agentModePayload) { _, new in new }
         do {
             let result: ForkThreadResponse = try await client.post(
                 client.threadPath(threadID, action: "fork"),
@@ -2001,6 +2036,11 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    func selectClaudeMode(_ mode: ClaudeExecutionMode) {
+        claudeMode = mode
+        UserDefaults.standard.set(mode.rawValue, forKey: "cloudex.claudeMode")
+    }
+
     func isPinned(_ threadID: String) -> Bool {
         pinnedThreadIDs.contains(threadID)
     }
@@ -2021,6 +2061,14 @@ final class AppViewModel: ObservableObject {
             "approvalsReviewer": codexMode.approvalsReviewer,
             "sandboxPolicy": ["type": codexMode.sandboxPolicyType],
         ]
+    }
+
+    private var claudeModePayload: [String: Any] {
+        ["claudePermissionMode": claudeMode.rawValue]
+    }
+
+    private var agentModePayload: [String: Any] {
+        selectedAgentProvider == .claude ? claudeModePayload : codexModePayload
     }
 
     private func normalizeEffortForSelectedModel() {

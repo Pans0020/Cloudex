@@ -139,6 +139,33 @@ enum CodexExecutionMode: String, CaseIterable, Identifiable, Codable {
     }
 }
 
+enum ClaudeExecutionMode: String, CaseIterable, Identifiable, Codable {
+    case manual
+    case acceptEdits
+    case plan
+    case bypassPermissions
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .manual: return cloudexLocalized("手动确认")
+        case .acceptEdits: return cloudexLocalized("接受编辑")
+        case .plan: return "Plan"
+        case .bypassPermissions: return cloudexLocalized("绕过权限")
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .manual: return "hand.raised"
+        case .acceptEdits: return "pencil.and.outline"
+        case .plan: return "list.clipboard"
+        case .bypassPermissions: return "lock.open"
+        }
+    }
+}
+
 enum AgentProvider: String, CaseIterable, Identifiable, Codable {
     case codex
     case qwen

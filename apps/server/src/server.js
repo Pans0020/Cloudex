@@ -1308,6 +1308,7 @@ async function handle(req, res, url) {
         files: data.files || [],
         model: data.model || null,
         effort: data.effort || null,
+        permissionMode: data.claudePermissionMode || "manual",
         onEvent: (message) => publish(message),
       });
       thread = result.thread;
@@ -1385,6 +1386,7 @@ async function handle(req, res, url) {
           files: input.filter((part) => part.type === "localImage"),
           model: data.model || null,
           effort: data.effort || null,
+          permissionMode: data.claudePermissionMode || "manual",
           onEvent: (message) => publish(message),
         });
         thread = result.thread;

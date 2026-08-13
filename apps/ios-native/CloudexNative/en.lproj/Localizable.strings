@@ -110,6 +110,9 @@
 "请求批准" = "Ask for Approval";
 "替我审批" = "Approve for Me";
 "完全访问" = "Full Access";
+"手动确认" = "Manual";
+"接受编辑" = "Accept Edits";
+"绕过权限" = "Bypass Permissions";
 "自动" = "Automatic";
 "局域网" = "LAN";
 "低" = "Low";

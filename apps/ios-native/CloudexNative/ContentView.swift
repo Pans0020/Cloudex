@@ -645,7 +645,10 @@ struct ContentView: View {
                     .font(.caption.weight(.medium))
                     .padding(.horizontal, 10)
                     .padding(.vertical, 6)
-                    .frame(maxWidth: 172, alignment: .leading)
+                    // Keep the capsule intrinsic to the model/effort labels.
+                    // A maxWidth frame makes SwiftUI consume the remaining
+                    // toolbar width, which appears as an empty tail.
+                    .fixedSize(horizontal: true, vertical: false)
                     .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
@@ -655,31 +658,44 @@ struct ContentView: View {
                     Task { await viewModel.loadModelsIfNeeded(force: true) }
                 })
 
-                Menu {
-                    Picker("模式", selection: Binding(
-                        get: { viewModel.codexMode },
-                        set: { viewModel.selectCodexMode($0) }
-                    )) {
-                        ForEach(CodexExecutionMode.allCases) { mode in
-                            Label(mode.title, systemImage: mode.systemImage)
-                                .tag(mode)
+                Group {
+                    if viewModel.selectedAgentProvider == .claude {
+                        Menu {
+                            Picker("模式", selection: Binding(
+                                get: { viewModel.claudeMode },
+                                set: { viewModel.selectClaudeMode($0) }
+                            )) {
+                                ForEach(ClaudeExecutionMode.allCases) { mode in
+                                    Label(mode.title, systemImage: mode.systemImage).tag(mode)
+                                }
+                            }
+                        } label: {
+                            Label(viewModel.claudeMode.title, systemImage: viewModel.claudeMode.systemImage)
+                                .font(.caption.weight(.medium))
+                                .lineLimit(1)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .contentShape(Capsule())
+                        }
+                    } else {
+                        Menu {
+                            Picker("模式", selection: Binding(
+                                get: { viewModel.codexMode },
+                                set: { viewModel.selectCodexMode($0) }
+                            )) {
+                                ForEach(CodexExecutionMode.allCases) { mode in
+                                    Label(mode.title, systemImage: mode.systemImage).tag(mode)
+                                }
+                            }
+                        } label: {
+                            Label(viewModel.codexMode.title, systemImage: viewModel.codexMode.systemImage)
+                                .font(.caption.weight(.medium))
+                                .lineLimit(1)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .contentShape(Capsule())
                         }
                     }
-                } label: {
-                    ViewThatFits(in: .horizontal) {
-                        Label(viewModel.codexMode.title, systemImage: viewModel.codexMode.systemImage)
-                            .font(.caption.weight(.medium))
-                            .fixedSize(horizontal: true, vertical: false)
-
-                        Label(viewModel.codexMode.title, systemImage: viewModel.codexMode.systemImage)
-                            .font(.caption.weight(.medium))
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                            .frame(width: 120, alignment: .leading)
-                    }
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
                 .liquidGlass(in: Capsule(), interactive: true)
@@ -2774,7 +2790,12 @@ private struct MarkdownTableView: View {
                                 .font(.subheadline)
                                 .foregroundStyle(.primary)
                                 .multilineTextAlignment(.leading)
-                                .frame(minWidth: 110, maxWidth: 220, alignment: .leading)
+                                // A horizontal ScrollView gives Grid an
+                                // unbounded width proposal. Give each cell a
+                                // real wrapping width so Text reports its
+                                // full height back to the row measurement.
+                                .frame(width: 180, alignment: .leading)
+                                .lineLimit(nil)
                                 .fixedSize(horizontal: false, vertical: true)
                                 .padding(.horizontal, 10)
                                 .padding(.vertical, 8)
@@ -2795,7 +2816,12 @@ private struct MarkdownTableView: View {
 
     private func inlineText(_ value: String) -> AttributedString {
         let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .full)
-        let parsed = (try? AttributedString(markdown: value, options: options)) ?? AttributedString(value)
+        let normalized = value.replacingOccurrences(
+            of: #"(?i)<br\s*/?>"#,
+            with: "\n",
+            options: .regularExpression
+        )
+        let parsed = (try? AttributedString(markdown: normalized, options: options)) ?? AttributedString(normalized)
         return highlightedAttributedString(markdownInlineCodeBackground(parsed), query: highlightQuery)
     }
 }
