@@ -3,6 +3,7 @@ import gitdiff
 import UIKit
 import QuickLook
 import Foundation
+import PhotosUI
 
 private enum ConversationSubpage: Hashable {
     case conversation
@@ -20,10 +21,13 @@ struct ContentView: View {
     @Environment(\.cloudexIsWindowedIPad) private var isWindowedIPad
     @Environment(\.cloudexBottomSafeArea) private var bottomSafeArea
     @StateObject private var chatScrollController = ChatScrollController()
+    @StateObject private var speechInput = SpeechInputController()
     let expectedThreadID: String?
     let onToggleDirectory: (() -> Void)?
     let showsDirectoryButton: Bool
     @State private var showingFilePicker = false
+    @State private var showingPhotosPicker = false
+    @State private var selectedPhoto: PhotosPickerItem?
     @State private var isAtChatBottom = true
     @State private var isFollowingChatBottom = true
     @State private var hasLoadedChatContent = false
@@ -199,6 +203,15 @@ struct ContentView: View {
         .onAppear {
             prepareNewChatRouteIfNeeded()
         }
+        .onDisappear { speechInput.stop() }
+        .alert("语音输入", isPresented: Binding(
+            get: { speechInput.errorMessage != nil },
+            set: { if !$0 { speechInput.errorMessage = nil } }
+        )) {
+            Button("好", role: .cancel) { speechInput.errorMessage = nil }
+        } message: {
+            Text(speechInput.errorMessage ?? "")
+        }
         .sheet(isPresented: $showingFilePicker) {
             RemoteFilePickerView(
                 isPresented: $showingFilePicker,
@@ -207,6 +220,19 @@ struct ContentView: View {
                 viewModel.attach(file)
             }
             .environmentObject(viewModel)
+        }
+        .photosPicker(isPresented: $showingPhotosPicker, selection: $selectedPhoto, matching: .images)
+        .onChange(of: selectedPhoto) { _, item in
+            Task {
+                guard let data = try? await item?.loadTransferable(type: Data.self),
+                      let image = UIImage(data: data),
+                      let jpeg = image.jpegData(compressionQuality: 0.85) else {
+                    viewModel.status = "无法读取所选照片"
+                    return
+                }
+                _ = await viewModel.attachPhoneImage(jpeg)
+                selectedPhoto = nil
+            }
         }
         .sheet(item: $viewModel.presentedInput) { input in
             InputRequestSheet(input: input)
@@ -797,7 +823,14 @@ struct ContentView: View {
 
     private var composerControlStack: some View {
         HStack(alignment: .bottom, spacing: 10) {
-            Button { showingFilePicker = true } label: {
+            Menu {
+                Button { showingFilePicker = true } label: {
+                    Label("电脑文件", systemImage: "folder")
+                }
+                Button { showingPhotosPicker = true } label: {
+                    Label("手机照片", systemImage: "photo")
+                }
+            } label: {
                 Image(systemName: "paperclip")
                     .font(.body.weight(.semibold))
                     .frame(width: 46, height: 46)
@@ -805,8 +838,29 @@ struct ContentView: View {
             }
             .buttonStyle(.plain)
             .liquidGlass(in: Circle(), interactive: true)
-            .disabled((viewModel.selectedProjectCWD ?? viewModel.selectedThread?.cwd ?? viewModel.projects.first?.cwd) == nil)
-            .accessibilityLabel("上传文件")
+            .accessibilityLabel("添加附件")
+
+            Button {
+                if speechInput.isRecording {
+                    speechInput.stop()
+                } else {
+                    let existing = viewModel.draft
+                    Task {
+                        await speechInput.start { transcript in
+                            viewModel.draft = existing + (existing.isEmpty ? "" : " ") + transcript
+                        }
+                    }
+                }
+            } label: {
+                Image(systemName: speechInput.isRecording ? "stop.circle.fill" : "mic")
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(speechInput.isRecording ? Color.red : Color.primary)
+                    .frame(width: 46, height: 46)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .liquidGlass(in: Circle(), interactive: true)
+            .accessibilityLabel(speechInput.isRecording ? "停止语音输入" : "开始语音输入")
 
             if !agentBuiltInCommands.isEmpty {
                 Menu {
@@ -855,7 +909,8 @@ struct ContentView: View {
                 .padding(.leading, 4)
 
                 if viewModel.active {
-                    if viewModel.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    if viewModel.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        && viewModel.attachedFiles.isEmpty {
                         Button { Task { await viewModel.stop() } } label: {
                             Image(systemName: "stop.fill")
                                 .font(.caption.weight(.semibold))
@@ -961,7 +1016,8 @@ struct ContentView: View {
 
     private var isSendButtonDisabled: Bool {
         viewModel.isBusy
-            || viewModel.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || (viewModel.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && viewModel.attachedFiles.isEmpty)
     }
 
     private var isExpectedChatReady: Bool {

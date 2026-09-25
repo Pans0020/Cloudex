@@ -1,4 +1,5 @@
 import http from "node:http";
+import crypto from "node:crypto";
 import os from "node:os";
 import fs from "node:fs/promises";
 import syncFs from "node:fs";
@@ -16,7 +17,7 @@ import {
   stopThread as stopWindowsThread,
 } from "./windows-cli.js";
 import { printConnectionQRCode } from "./connection-qr.js";
-import { normalizeAllowedPath } from "./file-roots.js";
+import { isPathInside, normalizeAllowedPath } from "./file-roots.js";
 import { listModelsViaStdio } from "./app-server-stdio.js";
 import { QwenProvider } from "./qwen-provider.js";
 import { ClaudeProvider } from "./claude-provider.js";
@@ -26,12 +27,15 @@ const qwenProvider = new QwenProvider();
 const claudeProvider = new ClaudeProvider();
 const execFile = promisify(execFileCallback);
 const subscribers = new Map();
+const unsubscribeTimers = new Map();
 const globalSubscribers = new Set();
 const eventHistory = new Map();
 const pendingApprovals = new Map();
 const pendingInputs = new Map();
 const EVENT_HISTORY_LIMIT = 250;
 const APPROVAL_HISTORY_FILE = path.join(config.stateDir, "approval-history.json");
+const UPLOAD_ROOT = path.join(config.stateDir, "uploads");
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 let approvalHistory = null;
 let approvalHistoryLoadPromise = null;
 let approvalHistoryWrite = Promise.resolve();
@@ -369,6 +373,40 @@ function body(req) {
   });
 }
 
+async function imageBody(req) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > MAX_IMAGE_BYTES) {
+      const error = new Error("Image is larger than 10 MB");
+      error.status = 413;
+      throw error;
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+export async function saveUploadedImage(data, contentType) {
+  const formats = {
+    "image/jpeg": { extension: "jpg", valid: data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff },
+    "image/png": { extension: "png", valid: data.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])) },
+    "image/webp": { extension: "webp", valid: data.toString("ascii", 0, 4) === "RIFF" && data.toString("ascii", 8, 12) === "WEBP" },
+  };
+  const format = formats[contentType];
+  if (!format?.valid || data.length === 0 || data.length > MAX_IMAGE_BYTES) {
+    const error = new Error("Only PNG, JPEG or WebP images up to 10 MB are supported");
+    error.status = 415;
+    throw error;
+  }
+  await fs.mkdir(UPLOAD_ROOT, { recursive: true, mode: 0o700 });
+  const name = `${crypto.randomUUID()}.${format.extension}`;
+  const filePath = path.join(UPLOAD_ROOT, name);
+  await fs.writeFile(filePath, data, { mode: 0o600 });
+  return { name, path: filePath, type: "file", size: data.length, selectable: true };
+}
+
 function getThreadId(message) {
   const params = message.params || {};
   return params.threadId || params.thread?.id || params.turn?.threadId || null;
@@ -513,12 +551,32 @@ client.on("disconnected", () => {
   pendingInputs.clear();
 });
 
+function scheduleThreadUnsubscribe(threadId, delay = 250) {
+  if (!hasCodexProvider() || usesWindowsCliFallback() || subscribers.has(threadId)) return;
+  if (unsubscribeTimers.has(threadId)) clearTimeout(unsubscribeTimers.get(threadId));
+  const timer = setTimeout(() => {
+    unsubscribeTimers.delete(threadId);
+    if (!subscribers.has(threadId)) {
+      client.unsubscribeThread(threadId, () => !subscribers.has(threadId)).catch((error) =>
+        console.warn(`Cloudex unsubscribe failed: ${error.message}`));
+    }
+  }, delay);
+  unsubscribeTimers.set(threadId, timer);
+}
+
 function subscribe(threadId, res) {
+  if (unsubscribeTimers.has(threadId)) {
+    clearTimeout(unsubscribeTimers.get(threadId));
+    unsubscribeTimers.delete(threadId);
+  }
   if (!subscribers.has(threadId)) subscribers.set(threadId, new Set());
   subscribers.get(threadId).add(res);
   const cleanup = () => {
     subscribers.get(threadId)?.delete(res);
-    if (subscribers.get(threadId)?.size === 0) subscribers.delete(threadId);
+    if (subscribers.get(threadId)?.size === 0) {
+      subscribers.delete(threadId);
+      scheduleThreadUnsubscribe(threadId);
+    }
   };
   res.on("close", cleanup);
   return cleanup;
@@ -986,6 +1044,7 @@ function projectRootsFromThreads(threads) {
 }
 
 async function normalizeWorkspacePath(candidate) {
+  if (isUploadedImagePath(candidate)) return path.resolve(candidate);
   try {
     return normalizePath(candidate);
   } catch (error) {
@@ -1009,6 +1068,12 @@ async function normalizeWorkspacePath(candidate) {
     defaultPath: config.defaultCwd,
     roots: projectRootsFromThreads(await listAllThreads(false)),
   });
+}
+
+function isUploadedImagePath(candidate) {
+  const resolved = path.resolve(candidate);
+  return isPathInside(UPLOAD_ROOT, resolved)
+    && /^[0-9a-f-]{36}\.(png|jpg|webp)$/.test(path.basename(resolved));
 }
 
 function threadSignature(threads) {
@@ -1103,7 +1168,8 @@ async function inputFrom(bodyData) {
   }
   const input = [{ type: "text", text: message }];
   for (const file of bodyData.files || []) {
-    const filePath = await normalizeWorkspacePath(file.path || file);
+    const candidate = file.path || file;
+    const filePath = await normalizeWorkspacePath(candidate);
     if (isImage(filePath)) input.push({ type: "localImage", path: filePath });
     else input[0].text += `\n\n[Attached local file: ${filePath}]`;
   }
@@ -1222,6 +1288,10 @@ async function handle(req, res, url) {
   }
   if (req.method === "GET" && url.pathname === "/api/files") {
     return json(res, 200, await fileListing(url.searchParams.get("path")));
+  }
+  if (req.method === "POST" && url.pathname === "/api/uploads/image") {
+    const file = await saveUploadedImage(await imageBody(req), req.headers["content-type"]?.split(";")[0]);
+    return json(res, 201, file);
   }
   if (req.method === "GET" && url.pathname === "/api/review") {
     return json(res, 200, await projectReview(url.searchParams.get("path")));
@@ -1427,17 +1497,21 @@ async function handle(req, res, url) {
       // that fact immediately so a phone opening the new thread does not issue a
       // redundant thread/resume before its first rollout has been persisted.
       client.markThreadSubscribed(thread.id);
-      if (data.prompt) {
-        const turnResult = await client.request("turn/start", {
-          threadId: thread.id,
-          input: await inputFrom({ message: data.prompt, files: data.files }),
-          model: data.model || null,
-          effort: data.effort || null,
-          approvalPolicy: data.approvalPolicy || "on-request",
-          approvalsReviewer: data.approvalsReviewer || "user",
-          sandboxPolicy: sandboxPolicyFor(data.sandbox || "workspace-write"),
-        });
-        turn = turnResult.turn || turnResult;
+      try {
+        if (data.prompt) {
+          const turnResult = await client.request("turn/start", {
+            threadId: thread.id,
+            input: await inputFrom({ message: data.prompt, files: data.files }),
+            model: data.model || null,
+            effort: data.effort || null,
+            approvalPolicy: data.approvalPolicy || "on-request",
+            approvalsReviewer: data.approvalsReviewer || "user",
+            sandboxPolicy: sandboxPolicyFor(data.sandbox || "workspace-write"),
+          });
+          turn = turnResult.turn || turnResult;
+        }
+      } finally {
+        scheduleThreadUnsubscribe(thread.id, 2000);
       }
     }
     scheduleThreadSync("thread-created", 100);
@@ -1494,17 +1568,21 @@ async function handle(req, res, url) {
         });
       } else {
         const resume = await client.subscribeThread(threadId);
-        const turnResult = await client.request("turn/start", {
-          threadId,
-          input: await inputFrom(data),
-          model: data.model || null,
-          effort: data.effort || null,
-          approvalPolicy: data.approvalPolicy || "on-request",
-          approvalsReviewer: data.approvalsReviewer || "user",
-          sandboxPolicy: sandboxPolicyFor(data.sandbox || "workspace-write"),
-        });
-        thread = resume?.thread || resume || null;
-        turn = turnResult.turn || turnResult;
+        try {
+          const turnResult = await client.request("turn/start", {
+            threadId,
+            input: await inputFrom(data),
+            model: data.model || null,
+            effort: data.effort || null,
+            approvalPolicy: data.approvalPolicy || "on-request",
+            approvalsReviewer: data.approvalsReviewer || "user",
+            sandboxPolicy: sandboxPolicyFor(data.sandbox || "workspace-write"),
+          });
+          thread = resume?.thread || resume || null;
+          turn = turnResult.turn || turnResult;
+        } finally {
+          scheduleThreadUnsubscribe(threadId, 2000);
+        }
       }
       scheduleThreadSync("message-sent", 100);
       return json(res, 202, { thread, turn });
@@ -1592,18 +1670,22 @@ async function handle(req, res, url) {
       client.markThreadSubscribed(forkedThread.id);
 
       let turn = null;
-      const editedMessage = String(data.message || "").trim();
-      if (editedMessage) {
-        const turnResult = await client.request("turn/start", {
-          threadId: forkedThread.id,
-          input: await inputFrom({ message: editedMessage, files: data.files }),
-          model: data.model || null,
-          effort: data.effort || null,
-          approvalPolicy: data.approvalPolicy || "on-request",
-          approvalsReviewer: data.approvalsReviewer || "user",
-          sandboxPolicy: sandboxPolicyFor(data.sandbox || "workspace-write"),
-        });
-        turn = turnResult.turn || turnResult;
+      try {
+        const editedMessage = String(data.message || "").trim();
+        if (editedMessage) {
+          const turnResult = await client.request("turn/start", {
+            threadId: forkedThread.id,
+            input: await inputFrom({ message: editedMessage, files: data.files }),
+            model: data.model || null,
+            effort: data.effort || null,
+            approvalPolicy: data.approvalPolicy || "on-request",
+            approvalsReviewer: data.approvalsReviewer || "user",
+            sandboxPolicy: sandboxPolicyFor(data.sandbox || "workspace-write"),
+          });
+          turn = turnResult.turn || turnResult;
+        }
+      } finally {
+        scheduleThreadUnsubscribe(forkedThread.id, 2000);
       }
       scheduleThreadSync("thread-forked", 100);
       return json(res, 201, { thread: forkedThread, turn });

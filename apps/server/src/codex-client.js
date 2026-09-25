@@ -217,6 +217,7 @@ export class CodexClient extends EventEmitter {
     this.activeTurns = new Map();
     this.subscribedThreads = new Set();
     this.subscriptionRequests = new Map();
+    this.unsubscribeRequests = new Map();
   }
 
   async start() {
@@ -265,6 +266,7 @@ export class CodexClient extends EventEmitter {
       this.socket = null;
       this.subscribedThreads.clear();
       this.subscriptionRequests.clear();
+      this.unsubscribeRequests.clear();
       this.pendingServerRequests.clear();
       this.activeTurns.clear();
       this.rejectPending(new CodexError("Managed Codex app-server connection closed"));
@@ -341,6 +343,7 @@ export class CodexClient extends EventEmitter {
 
   async subscribeThread(threadId) {
     await this.ensureConnected();
+    await this.unsubscribeRequests.get(threadId)?.catch(() => {});
     if (this.subscribedThreads.has(threadId)) return;
     if (this.subscriptionRequests.has(threadId)) return this.subscriptionRequests.get(threadId);
     const request = this.request("thread/resume", { threadId })
@@ -350,6 +353,19 @@ export class CodexClient extends EventEmitter {
       })
       .finally(() => this.subscriptionRequests.delete(threadId));
     this.subscriptionRequests.set(threadId, request);
+    return request;
+  }
+
+  unsubscribeThread(threadId, shouldRelease = () => true) {
+    if (this.unsubscribeRequests.has(threadId)) return this.unsubscribeRequests.get(threadId);
+    const request = (async () => {
+      await this.subscriptionRequests.get(threadId)?.catch(() => {});
+      if (!shouldRelease() || !this.subscribedThreads.has(threadId)) return;
+      await this.request("thread/unsubscribe", { threadId });
+      this.subscribedThreads.delete(threadId);
+      this.activeTurns.delete(threadId);
+    })().finally(() => this.unsubscribeRequests.delete(threadId));
+    this.unsubscribeRequests.set(threadId, request);
     return request;
   }
 
@@ -382,6 +398,7 @@ export class CodexClient extends EventEmitter {
     this.child = null;
     this.subscribedThreads.clear();
     this.subscriptionRequests.clear();
+    this.unsubscribeRequests.clear();
     this.pendingServerRequests.clear();
     this.activeTurns.clear();
   }

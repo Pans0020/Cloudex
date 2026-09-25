@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import WidgetKit
 
 @MainActor
 final class AppViewModel: ObservableObject {
@@ -52,6 +53,8 @@ final class AppViewModel: ObservableObject {
     @Published var notifyTaskFailure: Bool
     @Published private(set) var connectionHistory: [ConnectionHistoryItem] = []
     @Published private(set) var serverProfiles: [ServerProfile] = []
+    @Published private(set) var serverOverviews: [ServerOverview] = []
+    @Published private(set) var pendingShares: [SharedItem] = []
     @Published var selectedServerProfileID: String?
 
     private let globalSSE = SSEClient()
@@ -59,6 +62,8 @@ final class AppViewModel: ObservableObject {
     private let conversationCache = LocalConversationCache.shared
     private var pollTask: Task<Void, Never>?
     private var healthTask: Task<Void, Never>?
+    private var overviewGeneration = 0
+    private var connectionGeneration = 0
     private var modelsLoaded = false
     private var modelsLoading = false
     private var started = false
@@ -117,7 +122,6 @@ final class AppViewModel: ObservableObject {
         defaults.set(tailscaleServerURL, forKey: "cloudex.tailscaleServerURL")
         defaults.set(connectionMode.rawValue, forKey: "cloudex.connectionMode")
         defaults.set(authToken, forKey: "cloudex.authToken")
-        projects = conversationCache.loadProjects() ?? []
         connectionHistory = Self.loadConnectionHistory(defaults: defaults)
         serverProfiles = Self.loadServerProfiles(defaults: defaults)
         if serverProfiles.isEmpty {
@@ -143,6 +147,7 @@ final class AppViewModel: ObservableObject {
             authToken = profile.token
             serverURL = profile.activeURL.isEmpty ? profile.preferredURL : profile.activeURL
         }
+        projects = conversationCache.loadProjects(profileID: selectedServerProfileID ?? "default") ?? []
         rebuildRenderedMessages()
     }
 
@@ -1136,6 +1141,7 @@ final class AppViewModel: ObservableObject {
     func start() async {
         guard !started else { return }
         started = true
+        loadSharedInbox()
         startHealthMonitor()
         await refresh()
         streamsStarted = true
@@ -1144,7 +1150,9 @@ final class AppViewModel: ObservableObject {
 
     func resumeFromForeground() async {
         guard started else { return }
+        loadSharedInbox()
         await refresh()
+        if streamsStarted { connectGlobalStream() }
         guard let threadID = selectedThreadID else { return }
         guard active else {
             // Completed conversations are immutable from the chat viewport's
@@ -1162,12 +1170,20 @@ final class AppViewModel: ObservableObject {
         startPolling(threadID: threadID)
     }
 
+    func suspendForBackground() {
+        globalSSE.stop()
+        threadSSE.stop()
+        pollTask?.cancel()
+        pollTask = nil
+    }
+
     func applySettings(
         lanServerURL: String,
         tailscaleServerURL: String,
         connectionMode: ConnectionMode,
         token: String
     ) async {
+        connectionGeneration += 1
         self.lanServerURL = normalizedURL(lanServerURL)
         self.tailscaleServerURL = normalizedURL(tailscaleServerURL)
         self.connectionMode = connectionMode
@@ -1222,11 +1238,35 @@ final class AppViewModel: ObservableObject {
         }
         persistServerProfiles()
         await switchToServerProfile(profile)
+        Task { await refreshServerOverviews() }
     }
 
     func switchToServerProfile(_ profile: ServerProfile) async {
+        let switching = selectedServerProfileID != profile.id
+        if switching {
+            if let previousID = selectedServerProfileID {
+                UserDefaults.standard.set(draft, forKey: "cloudex.draft.\(previousID)")
+                UserDefaults.standard.set(pendingSteerDraft, forKey: "cloudex.pendingSteerDraft.\(previousID)")
+            }
+            threadOpenGeneration += 1
+            detailLoadGeneration += 1
+            selectedThreadID = nil
+            selectedProjectCWD = nil
+            detail = nil
+            projects = conversationCache.loadProjects(profileID: profile.id) ?? []
+            liveRunning = false
+            isCreatingNew = false
+            attachedFiles = []
+            threadSSE.stop()
+            pollTask?.cancel()
+            pollTask = nil
+        }
         selectedServerProfileID = profile.id
         UserDefaults.standard.set(profile.id, forKey: "cloudex.selectedServerProfileID")
+        if switching {
+            draft = UserDefaults.standard.string(forKey: "cloudex.draft.\(profile.id)") ?? ""
+            pendingSteerDraft = UserDefaults.standard.string(forKey: "cloudex.pendingSteerDraft.\(profile.id)") ?? ""
+        }
         await applySettings(
             lanServerURL: profile.lanURL,
             tailscaleServerURL: profile.tailscaleURL,
@@ -1239,14 +1279,47 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    func loadSharedInbox() {
+        pendingShares = CloudexShared.pendingItems()
+    }
+
+    func acceptSharedItem(_ item: SharedItem, thread: CloudexThread, project: CloudexProject,
+                          profile: ServerProfile) async -> Bool {
+        if selectedServerProfileID != profile.id { await switchToServerProfile(profile) }
+        await openThread(thread, projectCWD: project.isNoProjectLike ? nil : project.cwd)
+        if let imageName = item.imageName {
+            guard let data = CloudexShared.imageData(for: item), !data.isEmpty,
+                  await attachPhoneImage(data) else {
+                status = "无法读取分享的图片：\(imageName)"
+                return false
+            }
+        }
+        let text = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !text.isEmpty { draft += (draft.isEmpty ? "" : "\n\n") + text }
+        CloudexShared.remove(item)
+        loadSharedInbox()
+        return true
+    }
+
     func deleteServerProfile(_ profile: ServerProfile) {
+        overviewGeneration += 1
         serverProfiles.removeAll { $0.id == profile.id }
+        serverOverviews.removeAll { $0.id == profile.id }
         persistServerProfiles()
         guard selectedServerProfileID == profile.id else { return }
-        selectedServerProfileID = serverProfiles.first?.id
-        UserDefaults.standard.set(selectedServerProfileID, forKey: "cloudex.selectedServerProfileID")
-        if let next = activeServerProfile {
+        if let next = serverProfiles.first {
             Task { await switchToServerProfile(next) }
+        } else {
+            connectionGeneration += 1
+            globalSSE.stop()
+            suspendForBackground()
+            selectedServerProfileID = nil
+            UserDefaults.standard.removeObject(forKey: "cloudex.selectedServerProfileID")
+            projects = []
+            selectedThreadID = nil
+            detail = nil
+            draft = ""
+            pendingSteerDraft = ""
         }
     }
 
@@ -1304,6 +1377,7 @@ final class AppViewModel: ObservableObject {
     }
 
     func refresh() async {
+        let generation = connectionGeneration
         isBusy = true
         defer { isBusy = false }
         var lastError: Error?
@@ -1313,11 +1387,13 @@ final class AppViewModel: ObservableObject {
                 let _: HealthResponse = try await candidateClient.get("/api/health")
                 let projectResponse: ProjectsResponse = try await candidateClient.get("/api/projects")
                 let approvalsResponse: ApprovalsResponse? = try? await candidateClient.get("/api/approvals")
+                guard generation == connectionGeneration else { return }
                 let switchedConnection = normalizedURL(serverURL) != candidate
                 serverURL = candidate
                 isServerReachable = true
                 applyProjects(projectResponse.data)
                 await synchronizeSelectedThreadIfNeeded(from: projectResponse.data)
+                guard generation == connectionGeneration else { return }
                 if let approvalsResponse { pendingApprovals = approvalsResponse.data }
                 status = cloudexLocalized(
                     "已连接 · %@ · %@",
@@ -1333,6 +1409,7 @@ final class AppViewModel: ObservableObject {
                 lastError = error
             }
         }
+        guard generation == connectionGeneration else { return }
         isServerReachable = false
         status = cloudexLocalized(
             "连接失败：%@",
@@ -1356,11 +1433,13 @@ final class AppViewModel: ObservableObject {
         if modelsLoaded && !force { return }
         modelsLoading = true
         defer { modelsLoading = false }
+        let generation = connectionGeneration
         var lastError: Error?
         for candidate in connectionCandidates {
             do {
                 let candidateClient = APIClient(serverURL: candidate, token: authToken)
                 let response: ModelsResponse = try await candidateClient.get("/api/models")
+                guard generation == connectionGeneration else { return }
                 let visibleModels = response.data.filter { $0.hidden != true }
                 models = visibleModels
                 modelsLoaded = true
@@ -1382,20 +1461,63 @@ final class AppViewModel: ObservableObject {
                 lastError = error
             }
         }
+        guard generation == connectionGeneration else { return }
         status = "读取模型列表失败：\(lastError?.localizedDescription ?? "无法访问本地服务器")"
     }
 
     private func startHealthMonitor() {
         healthTask?.cancel()
         healthTask = Task { [weak self] in
+            var tick = 0
             while !Task.isCancelled {
                 await self?.refreshServerReachability()
+                if tick.isMultiple(of: 3) { await self?.refreshServerOverviews() }
+                tick += 1
                 try? await Task.sleep(for: .seconds(5))
             }
         }
     }
 
+    func refreshServerOverviews() async {
+        overviewGeneration += 1
+        let generation = overviewGeneration
+        var latest: [ServerOverview] = []
+        for profile in serverProfiles {
+            guard !Task.isCancelled, generation == overviewGeneration else { return }
+            let candidates: [String]
+            switch profile.connectionMode {
+            case .automatic: candidates = [profile.lanURL, profile.tailscaleURL]
+            case .lan: candidates = [profile.lanURL]
+            case .tailscale: candidates = [profile.tailscaleURL]
+            }
+            var overview = ServerOverview(id: profile.id, isOnline: false, projectCount: 0,
+                                          activeThreads: [], pendingApprovalCount: 0, projects: [])
+            for address in candidates.map(normalizedURL).filter({ !$0.isEmpty }) {
+                let remote = APIClient(serverURL: address, token: profile.token)
+                do {
+                    let health: HealthResponse = try await remote.get("/api/health")
+                    guard health.ok else { continue }
+                    let projects: ProjectsResponse = try await remote.get("/api/projects")
+                    let approvals: ApprovalsResponse = try await remote.get("/api/approvals")
+                    overview = ServerOverview(
+                        id: profile.id,
+                        isOnline: true,
+                        projectCount: projects.data.count,
+                        activeThreads: projects.data.flatMap(\.threads).filter(\.isActive).map(\.title),
+                        pendingApprovalCount: approvals.data.count,
+                        projects: projects.data
+                    )
+                    break
+                } catch { continue }
+            }
+            latest.append(overview)
+        }
+        guard generation == overviewGeneration else { return }
+        serverOverviews = latest
+    }
+
     private func refreshServerReachability() async {
+        let generation = connectionGeneration
         var reachableCandidate: String?
         for candidate in connectionCandidates {
             do {
@@ -1407,6 +1529,7 @@ final class AppViewModel: ObservableObject {
                 continue
             }
         }
+        guard generation == connectionGeneration else { return }
         if let reachableCandidate {
             isServerReachable = true
             if connectionMode == .automatic, normalizedURL(serverURL) != reachableCandidate {
@@ -1414,9 +1537,11 @@ final class AppViewModel: ObservableObject {
             }
             let candidateClient = APIClient(serverURL: reachableCandidate, token: authToken)
             if let approvalsResponse: ApprovalsResponse = try? await candidateClient.get("/api/approvals") {
+                guard generation == connectionGeneration else { return }
                 pendingApprovals = approvalsResponse.data
             }
             if let inputsResponse: InputsResponse = try? await candidateClient.get("/api/inputs") {
+                guard generation == connectionGeneration else { return }
                 pendingInputs = inputsResponse.data
             }
         } else {
@@ -1707,12 +1832,12 @@ final class AppViewModel: ObservableObject {
 
     func send() async {
         let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !prompt.isEmpty else { return }
+        guard !prompt.isEmpty || !attachedFiles.isEmpty else { return }
         guard !active else {
             queueSteerDraft()
             return
         }
-        _ = await submitPrompt(prompt, steering: false)
+        _ = await submitPrompt(prompt.isEmpty ? "请查看附件" : prompt, steering: false)
     }
 
     func sendBuiltInCommand(_ command: String) async {
@@ -1728,11 +1853,12 @@ final class AppViewModel: ObservableObject {
 
     func queueSteerDraft() {
         let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard active, !prompt.isEmpty else { return }
+        guard active, !prompt.isEmpty || !attachedFiles.isEmpty else { return }
+        let queuedText = prompt.isEmpty ? "请查看附件" : draft
         if pendingSteerDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            pendingSteerDraft = draft
+            pendingSteerDraft = queuedText
         } else {
-            pendingSteerDraft += "\n\n\(draft)"
+            pendingSteerDraft += "\n\n\(queuedText)"
         }
         draft = ""
     }
@@ -1783,6 +1909,7 @@ final class AppViewModel: ObservableObject {
     }
 
     private func submitPrompt(_ prompt: String, steering: Bool) async -> Bool {
+        let generation = connectionGeneration
         let wasRunning = active
         isBusy = true
         liveRunning = true
@@ -1800,9 +1927,11 @@ final class AppViewModel: ObservableObject {
                 body["message"] = prompt
                 let action = steering ? "steer" : "message"
                 let _: EmptyResponse = try await client.post(client.threadPath(selectedThreadID, action: action), json: body)
+                guard generation == connectionGeneration else { return false }
                 draft = ""
                 attachedFiles = []
                 await loadThread(selectedThreadID)
+                guard generation == connectionGeneration else { return false }
                 isBusy = false
                 return true
             } else {
@@ -1819,6 +1948,7 @@ final class AppViewModel: ObservableObject {
                     body["noProject"] = true
                 }
                 let result: CreateThreadResponse = try await client.post("/api/threads", json: body)
+                guard generation == connectionGeneration else { return false }
                 draft = ""
                 attachedFiles = []
                 isCreatingNew = false
@@ -1831,6 +1961,7 @@ final class AppViewModel: ObservableObject {
                 return true
             }
         } catch {
+            guard generation == connectionGeneration else { return false }
             liveRunning = wasRunning
             localError = error.localizedDescription
             status = "发送失败：\(error.localizedDescription)"
@@ -1998,6 +2129,17 @@ final class AppViewModel: ObservableObject {
         attachedFiles.append(file)
     }
 
+    func attachPhoneImage(_ data: Data) async -> Bool {
+        do {
+            let file = try await client.uploadImage(data)
+            attach(file)
+            return true
+        } catch {
+            status = "上传图片失败：\(error.localizedDescription)"
+            return false
+        }
+    }
+
     func removeAttachment(_ file: RemoteFileEntry) {
         attachedFiles.removeAll { $0.path == file.path }
     }
@@ -2139,9 +2281,22 @@ final class AppViewModel: ObservableObject {
     private func applyProjects(_ value: [CloudexProject]) {
         if projects == value { return }
         projects = value
-        conversationCache.saveProjects(value)
+        updateCurrentTaskSnapshot()
+        conversationCache.saveProjects(value, profileID: selectedServerProfileID ?? "default")
         if let selectedProjectCWD, !value.contains(where: { $0.cwd == selectedProjectCWD }) {
             self.selectedProjectCWD = nil
+        }
+    }
+
+    private func updateCurrentTaskSnapshot() {
+        let activeThreads = projects.flatMap(\.threads).filter(\.isActive)
+        let title = activeThreads.first(where: { $0.id == selectedThreadID })?.title
+            ?? activeThreads.first?.title ?? "无运行任务"
+        let snapshot = CurrentTaskSnapshot(hostName: serverProfileTitle, title: title,
+                                           activeCount: activeThreads.count, updatedAt: Date())
+        if let data = try? JSONEncoder().encode(snapshot) {
+            UserDefaults(suiteName: CloudexShared.groupID)?.set(data, forKey: "currentTask")
+            WidgetCenter.shared.reloadTimelines(ofKind: "CloudexCurrentTask")
         }
     }
 
@@ -2170,15 +2325,23 @@ final class AppViewModel: ObservableObject {
 
     private func connectGlobalStream() {
         do {
+            let generation = connectionGeneration
             let url = try client.makeURL(path: "/api/events")
             globalSSE.onOpen = { [weak self] in
-                Task { @MainActor in self?.status = cloudexLocalized("已连接 · 实时同步") }
+                Task { @MainActor in
+                    guard self?.connectionGeneration == generation else { return }
+                    self?.status = cloudexLocalized("已连接 · 实时同步")
+                }
             }
             globalSSE.onEvent = { [weak self] event in
-                Task { @MainActor in self?.handleGlobalEvent(event) }
+                Task { @MainActor in
+                    guard self?.connectionGeneration == generation else { return }
+                    self?.handleGlobalEvent(event)
+                }
             }
             globalSSE.onDisconnect = { [weak self] message in
                 Task { @MainActor in
+                    guard self?.connectionGeneration == generation else { return }
                     self?.status = message.contains("401") ? "实时总线认证失败：请确认 Token" : "实时总线断开：\(message)"
                 }
             }
@@ -2193,19 +2356,25 @@ final class AppViewModel: ObservableObject {
         lastThreadEventID = 0
         threadStreamReplaying = true
         do {
+            let generation = connectionGeneration
             let url = try client.makeURL(path: client.threadPath(threadID, action: "stream"))
             threadSSE.onEvent = { [weak self] event in
-                Task { @MainActor in self?.handleThreadEvent(event, expectedThreadID: threadID) }
+                Task { @MainActor in
+                    guard self?.connectionGeneration == generation else { return }
+                    self?.handleThreadEvent(event, expectedThreadID: threadID)
+                }
             }
             threadSSE.onOpen = { [weak self] in
                 Task { @MainActor in
+                    guard self?.connectionGeneration == generation else { return }
                     self?.lastThreadEventID = 0
                     self?.threadStreamReplaying = true
                 }
             }
             threadSSE.onDisconnect = { [weak self] message in
                 Task { @MainActor in
-                    guard self?.selectedThreadID == threadID else { return }
+                    guard self?.connectionGeneration == generation,
+                          self?.selectedThreadID == threadID else { return }
                     self?.status = message.contains("401") ? "实时订阅认证失败：请确认 Token" : "实时连接断开：\(message)"
                 }
             }

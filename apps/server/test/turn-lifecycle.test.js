@@ -59,6 +59,58 @@ test('closed threads resubscribe and clear their active turn', async () => {
   assert.equal(client.getActiveTurn('thread'), undefined);
 });
 
+test('closing the last phone stream releases its Codex subscription', async () => {
+  const client = new CodexClient();
+  client.markThreadSubscribed('thread');
+  client.setActiveTurn('thread', 'turn');
+  const calls = [];
+  client.request = async (method, params) => { calls.push([method, params]); return { status: 'unsubscribed' }; };
+  await client.unsubscribeThread('thread');
+  assert.deepEqual(calls, [['thread/unsubscribe', { threadId: 'thread' }]]);
+  assert.equal(client.getActiveTurn('thread'), undefined);
+  await client.unsubscribeThread('thread');
+  assert.equal(calls.length, 1);
+});
+
+test('reconnected phone stream retains its Codex subscription', async () => {
+  const client = new CodexClient();
+  let resolveResume;
+  client.subscriptionRequests.set('thread', new Promise((resolve) => { resolveResume = resolve; }));
+  let currentStreamExists = false;
+  const calls = [];
+  client.request = async (method) => { calls.push(method); return {}; };
+  const closing = client.unsubscribeThread('thread', () => !currentStreamExists);
+  currentStreamExists = true;
+  client.markThreadSubscribed('thread');
+  resolveResume();
+  await closing;
+  assert.deepEqual(calls, []);
+  assert.equal(client.subscribedThreads.has('thread'), true);
+});
+
+test('reconnect waits for an in-flight unsubscribe before resuming', async () => {
+  const client = new CodexClient();
+  client.markThreadSubscribed('thread');
+  client.ensureConnected = async () => {};
+  let finishUnsubscribe;
+  const calls = [];
+  client.request = async (method) => {
+    calls.push(method);
+    if (method === 'thread/unsubscribe') {
+      await new Promise((resolve) => { finishUnsubscribe = resolve; });
+    }
+    return {};
+  };
+  const closing = client.unsubscribeThread('thread');
+  await Promise.resolve();
+  const reopening = client.subscribeThread('thread');
+  assert.deepEqual(calls, ['thread/unsubscribe']);
+  finishUnsubscribe();
+  await Promise.all([closing, reopening]);
+  assert.deepEqual(calls, ['thread/unsubscribe', 'thread/resume']);
+  assert.equal(client.subscribedThreads.has('thread'), true);
+});
+
 test('new rollout items retain images, MCP calls and file changes', async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cloudex-rollout-'));
   const file = path.join(dir, 'rollout-2026-09-25-01a0d7e2-1b3c-7ea1-9c38-3913a8e36e26.jsonl');

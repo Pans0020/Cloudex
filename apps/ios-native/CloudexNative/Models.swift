@@ -266,6 +266,15 @@ struct ServerProfile: Codable, Identifiable, Equatable {
     }
 }
 
+struct ServerOverview: Identifiable, Equatable {
+    let id: String
+    let isOnline: Bool
+    let projectCount: Int
+    let activeThreads: [String]
+    let pendingApprovalCount: Int
+    let projects: [CloudexProject]
+}
+
 struct ProjectsResponse: Codable {
     let data: [CloudexProject]
     let total: Int?

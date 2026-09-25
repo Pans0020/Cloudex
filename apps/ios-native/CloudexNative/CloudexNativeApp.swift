@@ -23,7 +23,8 @@ struct CloudexNativeApp: App {
                     CloudexAppDelegate.notifications.setAppIsInForeground(phase == .active)
                     if phase == .active {
                         Task { await viewModel.resumeFromForeground() }
-                    } else {
+                    } else if phase == .background {
+                        viewModel.suspendForBackground()
                         for approval in viewModel.pendingApprovals {
                             CloudexAppDelegate.notifications.scheduleApproval(approval)
                         }

@@ -8,6 +8,7 @@ struct CloudexRootView: View {
     @State private var navigationPath: [String] = []
     @State private var searchQuery = ""
     @State private var showingSettings = false
+    @State private var presentingSharedItem: SharedItem?
     @FocusState private var searchFieldFocused: Bool
     @State private var keyboardHeight: CGFloat = 0
     @State private var searchMatches: [ConversationSearchMatch] = []
@@ -47,6 +48,17 @@ struct CloudexRootView: View {
         .onChange(of: viewModel.projects) { _, _ in
             normalizeIPadProjectSelection()
         }
+        .onChange(of: viewModel.selectedServerProfileID) { oldValue, newValue in
+            guard oldValue != newValue else { return }
+            navigationPath = []
+            iPadSelectedThreadRoute = nil
+            iPadSelectedProjectID = nil
+            expandedProjectIDs = []
+            lastOpenedThreadID = ""
+        }
+        .onChange(of: viewModel.pendingShares) { _, shares in
+            if presentingSharedItem == nil { presentingSharedItem = shares.first }
+        }
         .onChange(of: searchQuery) { _, query in
             scheduleMessageSearch(query)
         }
@@ -67,6 +79,24 @@ struct CloudexRootView: View {
             SettingsView(isPresented: $showingSettings)
                 .environmentObject(viewModel)
         }
+        .sheet(item: $presentingSharedItem) { item in
+            SharedDestinationSheet(item: item) { profile, project, thread in
+                Task {
+                    guard await viewModel.acceptSharedItem(item, thread: thread, project: project,
+                                                           profile: profile) else { return }
+                    presentingSharedItem = nil
+                    lastOpenedThreadID = thread.id
+                    if usesIPadLayout {
+                        iPadSelectedThreadRoute = thread.id
+                        selectProjectContainingThread(thread.id)
+                        iPadPreferredCompactColumn = .detail
+                    } else {
+                        navigationPath = [thread.id]
+                    }
+                }
+            }
+            .environmentObject(viewModel)
+        }
     }
 
     private var usesIPadLayout: Bool {
@@ -85,6 +115,8 @@ struct CloudexRootView: View {
     private var phoneNavigation: some View {
         NavigationStack(path: $navigationPath) {
             List {
+                serverOverviewSection
+
                 if !pinnedConversations.isEmpty {
                     Section("置顶") {
                         ForEach(pinnedConversations) { pinned in
@@ -123,6 +155,10 @@ struct CloudexRootView: View {
                         } label: {
                             HStack {
                                 Text(project.displayName)
+                                Text(viewModel.serverProfileTitle)
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                                    .lineLimit(1)
                                 Spacer(minLength: 8)
                                 Image(systemName: isProjectCollapsed(project) ? "chevron.right" : "chevron.down")
                                     .font(.caption.weight(.semibold))
@@ -246,6 +282,8 @@ struct CloudexRootView: View {
 
     private func iPadSidebarColumn(windowed: Bool, bottomSafeArea: CGFloat) -> some View {
         List {
+            serverOverviewSection
+
             if !pinnedConversations.isEmpty {
                 Section("置顶") {
                     ForEach(pinnedConversations) { pinned in
@@ -284,6 +322,10 @@ struct CloudexRootView: View {
                     } label: {
                         HStack {
                             Text(project.displayName)
+                            Text(viewModel.serverProfileTitle)
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                                .lineLimit(1)
                             Spacer(minLength: 8)
                             Image(systemName: isProjectCollapsed(project) ? "chevron.right" : "chevron.down")
                                 .font(.caption.weight(.semibold))
@@ -313,6 +355,57 @@ struct CloudexRootView: View {
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 conversationSearchBar(isWindowedIPad: windowed, bottomSafeArea: bottomSafeArea)
             }
+    }
+
+    private var serverOverviewSection: some View {
+        Section("主机") {
+            if !viewModel.pendingShares.isEmpty {
+                Button {
+                    presentingSharedItem = viewModel.pendingShares.first
+                } label: {
+                    Label("待分享 \(viewModel.pendingShares.count)", systemImage: "square.and.arrow.down")
+                }
+            }
+            ForEach(viewModel.serverProfiles) { profile in
+                let overview = viewModel.serverOverviews.first { $0.id == profile.id }
+                Button {
+                    guard viewModel.selectedServerProfileID != profile.id else { return }
+                    Task { await viewModel.switchToServerProfile(profile) }
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: "server.rack")
+                            .foregroundStyle(overview?.isOnline == true ? Color.green : Color.secondary)
+                            .frame(width: 20)
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack(spacing: 6) {
+                                Text(profile.name).fontWeight(.medium)
+                                if viewModel.selectedServerProfileID == profile.id {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .foregroundStyle(.tint)
+                                }
+                            }
+                            Text(overview.map { $0.isOnline
+                                ? "\($0.projectCount) 个项目 · \($0.activeThreads.count) 个运行中 · \($0.pendingApprovalCount) 个待审批"
+                                : "离线" } ?? "检查中")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            if let title = overview?.activeThreads.first {
+                                Text(title).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                            }
+                        }
+                        Spacer(minLength: 0)
+                        if let pending = overview?.pendingApprovalCount, pending > 0 {
+                            Text("\(pending)")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.orange)
+                        }
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("\(profile.name)，\(overview?.isOnline == true ? "在线" : "离线")")
+            }
+        }
     }
 
     @ToolbarContentBuilder
@@ -994,6 +1087,63 @@ struct CloudexRootView: View {
         .background(.clear)
     }
 
+}
+
+private struct SharedDestinationSheet: View {
+    @EnvironmentObject private var viewModel: AppViewModel
+    @Environment(\.dismiss) private var dismiss
+    let item: SharedItem
+    let onSelect: (ServerProfile, CloudexProject, CloudexThread) -> Void
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if !item.text.isEmpty || item.imageName != nil {
+                    Section("分享内容") {
+                        if let imageName = item.imageName {
+                            Label(imageName, systemImage: "photo")
+                        }
+                        if !item.text.isEmpty { Text(item.text).lineLimit(4) }
+                    }
+                }
+                ForEach(viewModel.serverProfiles) { profile in
+                    let overview = viewModel.serverOverviews.first { $0.id == profile.id }
+                    Section(profile.name) {
+                        if let overview, overview.isOnline {
+                            ForEach(overview.projects) { project in
+                                ForEach(project.threads) { thread in
+                                    Button {
+                                        onSelect(profile, project, thread)
+                                    } label: {
+                                        VStack(alignment: .leading, spacing: 3) {
+                                            Text(thread.title).lineLimit(2)
+                                            Text(project.displayName)
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            Text(overview == nil ? "正在检查连接" : "主机离线")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+            .navigationTitle("选择会话")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("稍后") { dismiss() } }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button { Task { await viewModel.refreshServerOverviews() } } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .accessibilityLabel("刷新主机")
+                }
+            }
+            .task { await viewModel.refreshServerOverviews() }
+        }
+    }
 }
 
 private struct PinnedConversation: Identifiable, Equatable {

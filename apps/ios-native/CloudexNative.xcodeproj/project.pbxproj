@@ -28,6 +28,14 @@
 		A00000000000000000000013 /* en.lproj/InfoPlist.strings in Resources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000014 /* en.lproj/InfoPlist.strings */; };
 		A00000000000000000000014 /* zh-Hant.lproj/InfoPlist.strings in Resources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000015 /* zh-Hant.lproj/InfoPlist.strings */; };
 		A00000000000000000000015 /* ja.lproj/InfoPlist.strings in Resources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000016 /* ja.lproj/InfoPlist.strings */; };
+		A00000000000000000000017 /* SharedInbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000017 /* SharedInbox.swift */; };
+		A00000000000000000000018 /* SpeechInputController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000018 /* SpeechInputController.swift */; };
+		A00000000000000000000019 /* ShareViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000019 /* ShareViewController.swift */; };
+		A0000000000000000000001A /* SharedInbox.swift in Share Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000017 /* SharedInbox.swift */; };
+		A0000000000000000000001B /* CloudexCurrentTaskWidget.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0000000000000000000001D /* CloudexCurrentTaskWidget.swift */; };
+		A0000000000000000000001C /* SharedInbox.swift in Widget Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000017 /* SharedInbox.swift */; };
+		A0000000000000000000001D /* CloudexShare.appex in Embed Extensions */ = {isa = PBXBuildFile; fileRef = B0000000000000000000001C /* CloudexShare.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		A0000000000000000000001E /* CloudexWidget.appex in Embed Extensions */ = {isa = PBXBuildFile; fileRef = B00000000000000000000020 /* CloudexWidget.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -53,6 +61,17 @@
 		B00000000000000000000014 /* en.lproj/InfoPlist.strings */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; path = en.lproj/InfoPlist.strings; sourceTree = "<group>"; };
 		B00000000000000000000015 /* zh-Hant.lproj/InfoPlist.strings */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; path = "zh-Hant.lproj/InfoPlist.strings"; sourceTree = "<group>"; };
 		B00000000000000000000016 /* ja.lproj/InfoPlist.strings */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; path = ja.lproj/InfoPlist.strings; sourceTree = "<group>"; };
+		B00000000000000000000017 /* SharedInbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedInbox.swift; sourceTree = "<group>"; };
+		B00000000000000000000018 /* SpeechInputController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeechInputController.swift; sourceTree = "<group>"; };
+		B00000000000000000000019 /* ShareViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareViewController.swift; sourceTree = "<group>"; };
+		B0000000000000000000001A /* Share Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		B0000000000000000000001B /* CloudexShare.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = CloudexShare.entitlements; sourceTree = "<group>"; };
+		B0000000000000000000001C /* CloudexShare.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = CloudexShare.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		B0000000000000000000001D /* CloudexCurrentTaskWidget.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudexCurrentTaskWidget.swift; sourceTree = "<group>"; };
+		B0000000000000000000001E /* Widget Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		B0000000000000000000001F /* CloudexWidget.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = CloudexWidget.entitlements; sourceTree = "<group>"; };
+		B00000000000000000000020 /* CloudexWidget.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = CloudexWidget.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		B00000000000000000000021 /* CloudexNative.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = CloudexNative.entitlements; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -64,13 +83,34 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		D00000000000000000000006 /* Share Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		D00000000000000000000009 /* Widget Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		D00000000000000000000004 /* Embed Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (A0000000000000000000001D /* CloudexShare.appex in Embed Extensions */, A0000000000000000000001E /* CloudexWidget.appex in Embed Extensions */, );
+			name = "Embed Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXContainerItemProxy section */
+		J00000000000000000000001 = {isa = PBXContainerItemProxy; containerPortal = E00000000000000000000002; proxyType = 1; remoteGlobalIDString = E00000000000000000000003; remoteInfo = CloudexShare; };
+		J00000000000000000000002 = {isa = PBXContainerItemProxy; containerPortal = E00000000000000000000002; proxyType = 1; remoteGlobalIDString = E00000000000000000000004; remoteInfo = CloudexWidget; };
+/* End PBXContainerItemProxy section */
 
 /* Begin PBXGroup section */
 		C00000000000000000000001 = {
 			isa = PBXGroup;
 			children = (
 				C00000000000000000000002 /* CloudexNative */,
+				C00000000000000000000004 /* CloudexShare */,
+				C00000000000000000000005 /* CloudexWidget */,
 				B0000000000000000000000F /* Cloudex.icon */,
 				C00000000000000000000003 /* Products */,
 			);
@@ -88,6 +128,9 @@
 				B00000000000000000000007 /* SidebarView.swift */,
 				B00000000000000000000008 /* SettingsView.swift */,
 				B00000000000000000000009 /* RemoteFilePickerView.swift */,
+				B00000000000000000000017 /* SharedInbox.swift */,
+				B00000000000000000000018 /* SpeechInputController.swift */,
+				B00000000000000000000021 /* CloudexNative.entitlements */,
 				B0000000000000000000000C /* LocalConversationCache.swift */,
 				B0000000000000000000000D /* WorkspaceTabsView.swift */,
 				B0000000000000000000000E /* CodePreviewView.swift */,
@@ -107,10 +150,14 @@
 			isa = PBXGroup;
 			children = (
 				B0000000000000000000000B /* CloudexNative.app */,
+				B0000000000000000000001C /* CloudexShare.appex */,
+				B00000000000000000000020 /* CloudexWidget.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
 		};
+		C00000000000000000000004 /* CloudexShare */ = {isa = PBXGroup; children = (B00000000000000000000019 /* ShareViewController.swift */, B0000000000000000000001A /* Info.plist */, B0000000000000000000001B /* CloudexShare.entitlements */, ); path = CloudexShare; sourceTree = "<group>"; };
+		C00000000000000000000005 /* CloudexWidget */ = {isa = PBXGroup; children = (B0000000000000000000001D /* CloudexCurrentTaskWidget.swift */, B0000000000000000000001E /* Info.plist */, B0000000000000000000001F /* CloudexWidget.entitlements */, ); path = CloudexWidget; sourceTree = "<group>"; };
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -121,11 +168,11 @@
 				D00000000000000000000001 /* Sources */,
 				D00000000000000000000002 /* Frameworks */,
 				D00000000000000000000003 /* Resources */,
+				D00000000000000000000004 /* Embed Extensions */,
 			);
 			buildRules = (
 			);
-			dependencies = (
-			);
+			dependencies = (J00000000000000000000003 /* PBXTargetDependency */, J00000000000000000000004 /* PBXTargetDependency */, );
 			name = CloudexNative;
 			packageProductDependencies = (
 				H00000000000000000000002 /* gitdiff */,
@@ -134,7 +181,14 @@
 			productReference = B0000000000000000000000B /* CloudexNative.app */;
 			productType = "com.apple.product-type.application";
 		};
+		E00000000000000000000003 /* CloudexShare */ = {isa = PBXNativeTarget; buildConfigurationList = G00000000000000000000003; buildPhases = (D00000000000000000000005, D00000000000000000000006, D00000000000000000000007, ); buildRules = (); dependencies = (); name = CloudexShare; productName = CloudexShare; productReference = B0000000000000000000001C; productType = "com.apple.product-type.app-extension"; };
+		E00000000000000000000004 /* CloudexWidget */ = {isa = PBXNativeTarget; buildConfigurationList = G00000000000000000000004; buildPhases = (D00000000000000000000008, D00000000000000000000009, D0000000000000000000000A, ); buildRules = (); dependencies = (); name = CloudexWidget; productName = CloudexWidget; productReference = B00000000000000000000020; productType = "com.apple.product-type.app-extension"; };
 /* End PBXNativeTarget section */
+
+/* Begin PBXTargetDependency section */
+		J00000000000000000000003 /* PBXTargetDependency */ = {isa = PBXTargetDependency; target = E00000000000000000000003; targetProxy = J00000000000000000000001; };
+		J00000000000000000000004 /* PBXTargetDependency */ = {isa = PBXTargetDependency; target = E00000000000000000000004; targetProxy = J00000000000000000000002; };
+/* End PBXTargetDependency section */
 
 /* Begin PBXProject section */
 		E00000000000000000000002 /* Project object */ = {
@@ -147,6 +201,8 @@
 					E00000000000000000000001 = {
 						CreatedOnToolsVersion = 16.0;
 					};
+					E00000000000000000000003 = {CreatedOnToolsVersion = 16.0; };
+					E00000000000000000000004 = {CreatedOnToolsVersion = 16.0; };
 				};
 			};
 			buildConfigurationList = G00000000000000000000001 /* Build configuration list for PBXProject "CloudexNative" */;
@@ -169,11 +225,15 @@
 			projectRoot = "";
 			targets = (
 				E00000000000000000000001 /* CloudexNative */,
+				E00000000000000000000003 /* CloudexShare */,
+				E00000000000000000000004 /* CloudexWidget */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
+		D00000000000000000000007 /* Share Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		D0000000000000000000000A /* Widget Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 		D00000000000000000000003 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -208,9 +268,13 @@
 				A0000000000000000000000A /* LocalConversationCache.swift in Sources */,
 				A0000000000000000000000C /* WorkspaceTabsView.swift in Sources */,
 				A0000000000000000000000D /* CodePreviewView.swift in Sources */,
+				A00000000000000000000017 /* SharedInbox.swift in Sources */,
+				A00000000000000000000018 /* SpeechInputController.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		D00000000000000000000005 /* Share Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000019 /* ShareViewController.swift in Sources */, A0000000000000000000001A /* SharedInbox.swift in Share Sources */, ); runOnlyForDeploymentPostprocessing = 0; };
+		D00000000000000000000008 /* Widget Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A0000000000000000000001B /* CloudexCurrentTaskWidget.swift in Sources */, A0000000000000000000001C /* SharedInbox.swift in Widget Sources */, ); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 
 /* Begin XCBuildConfiguration section */
@@ -253,10 +317,11 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = Cloudex;
+				CODE_SIGN_ENTITLEMENTS = CloudexNative/CloudexNative.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 3;
 				DEVELOPMENT_ASSET_PATHS = "";
-				DEVELOPMENT_TEAM = 95VS96F47C;
+				DEVELOPMENT_TEAM = QFG998HM3T;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = CloudexNative/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = Cloudex;
@@ -279,10 +344,11 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = Cloudex;
+				CODE_SIGN_ENTITLEMENTS = CloudexNative/CloudexNative.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 3;
 				DEVELOPMENT_ASSET_PATHS = "";
-				DEVELOPMENT_TEAM = 95VS96F47C;
+				DEVELOPMENT_TEAM = QFG998HM3T;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = CloudexNative/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = Cloudex;
@@ -301,6 +367,10 @@
 			};
 			name = Release;
 		};
+		F00000000000000000000005 /* Share Debug */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_ENTITLEMENTS = CloudexShare/CloudexShare.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 3; DEVELOPMENT_TEAM = QFG998HM3T; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = CloudexShare/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@executable_path/../../Frameworks", ); MARKETING_VERSION = 0.1.0; PRODUCT_BUNDLE_IDENTIFIER = com.cloudex.native.share; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
+		F00000000000000000000006 /* Share Release */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_ENTITLEMENTS = CloudexShare/CloudexShare.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 3; DEVELOPMENT_TEAM = QFG998HM3T; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = CloudexShare/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@executable_path/../../Frameworks", ); MARKETING_VERSION = 0.1.0; PRODUCT_BUNDLE_IDENTIFIER = com.cloudex.native.share; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
+		F00000000000000000000007 /* Widget Debug */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_ENTITLEMENTS = CloudexWidget/CloudexWidget.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 3; DEVELOPMENT_TEAM = QFG998HM3T; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = CloudexWidget/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@executable_path/../../Frameworks", ); MARKETING_VERSION = 0.1.0; PRODUCT_BUNDLE_IDENTIFIER = com.cloudex.native.widget; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
+		F00000000000000000000008 /* Widget Release */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_ENTITLEMENTS = CloudexWidget/CloudexWidget.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 3; DEVELOPMENT_TEAM = QFG998HM3T; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = CloudexWidget/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@executable_path/../../Frameworks", ); MARKETING_VERSION = 0.1.0; PRODUCT_BUNDLE_IDENTIFIER = com.cloudex.native.widget; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -322,6 +392,8 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
+		G00000000000000000000003 /* Share configurations */ = {isa = XCConfigurationList; buildConfigurations = (F00000000000000000000005, F00000000000000000000006, ); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		G00000000000000000000004 /* Widget configurations */ = {isa = XCConfigurationList; buildConfigurations = (F00000000000000000000007, F00000000000000000000008, ); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
 /* End XCConfigurationList section */
 
 /* Begin XCRemoteSwiftPackageReference section */

@@ -19,12 +19,17 @@ final class LocalConversationCache {
         try? FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
     }
 
-    func loadProjects() -> [CloudexProject]? {
-        read([CloudexProject].self, from: rootURL.appendingPathComponent("projects.json"))
+    func loadProjects(profileID: String) -> [CloudexProject]? {
+        read([CloudexProject].self, from: projectsFileURL(profileID: profileID))
     }
 
-    func saveProjects(_ projects: [CloudexProject]) {
-        write(projects, to: rootURL.appendingPathComponent("projects.json"))
+    func saveProjects(_ projects: [CloudexProject], profileID: String) {
+        write(projects, to: projectsFileURL(profileID: profileID))
+    }
+
+    private func projectsFileURL(profileID: String) -> URL {
+        let safeID = profileID.replacingOccurrences(of: "/", with: "_")
+        return rootURL.appendingPathComponent("projects-\(safeID).json")
     }
 
     func loadThreadDetail(threadID: String) -> ThreadDetail? {
