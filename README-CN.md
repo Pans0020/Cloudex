@@ -70,7 +70,7 @@ resources/
 curl -fsSL https://raw.githubusercontent.com/Pans0020/Cloudex/fix/codex-session-history/install-cloudex.sh | bash
 ```
 
-脚本安装到 `~/.local/share/cloudex`，生成并复用本机 Token，后台启动服务，确认可访问后打印配对二维码；再次运行可重新显示二维码。默认优先使用 Tailscale 地址，否则使用局域网地址；手机必须能访问同一网络。它**不会**自动建立公网隧道或开放防火墙。只有公网地址的 VPS 请先配置 Tailscale，或配置 HTTPS 反向代理后运行 `curl ... | CLOUDEX_PUBLIC_URL=https://你的域名 bash`。二维码包含 Token，不要分享或公开终端输出。运行远程脚本前可先打开上述 URL 检查内容。Windows 暂用下面的 PowerShell 启动方式。
+脚本安装到 `~/.local/share/cloudex`，支持 nvm 安装的 Node，生成并复用本机 Token，后台启动服务，确认可访问后打印配对二维码；再次运行可重新显示二维码。它优先使用 Tailscale；若 VPS 有公网 IP、Nginx 和匹配该 IP 的现有 HTTPS 证书，会为 VPS 自身选择并保存独立端口、增加独立的 Nginx 入口，不覆盖已有服务；否则使用局域网地址。可通过 `bash install-cloudex.sh --check` 只检查环境，不安装。公网模式需以 root 运行，脚本会配置已启用的 UFW/firewalld，但仍需确认服务商的入站防火墙放行新端口。没有现成证书时不会自动把控制接口暴露成公网 HTTP；可先配置 HTTPS 代理，再运行 `curl ... | CLOUDEX_PUBLIC_URL=https://你的地址 bash`。二维码包含 Token，不要分享或公开终端输出。运行远程脚本前可先打开上述 URL 检查内容。Windows 暂用下面的 PowerShell 启动方式。
 
 已有本地仓库也可以直接启动：
 
