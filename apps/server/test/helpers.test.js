@@ -1,12 +1,27 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { listModelsViaStdio } from "../src/app-server-stdio.js";
 import { readCliThread } from "../src/cli-sessions.js";
 import { daemonPaths, isProcessRunning, readPidRecord } from "../src/daemon.js";
 import { isPathInside, normalizeAllowedPath } from "../src/file-roots.js";
+import { projectsFromThreads } from "../src/server.js";
+
+test("temporary Codex workspaces do not become phone projects", () => {
+  const realTemp = path.join(fsSync.realpathSync(os.tmpdir()), "pytest-of-user", "test_fake_cli_matrix_records_e0");
+  const aliasTemp = path.join(os.tmpdir(), "cue-codex-smoke-example");
+  const threads = [
+    { id: "test-real", cwd: realTemp, updatedAt: 3 },
+    { id: "test-alias", cwd: aliasTemp, updatedAt: 2 },
+    { id: "real", cwd: path.join(os.homedir(), "Cloudex"), updatedAt: 1 },
+  ];
+  const projects = projectsFromThreads(threads);
+  assert.deepEqual(projects.map((project) => project.name), ["Cloudex"]);
+  assert.deepEqual(projects[0].threads.map((thread) => thread.id), ["real"]);
+});
 
 test("project has a package and a safe default workspace root", async () => {
   const packageJson = await import("../package.json", { with: { type: "json" } });

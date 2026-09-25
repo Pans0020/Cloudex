@@ -920,6 +920,11 @@ function compactThreadDetail(detail) {
 }
 
 const NO_PROJECT_CWD = "未指定项目目录";
+const temporaryRoots = [os.tmpdir(), ...(process.platform === "darwin" ? ["/tmp"] : [])]
+  .flatMap((root) => {
+    try { return [path.resolve(root), syncFs.realpathSync(root)]; }
+    catch { return [path.resolve(root)]; }
+  });
 
 function projectCwdForThread(thread) {
   const cwd = String(thread.cwd || "").trim();
@@ -934,6 +939,8 @@ function projectCwdForThread(thread) {
     return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
   };
 
+  if (temporaryRoots.some(isInside)) return null;
+
   // Codex creates dated scratch directories when a conversation is started
   // without choosing a project. Their final path component looks like a
   // project name (for example bh-w or token-api-api), but it is not one.
@@ -943,10 +950,11 @@ function projectCwdForThread(thread) {
   return cwd;
 }
 
-function projectsFromThreads(threads) {
+export function projectsFromThreads(threads) {
   const projects = new Map();
   for (const thread of threads) {
     const cwd = projectCwdForThread(thread);
+    if (cwd === null) continue;
     if (!projects.has(cwd)) {
       projects.set(cwd, {
         id: cwd,
@@ -961,6 +969,10 @@ function projectsFromThreads(threads) {
     project.updatedAt = Math.max(project.updatedAt, thread.updatedAt || thread.createdAt || 0);
   }
   return [...projects.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+function visibleThreadCount(projects) {
+  return projects.reduce((count, project) => count + project.threads.length, 0);
 }
 
 function projectRootsFromThreads(threads) {
@@ -1010,10 +1022,11 @@ function threadSignature(threads) {
 }
 
 function snapshotFromThreads(threads) {
+  const projects = projectsFromThreads(threads);
   return {
     generatedAt: Date.now(),
-    projects: projectsFromThreads(threads),
-    total: threads.length,
+    projects,
+    total: visibleThreadCount(projects),
   };
 }
 
@@ -1170,7 +1183,8 @@ async function handle(req, res, url) {
   }
   if (req.method === "GET" && url.pathname === "/api/projects") {
     const threads = await listAllThreads(false);
-    return json(res, 200, { data: projectsFromThreads(threads), total: threads.length });
+    const projects = projectsFromThreads(threads);
+    return json(res, 200, { data: projects, total: visibleThreadCount(projects) });
   }
   if (req.method === "GET" && url.pathname === "/api/search/messages") {
     const query = url.searchParams.get("q") || "";
