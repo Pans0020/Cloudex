@@ -42,6 +42,7 @@ let syncInFlight = false;
 let syncAgainReason = null;
 let syncTimer = null;
 let syncInterval = null;
+let archiveRevision = 0;
 
 async function loadApprovalHistory() {
   if (approvalHistory) return approvalHistory;
@@ -934,6 +935,7 @@ function projectCwdForThread(thread) {
   const home = path.resolve(os.homedir());
   const codexScratchRoot = path.join(home, "Documents", "Codex");
   const codexStateRoot = path.join(home, ".codex");
+  const applicationSupportRoot = path.join(home, "Library", "Application Support");
   const isInside = (root) => {
     const relative = path.relative(root, resolved);
     return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
@@ -944,7 +946,8 @@ function projectCwdForThread(thread) {
   // Codex creates dated scratch directories when a conversation is started
   // without choosing a project. Their final path component looks like a
   // project name (for example bh-w or token-api-api), but it is not one.
-  if (resolved === home || isInside(codexScratchRoot) || isInside(codexStateRoot)) {
+  if (resolved === home || isInside(codexScratchRoot) || isInside(codexStateRoot)
+    || (process.platform === "darwin" && isInside(applicationSupportRoot))) {
     return NO_PROJECT_CWD;
   }
   return cwd;
@@ -1045,7 +1048,12 @@ async function syncThreads(reason = "manual") {
   }
   syncInFlight = true;
   try {
+    const revision = archiveRevision;
     const threads = await listAllThreads(false);
+    if (revision !== archiveRevision) {
+      syncAgainReason = "thread-archived";
+      return;
+    }
     const signature = threadSignature(threads);
     if (signature !== latestThreadSignature) {
       latestThreadSignature = signature;
@@ -1646,20 +1654,24 @@ async function handle(req, res, url) {
     if (req.method === "POST" && action === "archive") {
       if (await isQwenThread(threadId)) {
         const result = await qwenProvider.archiveThread(threadId);
+        archiveRevision += 1;
         scheduleThreadSync("thread-archived", 100);
         return json(res, 200, result);
       }
       if (await isClaudeThread(threadId)) {
         const result = await claudeProvider.archiveThread(threadId);
+        archiveRevision += 1;
         scheduleThreadSync("thread-archived", 100);
         return json(res, 200, result);
       }
       if (config.historySource === "cli-local") {
         const result = await archiveCliThread(threadId);
+        archiveRevision += 1;
         scheduleThreadSync("thread-archived", 100);
         return json(res, 200, result);
       }
       const result = await client.request("thread/archive", { threadId });
+      archiveRevision += 1;
       scheduleThreadSync("thread-archived", 100);
       return json(res, 200, result);
     }

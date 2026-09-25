@@ -1,12 +1,14 @@
 import os from "node:os";
 import fs from "node:fs/promises";
 import path from "node:path";
+import crypto from "node:crypto";
 import { config } from "./config.js";
 
 const SESSION_FILE_RE = /rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
 const ARCHIVE_FILE = path.join(config.stateDir, "archived-cli-threads.json");
 const SESSION_INDEX_FILE = path.join(os.homedir(), ".codex", "session_index.jsonl");
 const threadSummaryCache = new Map();
+let archiveWrite = Promise.resolve();
 let sessionIndexSignature = "";
 let sessionIndexNames = new Map();
 
@@ -785,24 +787,35 @@ export async function readArchiveSet() {
   try {
     const data = JSON.parse(await fs.readFile(ARCHIVE_FILE, "utf8"));
     return new Set(Array.isArray(data.archivedThreadIds) ? data.archivedThreadIds : []);
-  } catch {
-    return new Set();
+  } catch (error) {
+    if (error.code === "ENOENT") return new Set();
+    throw error;
   }
 }
 
 export async function writeArchiveSet(archiveSet) {
   await fs.mkdir(path.dirname(ARCHIVE_FILE), { recursive: true });
-  await fs.writeFile(ARCHIVE_FILE, JSON.stringify({
-    archivedThreadIds: [...archiveSet].sort(),
-    updatedAt: new Date().toISOString(),
-  }, null, 2));
+  const temporaryFile = `${ARCHIVE_FILE}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  try {
+    await fs.writeFile(temporaryFile, JSON.stringify({
+      archivedThreadIds: [...archiveSet].sort(),
+      updatedAt: new Date().toISOString(),
+    }, null, 2));
+    await fs.rename(temporaryFile, ARCHIVE_FILE);
+  } finally {
+    await fs.rm(temporaryFile, { force: true });
+  }
 }
 
 export async function archiveCliThread(threadId) {
-  const archiveSet = await readArchiveSet();
-  archiveSet.add(threadId);
-  await writeArchiveSet(archiveSet);
-  return { archived: true, threadId };
+  const operation = archiveWrite.then(async () => {
+    const archiveSet = await readArchiveSet();
+    archiveSet.add(threadId);
+    await writeArchiveSet(archiveSet);
+    return { archived: true, threadId };
+  });
+  archiveWrite = operation.catch(() => {});
+  return operation;
 }
 
 export async function listCliThreads({ archived = false } = {}) {

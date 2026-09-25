@@ -23,6 +23,16 @@ test("temporary Codex workspaces do not become phone projects", () => {
   assert.deepEqual(projects[0].threads.map((thread) => thread.id), ["real"]);
 });
 
+test("application support sessions do not create a second project with the same name", () => {
+  const threads = [
+    { id: "project", cwd: path.join(os.homedir(), "Project", "Cue"), updatedAt: 2 },
+    { id: "app-data", cwd: path.join(os.homedir(), "Library", "Application Support", "Cue"), updatedAt: 1 },
+  ];
+  const projects = projectsFromThreads(threads);
+  assert.deepEqual(projects.map((project) => project.name), ["Cue", "无项目"]);
+  assert.deepEqual(projects.map((project) => project.threads[0].id), ["project", "app-data"]);
+});
+
 test("project has a package and a safe default workspace root", async () => {
   const packageJson = await import("../package.json", { with: { type: "json" } });
   assert.equal(packageJson.default.name, "cloudex");
