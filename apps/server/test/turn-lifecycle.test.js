@@ -59,6 +59,12 @@ test('closed threads resubscribe and clear their active turn', async () => {
   assert.equal(client.getActiveTurn('thread'), undefined);
 });
 
+test('thread notifications do not claim another client writer', async () => {
+  const client = new CodexClient();
+  client.trackNotification({ method: 'thread/started', params: { thread: { id: 'thread' } } });
+  assert.equal(client.subscribedThreads.has('thread'), false);
+});
+
 test('closing the last phone stream releases its Codex subscription', async () => {
   const client = new CodexClient();
   client.markThreadSubscribed('thread');

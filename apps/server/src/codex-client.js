@@ -304,7 +304,6 @@ export class CodexClient extends EventEmitter {
   trackNotification(message) {
     const params = message.params || {};
     const threadId = params.threadId || params.thread?.id;
-    if (message.method === "thread/started" && threadId) this.subscribedThreads.add(threadId);
     if (message.method === "thread/closed" && threadId) {
       this.subscribedThreads.delete(threadId);
       this.activeTurns.delete(threadId);

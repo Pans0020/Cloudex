@@ -325,9 +325,12 @@ async function sendFilePreview(res, candidate) {
   res.end(data);
 }
 
-function errorResponse(res, error) {
-  const status = error.status || (error instanceof CodexError ? 502 : 400);
-  json(res, status, { error: error.message || "Request failed" });
+export function errorResponse(res, error) {
+  const writerBusy = /already has an active writer/i.test(error.message || "");
+  const status = writerBusy ? 409 : error.status || (error instanceof CodexError ? 502 : 400);
+  json(res, status, { error: writerBusy
+    ? "此会话正由其他客户端占用，暂时无法发送；请稍后重试。"
+    : error.message || "Request failed" });
 }
 
 function isImage(filePath) {
@@ -1232,7 +1235,7 @@ function isStaleTurnError(error) {
     || message.includes("expected turn");
 }
 
-async function handle(req, res, url) {
+export async function handle(req, res, url) {
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
       "access-control-allow-origin": "*",
@@ -1450,12 +1453,8 @@ async function handle(req, res, url) {
       // app receives live notifications instead of polling only.
       writeSse(res, "subscribed", { threadId });
     } else {
-      try {
-        await client.subscribeThread(threadId);
-        writeSse(res, "subscribed", { threadId });
-      } catch (error) {
-        writeSse(res, "error", { message: error.message || "Unable to subscribe to Codex task" });
-      }
+      // Viewing history must not claim the Codex writer; sending a turn resumes the thread.
+      writeSse(res, "read-only", { threadId });
     }
     const keepAlive = setInterval(() => res.write(": keep-alive\n\n"), 15000);
     res.on("close", () => { clearInterval(keepAlive); cleanup(); });
