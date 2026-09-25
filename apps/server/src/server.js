@@ -330,7 +330,7 @@ export function errorResponse(res, error) {
   const writerBusy = /already has an active writer/i.test(error.message || "");
   const status = writerBusy ? 409 : error.status || (error instanceof CodexError ? 502 : 400);
   json(res, status, { error: writerBusy
-    ? "此会话的 Codex 写入权正由其他客户端占用；电脑端仅打开会话也可能占用。请在电脑端切换到其他会话后重试。"
+    ? "此会话正由其他客户端占用写入权。仅切换电脑端对话不会释放；请关闭占用该会话的客户端后重试。"
     : error.message || "Request failed" });
 }
 

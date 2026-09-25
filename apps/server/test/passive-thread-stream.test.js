@@ -37,6 +37,7 @@ test("writer conflicts return a useful 409 instead of a raw Codex error", () => 
   errorResponse(res, new CodexError("thread example already has an active writer"));
   assert.equal(res.status, 409);
   assert.match(JSON.parse(res.chunks.join("")).error, /其他客户端占用/);
+  assert.match(JSON.parse(res.chunks.join("")).error, /切换电脑端对话不会释放/);
 });
 
 test("an open read-only phone stream does not retain the writer", async (t) => {
