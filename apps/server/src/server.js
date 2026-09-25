@@ -28,6 +28,7 @@ const claudeProvider = new ClaudeProvider();
 const execFile = promisify(execFileCallback);
 const subscribers = new Map();
 const unsubscribeTimers = new Map();
+const streamLeaseTimers = new Map();
 const globalSubscribers = new Set();
 const eventHistory = new Map();
 const pendingApprovals = new Map();
@@ -564,17 +565,32 @@ function scheduleThreadUnsubscribe(threadId, delay = 250) {
   unsubscribeTimers.set(threadId, timer);
 }
 
-function subscribe(threadId, res) {
+export function renewThreadLease(threadId, delay = 20000) {
+  if (!subscribers.has(threadId)) return;
+  clearTimeout(streamLeaseTimers.get(threadId));
+  const timer = setTimeout(() => {
+    streamLeaseTimers.delete(threadId);
+    for (const res of subscribers.get(threadId) || []) res.destroy();
+    subscribers.delete(threadId);
+    scheduleThreadUnsubscribe(threadId);
+  }, delay);
+  streamLeaseTimers.set(threadId, timer);
+}
+
+export function subscribe(threadId, res) {
   if (unsubscribeTimers.has(threadId)) {
     clearTimeout(unsubscribeTimers.get(threadId));
     unsubscribeTimers.delete(threadId);
   }
   if (!subscribers.has(threadId)) subscribers.set(threadId, new Set());
   subscribers.get(threadId).add(res);
+  renewThreadLease(threadId);
   const cleanup = () => {
     subscribers.get(threadId)?.delete(res);
     if (subscribers.get(threadId)?.size === 0) {
       subscribers.delete(threadId);
+      clearTimeout(streamLeaseTimers.get(threadId));
+      streamLeaseTimers.delete(threadId);
       scheduleThreadUnsubscribe(threadId);
     }
   };
@@ -1404,6 +1420,11 @@ async function handle(req, res, url) {
     return json(res, 200, messageIndexFromDetail(detail));
   }
   const streamMatch = url.pathname.match(/^\/api\/threads\/([^/]+)\/stream$/);
+  const leaseMatch = url.pathname.match(/^\/api\/threads\/([^/]+)\/lease$/);
+  if (req.method === "POST" && leaseMatch) {
+    renewThreadLease(decodeURIComponent(leaseMatch[1]));
+    return json(res, 200, {});
+  }
   if (req.method === "GET" && streamMatch) {
     const threadId = decodeURIComponent(streamMatch[1]);
     const qwenThread = await isQwenThread(threadId);

@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import UIKit
 import WidgetKit
 
 @MainActor
@@ -1470,8 +1471,15 @@ final class AppViewModel: ObservableObject {
         healthTask = Task { [weak self] in
             var tick = 0
             while !Task.isCancelled {
+                if UIApplication.shared.applicationState == .active,
+                   let self, let threadID = self.selectedThreadID {
+                    let client = self.client
+                    Task {
+                        let _: EmptyResponse? = try? await client.post(client.threadPath(threadID, action: "lease"))
+                    }
+                }
                 await self?.refreshServerReachability()
-                if tick.isMultiple(of: 3) { await self?.refreshServerOverviews() }
+                if tick.isMultiple(of: 3) { Task { await self?.refreshServerOverviews() } }
                 tick += 1
                 try? await Task.sleep(for: .seconds(5))
             }
