@@ -4,8 +4,8 @@ import { EventEmitter } from "node:events";
 
 process.env.AUTH_TOKEN = "test-token";
 process.env.CLOUDEX_AGENT_PROVIDER = "codex";
-const { CodexError } = await import("../src/codex-client.js");
-const { errorResponse, handle } = await import("../src/server.js");
+const { CodexClient, CodexError } = await import("../src/codex-client.js");
+const { errorResponse, handle, scheduleThreadUnsubscribe } = await import("../src/server.js");
 
 function response() {
   const res = new EventEmitter();
@@ -37,4 +37,21 @@ test("writer conflicts return a useful 409 instead of a raw Codex error", () => 
   errorResponse(res, new CodexError("thread example already has an active writer"));
   assert.equal(res.status, 409);
   assert.match(JSON.parse(res.chunks.join("")).error, /其他客户端占用/);
+});
+
+test("an open read-only phone stream does not retain the writer", async (t) => {
+  const calls = [];
+  t.mock.method(CodexClient.prototype, "unsubscribeThread", async (threadId, shouldRelease) => {
+    calls.push([threadId, shouldRelease()]);
+  });
+  const res = response();
+  await handle(
+    { method: "GET", headers: { authorization: "Bearer test-token" } },
+    res,
+    new URL("http://localhost/api/threads/open-stream/stream"),
+  );
+  scheduleThreadUnsubscribe("open-stream", 0);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(calls, [["open-stream", true]]);
+  res.emit("close");
 });

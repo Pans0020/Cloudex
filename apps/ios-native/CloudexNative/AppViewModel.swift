@@ -18,6 +18,7 @@ final class AppViewModel: ObservableObject {
     @Published private(set) var pinnedThreadIDs: Set<String>
     @Published var projects: [CloudexProject] = []
     @Published var renderedMessages: [ChatMessage] = []
+    @Published var pendingOutgoing: ChatMessage? { didSet { rebuildRenderedMessages() } }
     @Published var models: [CodexModel] = []
     @Published var selectedProjectCWD: String?
     @Published var selectedThreadID: String?
@@ -312,6 +313,18 @@ final class AppViewModel: ObservableObject {
                 text: localError,
                 createdAt: Date().timeIntervalSince1970
             ))
+        }
+        if let pendingOutgoing {
+            let persisted = pendingOutgoing.executionStatus == "sent" && (detail?.turns ?? []).contains { turn in
+                (pendingOutgoing.sourceTurnID == nil
+                    ? (turn.startedAt ?? 0) >= (pendingOutgoing.createdAt ?? 0) - 30
+                    : turn.id == pendingOutgoing.sourceTurnID)
+                    && (turn.items ?? []).contains {
+                        $0.type == "userMessage"
+                            && (pendingOutgoing.sourceTurnID != nil || $0.renderedText == pendingOutgoing.text)
+                    }
+            }
+            if !persisted { result.append(pendingOutgoing) }
         }
         result.append(contentsOf: systemMessages.filter { $0.threadID == nil || $0.threadID == selectedThreadID })
         // A new chat has no turn yet, so retain live messages until its first
@@ -1593,6 +1606,7 @@ final class AppViewModel: ObservableObject {
         }
         selectedProjectCWD = projectCWD
         selectedThreadID = thread.id
+        pendingOutgoing = nil
         presentedInput = pendingInputs.first { $0.threadId == thread.id }
         selectedAgentProvider = thread.agentProvider
         UserDefaults.standard.set(selectedAgentProvider.rawValue, forKey: "cloudex.agentProvider")
@@ -1673,6 +1687,7 @@ final class AppViewModel: ObservableObject {
         isOpeningThread = false
         selectedProjectCWD = clearProject ? nil : (projectCWD ?? selectedProjectCWD)
         selectedThreadID = nil
+        pendingOutgoing = nil
         detail = nil
         draft = ""
         clearLiveMessages()
@@ -1926,12 +1941,24 @@ final class AppViewModel: ObservableObject {
     }
 
     private func submitPrompt(_ prompt: String, steering: Bool) async -> Bool {
+        guard !isBusy else { return false }
         let generation = connectionGeneration
         let wasRunning = active
         isBusy = true
         liveRunning = true
         clearLiveMessages()
         localError = nil
+        if !steering {
+            pendingOutgoing = ChatMessage(
+                id: "outgoing-\(UUID().uuidString)",
+                role: .user,
+                text: prompt,
+                executionStatus: "sending",
+                createdAt: Date().timeIntervalSince1970,
+                attachments: attachedFiles.map { MessageAttachment(name: $0.name, path: $0.path, kind: .file) }
+            )
+            draft = ""
+        }
         var body: [String: Any] = [:]
         if !steering {
             if !selectedModelID.isEmpty { body["model"] = selectedModelID }
@@ -1943,11 +1970,23 @@ final class AppViewModel: ObservableObject {
             if let selectedThreadID {
                 body["message"] = prompt
                 let action = steering ? "steer" : "message"
-                let _: EmptyResponse = try await client.post(client.threadPath(selectedThreadID, action: action), json: body)
+                let turnID: String?
+                if steering {
+                    let _: EmptyResponse = try await client.post(client.threadPath(selectedThreadID, action: action), json: body)
+                    turnID = nil
+                } else {
+                    let result: SendMessageResponse = try await client.post(client.threadPath(selectedThreadID, action: action), json: body)
+                    turnID = result.turn?.id
+                }
                 guard generation == connectionGeneration else { return false }
-                draft = ""
+                if steering { draft = "" }
                 attachedFiles = []
-                await loadThread(selectedThreadID)
+                if !steering {
+                    pendingOutgoing?.sourceTurnID = turnID
+                    pendingOutgoing?.executionStatus = "sent"
+                    rebuildRenderedMessages()
+                }
+                await loadThread(selectedThreadID, force: true)
                 guard generation == connectionGeneration else { return false }
                 isBusy = false
                 return true
@@ -1966,8 +2005,10 @@ final class AppViewModel: ObservableObject {
                 }
                 let result: CreateThreadResponse = try await client.post("/api/threads", json: body)
                 guard generation == connectionGeneration else { return false }
-                draft = ""
                 attachedFiles = []
+                pendingOutgoing?.executionStatus = "sent"
+                pendingOutgoing?.sourceTurnID = result.turn?.id
+                rebuildRenderedMessages()
                 isCreatingNew = false
                 selectedThreadID = result.thread.id
                 detail = ThreadDetail(thread: result.thread, turns: [])
@@ -1980,6 +2021,8 @@ final class AppViewModel: ObservableObject {
         } catch {
             guard generation == connectionGeneration else { return false }
             liveRunning = wasRunning
+            if !steering && draft.isEmpty { draft = prompt }
+            pendingOutgoing = nil
             localError = error.localizedDescription
             status = "发送失败：\(error.localizedDescription)"
             isBusy = false

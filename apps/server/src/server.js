@@ -28,6 +28,7 @@ const claudeProvider = new ClaudeProvider();
 const execFile = promisify(execFileCallback);
 const subscribers = new Map();
 const unsubscribeTimers = new Map();
+const ownedRunningThreads = new Set();
 const streamLeaseTimers = new Map();
 const globalSubscribers = new Set();
 const eventHistory = new Map();
@@ -329,7 +330,7 @@ export function errorResponse(res, error) {
   const writerBusy = /already has an active writer/i.test(error.message || "");
   const status = writerBusy ? 409 : error.status || (error instanceof CodexError ? 502 : 400);
   json(res, status, { error: writerBusy
-    ? "此会话正由其他客户端占用，暂时无法发送；请稍后重试。"
+    ? "此会话的 Codex 写入权正由其他客户端占用；电脑端仅打开会话也可能占用。请在电脑端切换到其他会话后重试。"
     : error.message || "Request failed" });
 }
 
@@ -438,6 +439,10 @@ function remember(message) {
 function publish(message) {
   const threadId = getThreadId(message);
   const record = remember(message);
+  if (threadId && ["turn/completed", "turn/failed", "turn/interrupted", "turn/cancelled", "turn/canceled"].includes(message.method)) {
+    ownedRunningThreads.delete(threadId);
+    scheduleThreadUnsubscribe(threadId);
+  }
   // Keep the global bus lossless so other local clients (including a CLI
   // bridge) can observe the same live tool progress as thread subscribers.
   broadcastGlobal("notification", message);
@@ -551,17 +556,18 @@ client.on("notification", (message) => {
 });
 
 client.on("disconnected", () => {
+  ownedRunningThreads.clear();
   for (const id of pendingInputs.keys()) broadcastGlobal("input/resolved", { id });
   pendingInputs.clear();
 });
 
-function scheduleThreadUnsubscribe(threadId, delay = 250) {
-  if (!hasCodexProvider() || usesWindowsCliFallback() || subscribers.has(threadId)) return;
+export function scheduleThreadUnsubscribe(threadId, delay = 250) {
+  if (!hasCodexProvider() || usesWindowsCliFallback() || ownedRunningThreads.has(threadId)) return;
   if (unsubscribeTimers.has(threadId)) clearTimeout(unsubscribeTimers.get(threadId));
   const timer = setTimeout(() => {
     unsubscribeTimers.delete(threadId);
-    if (!subscribers.has(threadId)) {
-      client.unsubscribeThread(threadId, () => !subscribers.has(threadId)).catch((error) =>
+    if (!ownedRunningThreads.has(threadId)) {
+      client.unsubscribeThread(threadId, () => !ownedRunningThreads.has(threadId)).catch((error) =>
         console.warn(`Cloudex unsubscribe failed: ${error.message}`));
     }
   }, delay);
@@ -581,10 +587,6 @@ export function renewThreadLease(threadId, delay = 20000) {
 }
 
 export function subscribe(threadId, res, leased = false) {
-  if (unsubscribeTimers.has(threadId)) {
-    clearTimeout(unsubscribeTimers.get(threadId));
-    unsubscribeTimers.delete(threadId);
-  }
   if (!subscribers.has(threadId)) subscribers.set(threadId, new Set());
   subscribers.get(threadId).add(res);
   if (leased) renewThreadLease(threadId);
@@ -1519,6 +1521,7 @@ export async function handle(req, res, url) {
       client.markThreadSubscribed(thread.id);
       try {
         if (data.prompt) {
+          ownedRunningThreads.add(thread.id);
           const turnResult = await client.request("turn/start", {
             threadId: thread.id,
             input: await inputFrom({ message: data.prompt, files: data.files }),
@@ -1530,6 +1533,9 @@ export async function handle(req, res, url) {
           });
           turn = turnResult.turn || turnResult;
         }
+      } catch (error) {
+        ownedRunningThreads.delete(thread.id);
+        throw error;
       } finally {
         scheduleThreadUnsubscribe(thread.id, 2000);
       }
@@ -1587,8 +1593,14 @@ export async function handle(req, res, url) {
           onAppMessage: (message) => publish(message),
         });
       } else {
-        const resume = await client.subscribeThread(threadId);
+        if (ownedRunningThreads.has(threadId)) {
+          const error = new Error("此会话已有正在执行的 Cloudex 任务，请等待完成或使用引导对话。");
+          error.status = 409;
+          throw error;
+        }
+        ownedRunningThreads.add(threadId);
         try {
+          const resume = await client.subscribeThread(threadId);
           const turnResult = await client.request("turn/start", {
             threadId,
             input: await inputFrom(data),
@@ -1600,6 +1612,9 @@ export async function handle(req, res, url) {
           });
           thread = resume?.thread || resume || null;
           turn = turnResult.turn || turnResult;
+        } catch (error) {
+          ownedRunningThreads.delete(threadId);
+          throw error;
         } finally {
           scheduleThreadUnsubscribe(threadId, 2000);
         }
@@ -1693,6 +1708,7 @@ export async function handle(req, res, url) {
       try {
         const editedMessage = String(data.message || "").trim();
         if (editedMessage) {
+          ownedRunningThreads.add(forkedThread.id);
           const turnResult = await client.request("turn/start", {
             threadId: forkedThread.id,
             input: await inputFrom({ message: editedMessage, files: data.files }),
@@ -1704,6 +1720,9 @@ export async function handle(req, res, url) {
           });
           turn = turnResult.turn || turnResult;
         }
+      } catch (error) {
+        ownedRunningThreads.delete(forkedThread.id);
+        throw error;
       } finally {
         scheduleThreadUnsubscribe(forkedThread.id, 2000);
       }

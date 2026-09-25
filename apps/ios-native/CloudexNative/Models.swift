@@ -832,6 +832,15 @@ struct ReasoningEffortOption: Codable, Equatable, Identifiable {
 
 struct CreateThreadResponse: Codable {
     let thread: CloudexThread
+    let turn: SubmittedTurn?
+}
+
+struct SendMessageResponse: Codable {
+    let turn: SubmittedTurn?
+}
+
+struct SubmittedTurn: Codable {
+    let id: String?
 }
 
 struct ForkThreadResponse: Codable {

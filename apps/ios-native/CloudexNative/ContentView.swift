@@ -443,14 +443,16 @@ struct ContentView: View {
                         .id("pending-steer")
                     }
 
-                    if content.active {
-                        HStack(spacing: 0) {
-                            Spacer(minLength: 0)
-                            ProgressView()
-                            Spacer(minLength: 0)
+                    if content.active || viewModel.isBusy {
+                        HStack(spacing: 7) {
+                            Image(systemName: "waveform")
+                                .symbolEffect(.variableColor.iterative, options: .repeating)
+                            Text(viewModel.isBusy ? "正在发送…" : "等待回复…")
+                                .font(.caption)
                         }
                         .frame(maxWidth: .infinity)
-                            .padding(.vertical, 8)
+                        .foregroundStyle(.secondary)
+                        .padding(.vertical, 8)
                     }
 
                     // Reserve only the space needed by the overlaid composer.
@@ -942,13 +944,9 @@ struct ContentView: View {
                 } else {
                     Button { Task { await viewModel.send() } } label: {
                         Group {
-                            if viewModel.isBusy {
-                                ProgressView().tint(.white)
-                            } else {
-                                Image(systemName: "arrow.up")
-                                    .font(.body.bold())
-                                    .foregroundStyle(.white)
-                            }
+                            Image(systemName: "arrow.up")
+                                .font(.body.bold())
+                                .foregroundStyle(.white)
                         }
                         .frame(width: 40, height: 40)
                         .contentShape(Circle())
@@ -1183,6 +1181,7 @@ struct ContentView: View {
         var messages = latest.messages
         messages.append(contentsOf: chatContentSnapshot.messages.filter {
             existingIDs.contains($0.id) && !latestIDs.contains($0.id)
+                && !$0.id.hasPrefix("outgoing-")
         })
 
         chatContentSnapshot = ChatScrollContent(
@@ -2022,6 +2021,11 @@ private struct MessageBubble: View {
         HStack(spacing: 6) {
             if !messageTime.isEmpty {
                 Text(messageTime)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            if message.id.hasPrefix("outgoing-") {
+                Text(message.executionStatus == "sent" ? "已发送" : "发送中…")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
