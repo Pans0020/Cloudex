@@ -4,7 +4,8 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { config } from "./config.js";
 
-const SESSION_FILE_RE = /rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
+const UUID_RE = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const SESSION_FILE_RE = new RegExp(`^rollout-.*-(${UUID_RE})(?:_(${UUID_RE}))?\\.jsonl$`, "i");
 const ARCHIVE_FILE = path.join(config.stateDir, "archived-cli-threads.json");
 const SESSION_INDEX_FILE = path.join(os.homedir(), ".codex", "session_index.jsonl");
 const threadSummaryCache = new Map();
@@ -701,6 +702,10 @@ export function threadIdFromPath(filePath) {
   return match?.[1] || null;
 }
 
+export function isContinuationPath(filePath) {
+  return Boolean(path.basename(filePath).match(SESSION_FILE_RE)?.[2]);
+}
+
 export async function findSessionFiles(root = config.codexSessionsDir) {
   const results = [];
   async function walk(dir) {
@@ -717,25 +722,62 @@ export async function findSessionFiles(root = config.codexSessionsDir) {
 }
 
 export async function readCliThread(filePath, { includeTurns = true } = {}) {
-  if (!includeTurns) return readCliThreadUnqueued(filePath, false);
-  const reading = detailReadQueue.then(() => readCliThreadUnqueued(filePath, true));
+  const files = (Array.isArray(filePath) ? filePath : [filePath]).sort();
+  if (!includeTurns) return readCliThreadUnqueued(files, false);
+  const reading = detailReadQueue.then(() => readCliThreadUnqueued(files, true));
   detailReadQueue = reading.catch(() => {});
   return reading;
 }
 
-async function readCliThreadUnqueued(filePath, includeTurns) {
-  const idFromPath = threadIdFromPath(filePath);
-  const stat = await fs.stat(filePath);
-  const cacheKey = `${filePath}:${stat.mtimeMs}:${stat.size}`;
+async function parseSessionFile(state, filePath, stat, start) {
+  const bytes = Buffer.allocUnsafe(stat.size - start);
+  const handle = await fs.open(filePath, "r");
+  try {
+    let read = 0;
+    while (read < bytes.length) {
+      const result = await handle.read(bytes, read, bytes.length - read, start + read);
+      if (result.bytesRead === 0) break;
+      read += result.bytesRead;
+    }
+    let offset = start;
+    for (const line of bytes.subarray(0, read).toString("utf8").split(/(?<=\n)/)) {
+      if (!line) continue;
+      const record = safeJson(line);
+      if (record) {
+        parseSessionLine(state, record);
+        offset += Buffer.byteLength(line);
+      } else if (line.endsWith("\n")) {
+        offset += Buffer.byteLength(line);
+      }
+    }
+    return offset;
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readCliThreadUnqueued(files, includeTurns) {
+  const idFromPath = threadIdFromPath(files[0]);
+  const fileStats = await Promise.all(files.map(async (filePath) => ({
+    filePath, stat: await fs.stat(filePath),
+  })));
+  const latest = fileStats.at(-1);
+  const updatedAt = Math.max(...fileStats.map(({ stat }) => stat.mtimeMs / 1000));
+  const cacheKey = fileStats.map(({ filePath, stat }) => `${filePath}:${stat.mtimeMs}:${stat.size}`).join("|");
+  const syncRevision = fileStats.map(({ stat }) => `${stat.mtimeMs}:${stat.size}`).join("|");
   if (!includeTurns) {
-    const cached = threadSummaryCache.get(filePath);
+    const cached = threadSummaryCache.get(files[0]);
     if (cached?.key === cacheKey) return { thread: cached.thread, turns: [] };
   }
   // ponytail: Codex rollouts grow by append; rewriting a longer file in place requires a fresh parse.
-  const reusable = includeTurns && detailCache?.filePath === filePath
-    && detailCache.ino === stat.ino && detailCache.dev === stat.dev
-    && (stat.size > detailCache.size ||
-      (stat.size === detailCache.size && stat.mtimeMs === detailCache.mtimeMs));
+  const reusable = includeTurns && detailCache?.files.length === files.length
+    && fileStats.every(({ filePath, stat }, index) => {
+      const cached = detailCache.files[index];
+      return cached.filePath === filePath && cached.ino === stat.ino && cached.dev === stat.dev
+        && (index === files.length - 1
+          ? stat.size > cached.size || (stat.size === cached.size && stat.mtimeMs === cached.mtimeMs)
+          : stat.size === cached.size && stat.mtimeMs === cached.mtimeMs);
+    });
   const state = reusable ? detailCache.state : {
     id: idFromPath,
     cwd: null,
@@ -747,7 +789,7 @@ async function readCliThreadUnqueued(filePath, includeTurns) {
     threadSource: "cli-local",
     sessionId: idFromPath,
     createdAt: 0,
-    updatedAt: stat.mtimeMs / 1000,
+    updatedAt,
     currentTurnId: null,
     turnMap: new Map(),
     toolCallMap: new Map(),
@@ -755,40 +797,21 @@ async function readCliThreadUnqueued(filePath, includeTurns) {
     turns: [],
     usage: null,
   };
-  if (!reusable || stat.size > detailCache.size) {
-    const start = reusable ? detailCache.offset : 0;
-    const bytes = Buffer.allocUnsafe(stat.size - start);
-    const handle = await fs.open(filePath, "r");
-    try {
-      let read = 0;
-      while (read < bytes.length) {
-        const result = await handle.read(bytes, read, bytes.length - read, start + read);
-        if (result.bytesRead === 0) break;
-        read += result.bytesRead;
-      }
-      let offset = start;
-      for (const line of bytes.subarray(0, read).toString("utf8").split(/(?<=\n)/)) {
-        if (!line) continue;
-        const record = safeJson(line);
-        if (record) {
-          parseSessionLine(state, record);
-          offset += Buffer.byteLength(line);
-        } else if (line.endsWith("\n")) {
-          offset += Buffer.byteLength(line);
-        }
-      }
-      if (includeTurns) detailCache = {
-        filePath, ino: stat.ino, dev: stat.dev, size: stat.size,
-        mtimeMs: stat.mtimeMs, offset, state,
-      };
-    } finally {
-      await handle.close();
-    }
+  const cachedFiles = [];
+  for (const [index, { filePath, stat }] of fileStats.entries()) {
+    const previous = reusable ? detailCache.files[index] : null;
+    const start = previous?.offset || 0;
+    const offset = !previous || stat.size > previous.size
+      ? await parseSessionFile(state, filePath, stat, start)
+      : start;
+    cachedFiles.push({ filePath, ino: stat.ino, dev: stat.dev,
+      size: stat.size, mtimeMs: stat.mtimeMs, offset });
   }
+  if (includeTurns) detailCache = { files: cachedFiles, state };
   const indexedName = (await readSessionIndexNames()).get(state.id);
   if (indexedName) state.name = indexedName;
-  const createdAt = state.createdAt || stat.birthtimeMs / 1000 || state.updatedAt;
-  const updatedAt = Math.max(state.updatedAt || 0, stat.mtimeMs / 1000);
+  const createdAt = state.createdAt || fileStats[0].stat.birthtimeMs / 1000 || state.updatedAt;
+  const recencyAt = Math.max(state.updatedAt || 0, updatedAt);
   const thread = {
     id: state.id,
     extra: null,
@@ -802,11 +825,11 @@ async function readCliThreadUnqueued(filePath, includeTurns) {
     modelProvider: state.modelProvider,
     model: state.model,
     createdAt,
-    updatedAt,
-    syncRevision: `${stat.mtimeMs}:${stat.size}`,
-    recencyAt: updatedAt,
-    status: statusFromTurns(state.turns, updatedAt),
-    path: filePath,
+    updatedAt: recencyAt,
+    syncRevision,
+    recencyAt,
+    status: statusFromTurns(state.turns, recencyAt),
+    path: latest.filePath,
     cwd: state.cwd || "未指定项目目录",
     cliVersion: state.cliVersion,
     source: state.source || "codex-cli",
@@ -819,7 +842,7 @@ async function readCliThreadUnqueued(filePath, includeTurns) {
     usage: state.usage,
     ...(includeTurns ? { turns: state.turns } : {}),
   };
-  if (!includeTurns) threadSummaryCache.set(filePath, { key: cacheKey, thread });
+  if (!includeTurns) threadSummaryCache.set(files[0], { key: cacheKey, thread });
   return { thread, turns: includeTurns ? state.turns : [] };
 }
 
@@ -861,7 +884,13 @@ export async function archiveCliThread(threadId) {
 export async function listCliThreads({ archived = false } = {}) {
   const archiveSet = await readArchiveSet();
   const files = await findSessionFiles();
-  const settled = await Promise.allSettled(files.map((file) => readCliThread(file, { includeTurns: false })));
+  const groups = new Map();
+  for (const file of files) {
+    const id = threadIdFromPath(file);
+    if (!groups.has(id)) groups.set(id, []);
+    groups.get(id).push(file);
+  }
+  const settled = await Promise.allSettled([...groups.values()].map((group) => readCliThread(group, { includeTurns: false })));
   return settled
     .filter((item) => item.status === "fulfilled")
     .map((item) => item.value.thread)
@@ -878,10 +907,5 @@ export async function readCliThreadById(threadId) {
     error.status = 404;
     throw error;
   }
-  const stats = await Promise.all(matches.map(async (candidate) => ({
-    file: candidate,
-    stat: await fs.stat(candidate),
-  })));
-  const newest = stats.sort((left, right) => right.stat.mtimeMs - left.stat.mtimeMs)[0];
-  return readCliThread(newest.file);
+  return readCliThread(matches);
 }
