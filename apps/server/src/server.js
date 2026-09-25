@@ -577,14 +577,14 @@ export function renewThreadLease(threadId, delay = 20000) {
   streamLeaseTimers.set(threadId, timer);
 }
 
-export function subscribe(threadId, res) {
+export function subscribe(threadId, res, leased = false) {
   if (unsubscribeTimers.has(threadId)) {
     clearTimeout(unsubscribeTimers.get(threadId));
     unsubscribeTimers.delete(threadId);
   }
   if (!subscribers.has(threadId)) subscribers.set(threadId, new Set());
   subscribers.get(threadId).add(res);
-  renewThreadLease(threadId);
+  if (leased) renewThreadLease(threadId);
   const cleanup = () => {
     subscribers.get(threadId)?.delete(res);
     if (subscribers.get(threadId)?.size === 0) {
@@ -1435,7 +1435,7 @@ async function handle(req, res, url) {
       connection: "keep-alive",
       "access-control-allow-origin": "*",
     });
-    const cleanup = subscribe(threadId, res);
+    const cleanup = subscribe(threadId, res, url.searchParams.get("lease") === "1");
     writeSse(res, "ready", { threadId, mode: "api-only" });
     replayEvents(threadId, res);
     // Let clients distinguish replayed history from newly arriving events.

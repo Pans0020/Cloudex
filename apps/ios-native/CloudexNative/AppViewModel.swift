@@ -2365,7 +2365,10 @@ final class AppViewModel: ObservableObject {
         threadStreamReplaying = true
         do {
             let generation = connectionGeneration
-            let url = try client.makeURL(path: client.threadPath(threadID, action: "stream"))
+            let url = try client.makeURL(
+                path: client.threadPath(threadID, action: "stream"),
+                queryItems: [URLQueryItem(name: "lease", value: "1")]
+            )
             threadSSE.onEvent = { [weak self] event in
                 Task { @MainActor in
                     guard self?.connectionGeneration == generation else { return }

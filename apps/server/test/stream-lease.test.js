@@ -10,7 +10,7 @@ test("silent phone streams expire unless the app renews their lease", async () =
     response.destroyed = true;
     response.emit("close");
   };
-  subscribe("lease-test", response);
+  subscribe("lease-test", response, true);
   renewThreadLease("lease-test", 100);
   await new Promise((resolve) => setTimeout(resolve, 50));
   renewThreadLease("lease-test", 100);
