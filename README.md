@@ -64,6 +64,16 @@ Requirements: Node.js ≥ 22 and the standalone Codex CLI.
 
 ### 1. Start the server
 
+On another macOS/Linux machine with Git, Node.js >= 22, npm, and a signed-in Codex CLI, run this from the directory you want the app to browse:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Pans0020/Cloudex/fix/codex-session-history/install-cloudex.sh | bash
+```
+
+The script installs to `~/.local/share/cloudex`, creates/reuses a local token, starts the server in the background, checks its health, and prints a pairing QR code. Rerun it to show the QR code again. It prefers Tailscale, then a LAN address; the phone must be on that network. It does not create a public tunnel or open a firewall. On a public-only VPS, set up Tailscale or an HTTPS reverse proxy first, then use `curl ... | CLOUDEX_PUBLIC_URL=https://your-host bash`. The QR code contains the token: do not share it. Inspect the script URL before running remote code. On Windows, use the PowerShell startup script below.
+
+For an existing local checkout:
+
 ```bash
 # macOS / Linux
 ./start-cloudex.sh

@@ -64,6 +64,16 @@ resources/
 
 ### 1. 启动服务器
 
+在另一台已安装 Git、Node.js ≥ 22、npm 和 Codex CLI（已登录）的 macOS/Linux 机器上，可从想要浏览的项目目录运行一行安装命令：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Pans0020/Cloudex/fix/codex-session-history/install-cloudex.sh | bash
+```
+
+脚本安装到 `~/.local/share/cloudex`，生成并复用本机 Token，后台启动服务，确认可访问后打印配对二维码；再次运行可重新显示二维码。默认优先使用 Tailscale 地址，否则使用局域网地址；手机必须能访问同一网络。它**不会**自动建立公网隧道或开放防火墙。只有公网地址的 VPS 请先配置 Tailscale，或配置 HTTPS 反向代理后运行 `curl ... | CLOUDEX_PUBLIC_URL=https://你的域名 bash`。二维码包含 Token，不要分享或公开终端输出。运行远程脚本前可先打开上述 URL 检查内容。Windows 暂用下面的 PowerShell 启动方式。
+
+已有本地仓库也可以直接启动：
+
 ```bash
 # macOS / Linux
 ./start-cloudex.sh
