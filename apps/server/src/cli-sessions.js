@@ -447,7 +447,12 @@ function parseSessionLine(state, record) {
   }
 
   if (record.type === "response_item") {
-    const turnId = payload.internal_chat_message_metadata_passthrough?.turn_id;
+    const metadataTurnId = payload.internal_chat_message_metadata_passthrough?.turn_id;
+    // Model response metadata may carry an internal ID, not an app-server
+    // turn ID. Keep those items in the task established by lifecycle events.
+    const turnId = state.turnMap.has(metadataTurnId)
+      ? metadataTurnId
+      : state.currentTurnId || metadataTurnId;
     if (payload.type === "custom_tool_call" && ["exec", "exec_command"].includes(payload.name)) {
       const invocation = nestedExecInvocation(payload.input);
       if (invocation?.type === "command" && invocation.command) {
@@ -539,6 +544,21 @@ function parseSessionLine(state, record) {
     if (payload.type === "function_call_output") {
       const item = state.toolCallMap.get(payload.call_id);
       if (item) Object.assign(item, commandResult(payload.output));
+      return;
+    }
+    if (payload.type === "message" && payload.role === "user") {
+      // New rollouts store user input as response items, alongside injected
+      // instructions. Only explicitly tagged user text belongs in the chat.
+      const kinds = payload.internal_chat_message_metadata_passthrough?.content_item_kinds || [];
+      const text = textFromContent((payload.content || []).filter((_, index) => kinds[index] === "user.text"));
+      if (!text) return;
+      const turn = getOrCreateTurn(state, turnId, timestamp);
+      addUniqueItem(turn, {
+        type: "userMessage",
+        id: payload.id || `${turn.id}-user-${turn.items.length}`,
+        content: [{ type: "text", text }],
+        createdAt,
+      });
       return;
     }
     if (payload.type !== "message" || payload.role !== "assistant") return;
