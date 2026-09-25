@@ -309,6 +309,9 @@ struct ContentView: View {
         }
         .onChange(of: viewModel.detail, initial: true) { _, _ in
             syncTaskTimerState()
+            if !viewModel.isOpeningThread && !viewModel.active {
+                updateChatContent(force: true)
+            }
         }
         .onChange(of: viewModel.liveRunning, initial: true) { _, _ in
             syncTaskTimerState()

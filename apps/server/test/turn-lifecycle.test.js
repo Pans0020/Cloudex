@@ -6,6 +6,29 @@ import path from 'node:path';
 import { readCliThread } from '../src/cli-sessions.js';
 import { CodexClient } from '../src/codex-client.js';
 
+test('CLI detail reuses unchanged data and parses appended records without losing partial lines', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cloudex-incremental-'));
+  const file = path.join(dir, 'rollout-2026-09-25-01a0d7e2-1b3c-7ea1-9c38-3913a8e36e26.jsonl');
+  const record = (type, payload) => JSON.stringify({ timestamp: '2026-09-25T10:00:00Z', type, payload });
+  try {
+    await fs.writeFile(file, `${record('event_msg', { type: 'task_started', turn_id: 'one' })}\n`);
+    const initial = await readCliThread(file);
+    assert.equal(initial.turns[0].status, 'inProgress');
+    assert.strictEqual((await readCliThread(file)).turns[0], initial.turns[0]);
+    const completion = record('event_msg', { type: 'task_complete', turn_id: 'one' });
+    await fs.appendFile(file, completion.slice(0, 30));
+    assert.equal((await readCliThread(file)).turns[0].status, 'inProgress');
+    await fs.appendFile(file, `${completion.slice(30)}\n${record('event_msg', { type: 'task_started', turn_id: 'two' })}\n`);
+    const appended = await readCliThread(file);
+    assert.deepEqual(appended.turns.map((turn) => [turn.id, turn.status]),
+      [['one', 'completed'], ['two', 'inProgress']]);
+    await fs.writeFile(file, `${record('event_msg', { type: 'task_started', turn_id: 'replacement' })}\n`);
+    assert.deepEqual((await readCliThread(file)).turns.map((turn) => turn.id), ['replacement']);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('internal response IDs do not create phantom active turns', async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cloudex-turn-'));
   const file = path.join(dir, 'rollout-2026-09-25-01a0d7e2-1b3c-7ea1-9c38-3913a8e36e26.jsonl');

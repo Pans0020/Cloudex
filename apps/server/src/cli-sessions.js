@@ -8,6 +8,8 @@ const SESSION_FILE_RE = /rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 const ARCHIVE_FILE = path.join(config.stateDir, "archived-cli-threads.json");
 const SESSION_INDEX_FILE = path.join(os.homedir(), ".codex", "session_index.jsonl");
 const threadSummaryCache = new Map();
+let detailCache = null;
+let detailReadQueue = Promise.resolve();
 let archiveWrite = Promise.resolve();
 let sessionIndexSignature = "";
 let sessionIndexNames = new Map();
@@ -715,6 +717,13 @@ export async function findSessionFiles(root = config.codexSessionsDir) {
 }
 
 export async function readCliThread(filePath, { includeTurns = true } = {}) {
+  if (!includeTurns) return readCliThreadUnqueued(filePath, false);
+  const reading = detailReadQueue.then(() => readCliThreadUnqueued(filePath, true));
+  detailReadQueue = reading.catch(() => {});
+  return reading;
+}
+
+async function readCliThreadUnqueued(filePath, includeTurns) {
   const idFromPath = threadIdFromPath(filePath);
   const stat = await fs.stat(filePath);
   const cacheKey = `${filePath}:${stat.mtimeMs}:${stat.size}`;
@@ -722,7 +731,12 @@ export async function readCliThread(filePath, { includeTurns = true } = {}) {
     const cached = threadSummaryCache.get(filePath);
     if (cached?.key === cacheKey) return { thread: cached.thread, turns: [] };
   }
-  const state = {
+  // ponytail: Codex rollouts grow by append; rewriting a longer file in place requires a fresh parse.
+  const reusable = includeTurns && detailCache?.filePath === filePath
+    && detailCache.ino === stat.ino && detailCache.dev === stat.dev
+    && (stat.size > detailCache.size ||
+      (stat.size === detailCache.size && stat.mtimeMs === detailCache.mtimeMs));
+  const state = reusable ? detailCache.state : {
     id: idFromPath,
     cwd: null,
     cliVersion: null,
@@ -741,9 +755,35 @@ export async function readCliThread(filePath, { includeTurns = true } = {}) {
     turns: [],
     usage: null,
   };
-  const raw = await fs.readFile(filePath, "utf8");
-  for (const line of raw.split("\n")) {
-    if (line.trim()) parseSessionLine(state, safeJson(line));
+  if (!reusable || stat.size > detailCache.size) {
+    const start = reusable ? detailCache.offset : 0;
+    const bytes = Buffer.allocUnsafe(stat.size - start);
+    const handle = await fs.open(filePath, "r");
+    try {
+      let read = 0;
+      while (read < bytes.length) {
+        const result = await handle.read(bytes, read, bytes.length - read, start + read);
+        if (result.bytesRead === 0) break;
+        read += result.bytesRead;
+      }
+      let offset = start;
+      for (const line of bytes.subarray(0, read).toString("utf8").split(/(?<=\n)/)) {
+        if (!line) continue;
+        const record = safeJson(line);
+        if (record) {
+          parseSessionLine(state, record);
+          offset += Buffer.byteLength(line);
+        } else if (line.endsWith("\n")) {
+          offset += Buffer.byteLength(line);
+        }
+      }
+      if (includeTurns) detailCache = {
+        filePath, ino: stat.ino, dev: stat.dev, size: stat.size,
+        mtimeMs: stat.mtimeMs, offset, state,
+      };
+    } finally {
+      await handle.close();
+    }
   }
   const indexedName = (await readSessionIndexNames()).get(state.id);
   if (indexedName) state.name = indexedName;

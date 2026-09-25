@@ -1385,17 +1385,18 @@ final class AppViewModel: ObservableObject {
         for candidate in connectionCandidates {
             do {
                 let candidateClient = APIClient(serverURL: candidate, token: authToken)
-                let _: HealthResponse = try await candidateClient.get("/api/health")
-                let projectResponse: ProjectsResponse = try await candidateClient.get("/api/projects")
-                let approvalsResponse: ApprovalsResponse? = try? await candidateClient.get("/api/approvals")
+                async let projectResponse: ProjectsResponse = candidateClient.get("/api/projects")
+                async let approvalsResponse: ApprovalsResponse? = try? candidateClient.get("/api/approvals")
+                let projects = try await projectResponse
+                let approvals = await approvalsResponse
                 guard generation == connectionGeneration else { return }
                 let switchedConnection = normalizedURL(serverURL) != candidate
                 serverURL = candidate
                 isServerReachable = true
-                applyProjects(projectResponse.data)
-                await synchronizeSelectedThreadIfNeeded(from: projectResponse.data)
+                applyProjects(projects.data)
+                await synchronizeSelectedThreadIfNeeded(from: projects.data)
                 guard generation == connectionGeneration else { return }
-                if let approvalsResponse { pendingApprovals = approvalsResponse.data }
+                if let approvals { pendingApprovals = approvals.data }
                 status = cloudexLocalized(
                     "已连接 · %@ · %@",
                     activeConnectionTitle,
@@ -1489,39 +1490,43 @@ final class AppViewModel: ObservableObject {
     func refreshServerOverviews() async {
         overviewGeneration += 1
         let generation = overviewGeneration
-        var latest: [ServerOverview] = []
-        for profile in serverProfiles {
-            guard !Task.isCancelled, generation == overviewGeneration else { return }
-            let candidates: [String]
-            switch profile.connectionMode {
-            case .automatic: candidates = [profile.lanURL, profile.tailscaleURL]
-            case .lan: candidates = [profile.lanURL]
-            case .tailscale: candidates = [profile.tailscaleURL]
+        let profiles = serverProfiles
+        let latest = await withTaskGroup(of: (Int, ServerOverview).self) { group in
+            for (index, profile) in profiles.enumerated() {
+                group.addTask { (index, await Self.fetchServerOverview(profile)) }
             }
-            var overview = ServerOverview(id: profile.id, isOnline: false, projectCount: 0,
-                                          activeThreads: [], pendingApprovalCount: 0, projects: [])
-            for address in candidates.map(normalizedURL).filter({ !$0.isEmpty }) {
-                let remote = APIClient(serverURL: address, token: profile.token)
-                do {
-                    let health: HealthResponse = try await remote.get("/api/health")
-                    guard health.ok else { continue }
-                    let projects: ProjectsResponse = try await remote.get("/api/projects")
-                    let approvals: ApprovalsResponse = try await remote.get("/api/approvals")
-                    overview = ServerOverview(
-                        id: profile.id,
-                        isOnline: true,
-                        projectCount: projects.data.count,
-                        activeThreads: projects.data.flatMap(\.threads).filter(\.isActive).map(\.title),
-                        pendingApprovalCount: approvals.data.count,
-                        projects: projects.data
-                    )
-                    break
-                } catch { continue }
-            }
-            latest.append(overview)
+            var results: [(Int, ServerOverview)] = []
+            for await result in group { results.append(result) }
+            return results.sorted { $0.0 < $1.0 }.map(\.1)
         }
         guard generation == overviewGeneration else { return }
         serverOverviews = latest
+    }
+
+    private static func fetchServerOverview(_ profile: ServerProfile) async -> ServerOverview {
+        let candidates: [String]
+        switch profile.connectionMode {
+        case .automatic: candidates = [profile.lanURL, profile.tailscaleURL]
+        case .lan: candidates = [profile.lanURL]
+        case .tailscale: candidates = [profile.tailscaleURL]
+        }
+        let offline = ServerOverview(id: profile.id, isOnline: false, projectCount: 0,
+                                     activeThreads: [], pendingApprovalCount: 0, projects: [])
+        for address in candidates.map({ $0.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/")) }).filter({ !$0.isEmpty }) {
+            let remote = APIClient(serverURL: address, token: profile.token)
+            do {
+                async let projects: ProjectsResponse = remote.get("/api/projects")
+                async let approvals: ApprovalsResponse? = try? remote.get("/api/approvals")
+                let projectData = try await projects.data
+                let approvalData = (await approvals)?.data ?? []
+                return ServerOverview(id: profile.id, isOnline: true,
+                                      projectCount: projectData.count,
+                                      activeThreads: projectData.flatMap(\.threads).filter(\.isActive).map(\.title),
+                                      pendingApprovalCount: approvalData.count, projects: projectData)
+            } catch { continue }
+        }
+        return offline
     }
 
     private func refreshServerReachability() async {
@@ -1596,12 +1601,15 @@ final class AppViewModel: ObservableObject {
         localError = nil
         attachedFiles = []
         detail = ThreadDetail(thread: thread, turns: [])
-        // Do not carry the previous conversation's model into this one while
-        // the authoritative Codex model list is being refreshed.
+        // Do not carry the previous conversation's model into this one.
         selectedModelID = ""
         selectedEffortID = ""
-        await refreshModelsForConversation()
-        guard selectedThreadID == thread.id, threadOpenGeneration == openGeneration else { return }
+        Task { [weak self] in
+            await self?.refreshModelsForConversation()
+            guard let self, self.selectedThreadID == thread.id,
+                  self.threadOpenGeneration == openGeneration else { return }
+            self.applyConversationModel(self.detail?.thread.model ?? thread.model)
+        }
         applyConversationModel(thread.model)
         liveRunning = thread.isActive
         messageIndex = []
@@ -1620,6 +1628,7 @@ final class AppViewModel: ObservableObject {
         }.value
         guard selectedThreadID == thread.id, threadOpenGeneration == openGeneration else { return }
         if let cachedIndex { messageIndex = cachedIndex }
+        if cachedDetail != nil { isOpeningThread = false }
         await loadThread(thread.id, force: true, replacingHistory: true)
         guard selectedThreadID == thread.id, threadOpenGeneration == openGeneration else { return }
         connectThreadStream(threadID: thread.id)
@@ -1636,7 +1645,7 @@ final class AppViewModel: ObservableObject {
             try? await Task.sleep(for: .milliseconds(20))
             if Task.isCancelled { return }
         }
-        await loadModelsIfNeeded(force: true)
+        await loadModelsIfNeeded()
     }
 
     private func applyConversationModel(_ modelValue: String?) {
