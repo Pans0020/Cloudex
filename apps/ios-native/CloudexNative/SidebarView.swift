@@ -8,15 +8,12 @@ struct CloudexRootView: View {
     @State private var navigationPath: [String] = []
     @State private var searchQuery = ""
     @State private var showingSettings = false
-    @State private var showingQRCodeScanner = false
-    @State private var showingScannerError = false
-    @State private var scannerErrorMessage = ""
     @FocusState private var searchFieldFocused: Bool
     @State private var keyboardHeight: CGFloat = 0
     @State private var searchMatches: [ConversationSearchMatch] = []
     @State private var searchRequest: Task<Void, Never>?
     @State private var isSearchingMessages = false
-    @State private var collapsedProjectIDs: Set<String> = []
+    @State private var expandedProjectIDs: Set<String> = []
     @State private var iPadColumnVisibility: NavigationSplitViewVisibility = .all
     @State private var iPadPreferredCompactColumn: NavigationSplitViewColumn = .sidebar
     @State private var showingIPadDirectory = false
@@ -69,30 +66,6 @@ struct CloudexRootView: View {
         .sheet(isPresented: $showingSettings) {
             SettingsView(isPresented: $showingSettings)
                 .environmentObject(viewModel)
-        }
-        .sheet(isPresented: $showingQRCodeScanner) {
-            NavigationStack {
-                QRCodeScannerView { code in
-                    connect(using: code)
-                } onFailure: { message in
-                    showingQRCodeScanner = false
-                    scannerErrorMessage = message
-                    showingScannerError = true
-                }
-                .ignoresSafeArea(edges: .bottom)
-                .navigationTitle("扫描连接二维码")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .cancellationAction) {
-                        Button("取消") { showingQRCodeScanner = false }
-                    }
-                }
-            }
-        }
-        .alert("无法扫描二维码", isPresented: $showingScannerError) {
-            Button("好", role: .cancel) {}
-        } message: {
-            Text(scannerErrorMessage)
         }
     }
 
@@ -376,11 +349,7 @@ struct CloudexRootView: View {
             }
             .accessibilityLabel("切换服务器")
         }
-        ToolbarItemGroup(placement: .topBarTrailing) {
-            Button { showingQRCodeScanner = true } label: {
-                Image(systemName: "qrcode.viewfinder")
-            }
-            .accessibilityLabel("扫描服务器二维码")
+        ToolbarItem(placement: .topBarTrailing) {
             Button { showingSettings = true } label: {
                 Image(systemName: "gearshape")
             }
@@ -462,28 +431,6 @@ struct CloudexRootView: View {
                 "选择一个项目",
                 systemImage: "folder",
                 description: Text("从左侧栏选择项目。")
-            )
-        }
-    }
-
-    private func connect(using code: String) {
-        guard let payload = CloudexConnectionPayload(code: code) else {
-            showingQRCodeScanner = false
-            scannerErrorMessage = "这不是有效的 Cloudex 服务器连接二维码。"
-            showingScannerError = true
-            return
-        }
-
-        showingQRCodeScanner = false
-        Task {
-            let mode = payload.preferredConnectionMode
-            await viewModel.saveServerProfile(
-                id: nil,
-                name: "",
-                lanURL: mode == .lan ? payload.serverURL : viewModel.lanServerURL,
-                tailscaleURL: mode == .tailscale ? payload.serverURL : viewModel.tailscaleServerURL,
-                connectionMode: mode,
-                token: payload.token
             )
         }
     }
@@ -771,14 +718,14 @@ struct CloudexRootView: View {
 
     private func isProjectCollapsed(_ project: CloudexProject) -> Bool {
         let isSearching = !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        return !isSearching && collapsedProjectIDs.contains(project.id)
+        return !isSearching && !expandedProjectIDs.contains(project.id)
     }
 
     private func toggleProject(_ project: CloudexProject) {
-        if collapsedProjectIDs.contains(project.id) {
-            collapsedProjectIDs.remove(project.id)
+        if expandedProjectIDs.contains(project.id) {
+            expandedProjectIDs.remove(project.id)
         } else {
-            collapsedProjectIDs.insert(project.id)
+            expandedProjectIDs.insert(project.id)
         }
     }
 

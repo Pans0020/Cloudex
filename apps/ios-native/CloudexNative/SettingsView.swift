@@ -10,6 +10,9 @@ struct SettingsView: View {
     @State private var notifyTaskFailure: Bool
     @State private var editingProfile: ServerProfile?
     @State private var showingNewProfile = false
+    @State private var showingQRCodeScanner = false
+    @State private var showingScannerError = false
+    @State private var scannerErrorMessage = ""
 
     init(isPresented: Binding<Bool>, viewModel: AppViewModel? = nil) {
         _isPresented = isPresented
@@ -22,6 +25,12 @@ struct SettingsView: View {
         NavigationStack {
             Form {
                 Section {
+                    Button {
+                        scannerErrorMessage = ""
+                        showingQRCodeScanner = true
+                    } label: {
+                        Label("扫描服务器二维码", systemImage: "qrcode.viewfinder")
+                    }
                     Button {
                         showingNewProfile = true
                     } label: {
@@ -56,6 +65,8 @@ struct SettingsView: View {
                                         Image(systemName: "checkmark")
                                             .foregroundStyle(.tint)
                                     }
+                                    Image(systemName: "pencil")
+                                        .foregroundStyle(.secondary)
                                 }
                             }
                             .buttonStyle(.plain)
@@ -111,6 +122,52 @@ struct SettingsView: View {
                 ServerProfileEditorView(profile: nil, isNew: true)
                     .environmentObject(viewModel)
             }
+            .sheet(isPresented: $showingQRCodeScanner, onDismiss: {
+                showingScannerError = !scannerErrorMessage.isEmpty
+            }) {
+                NavigationStack {
+                    QRCodeScannerView { code in
+                        connect(using: code)
+                    } onFailure: { message in
+                        showingQRCodeScanner = false
+                        scannerErrorMessage = message
+                    }
+                    .ignoresSafeArea(edges: .bottom)
+                    .navigationTitle("扫描连接二维码")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("取消") { showingQRCodeScanner = false }
+                        }
+                    }
+                }
+            }
+            .alert("无法扫描二维码", isPresented: $showingScannerError) {
+                Button("好", role: .cancel) {}
+            } message: {
+                Text(scannerErrorMessage)
+            }
+        }
+    }
+
+    private func connect(using code: String) {
+        guard let payload = CloudexConnectionPayload(code: code) else {
+            showingQRCodeScanner = false
+            scannerErrorMessage = "这不是有效的 Cloudex 服务器连接二维码。"
+            return
+        }
+
+        showingQRCodeScanner = false
+        Task {
+            let mode = payload.preferredConnectionMode
+            await viewModel.saveServerProfile(
+                id: nil,
+                name: "",
+                lanURL: mode == .lan ? payload.serverURL : "",
+                tailscaleURL: mode == .tailscale ? payload.serverURL : "",
+                connectionMode: mode,
+                token: payload.token
+            )
         }
     }
 }
@@ -131,7 +188,7 @@ private struct ServerProfileEditorView: View {
         NavigationStack {
             Form {
                 Section("服务器") {
-                    TextField("名称", text: $name)
+                    TextField("主机名称", text: $name)
                     Picker("默认连接方式", selection: $mode) {
                         ForEach(ConnectionMode.allCases) { Text($0.title).tag($0) }
                     }
