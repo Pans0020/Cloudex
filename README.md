@@ -64,13 +64,13 @@ Requirements: Node.js ≥ 22 and the standalone Codex CLI.
 
 ### 1. Start the server
 
-On another macOS/Linux machine with Git, Node.js >= 22, npm, and a signed-in Codex CLI, run this from the directory you want the app to browse:
+On another macOS/Linux machine with Git, Node.js >= 22, npm, and a signed-in Codex CLI, run:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Pans0020/Cloudex/fix/codex-session-history/install-cloudex.sh | bash
 ```
 
-The script installs to `~/.local/share/cloudex`, detects nvm-installed Node, creates/reuses a local token, starts the server in the background, checks its health, and prints a pairing QR code. Rerun it to show the QR code again. It prefers Tailscale; on a public VPS with Nginx and an existing certificate valid for its IP, it chooses and persists separate ports and adds an independent HTTPS proxy without changing existing services. Otherwise it uses a LAN address. Run `bash install-cloudex.sh --check` for a read-only preflight. Public HTTPS setup requires root. The script opens the port in active UFW/firewalld, but cloud-provider ingress rules may still need attention. It will not expose the controller over public HTTP without TLS. With a separately configured HTTPS proxy, use `curl ... | CLOUDEX_PUBLIC_URL=https://your-host bash`. The QR code contains the token: do not share it. Inspect the script URL before running remote code. On Windows, use the PowerShell startup script below.
+The script installs to `~/.local/share/cloudex`, detects nvm-installed Node, creates/reuses a local token, starts the server in the background, checks its health, and prints a pairing QR code. Rerun it to show the QR code again. It sets `FILE_ROOTS=/` by default, so the phone can browse every path readable by the server user. On a VPS running as root, this includes system files and keys; protect the QR code and token. Set `FILE_ROOTS=/chosen/path` to restrict access. The script prefers Tailscale; on a public VPS with Nginx and an existing certificate valid for its IP, it chooses and persists separate ports and adds an independent HTTPS proxy without changing existing services. Otherwise it uses a LAN address. Run `bash install-cloudex.sh --check` for a read-only preflight. Public HTTPS setup requires root. The script opens the port in active UFW/firewalld, but cloud-provider ingress rules may still need attention. It will not expose the controller over public HTTP without TLS. With a separately configured HTTPS proxy, use `curl ... | CLOUDEX_PUBLIC_URL=https://your-host bash`. Inspect the script URL before running remote code. On Windows, use the PowerShell startup script below.
 
 For an existing local checkout:
 
@@ -129,7 +129,7 @@ When `AUTH_TOKEN` is not set, `pair` / `serve` reuse or generate `.cloudex-state
 | `CLAUDE_DEFAULT_MODEL` | unset | Default model for new Claude sessions |
 | `CLAUDE_COMMAND_ARGS` | `--print --output-format stream-json --verbose` | Headless Claude arguments |
 | `CLAUDE_RESUME_ARGS` | `--resume {sessionId}` | Resume arguments; `{sessionId}` is replaced with the Claude session ID |
-| `FILE_ROOTS` | current directory | Root paths browsable from the phone (path-delimiter separated, `;` on Windows) |
+| `FILE_ROOTS` | current directory (`/` with installer) | Root paths browsable from the phone (path-delimiter separated, `;` on Windows) |
 | `CLOUDEX_PUBLIC_URL` | auto-inferred | Fixed server URL shown in the QR code |
 | `CLOUDEX_STATE_DIR` | `.cloudex-state` | State directory for the token, approval history, etc. |
 

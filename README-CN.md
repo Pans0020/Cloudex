@@ -64,13 +64,13 @@ resources/
 
 ### 1. 启动服务器
 
-在另一台已安装 Git、Node.js ≥ 22、npm 和 Codex CLI（已登录）的 macOS/Linux 机器上，可从想要浏览的项目目录运行一行安装命令：
+在另一台已安装 Git、Node.js ≥ 22、npm 和 Codex CLI（已登录）的 macOS/Linux 机器上，运行一行安装命令：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Pans0020/Cloudex/fix/codex-session-history/install-cloudex.sh | bash
 ```
 
-脚本安装到 `~/.local/share/cloudex`，支持 nvm 安装的 Node，生成并复用本机 Token，后台启动服务，确认可访问后打印配对二维码；再次运行可重新显示二维码。它优先使用 Tailscale；若 VPS 有公网 IP、Nginx 和匹配该 IP 的现有 HTTPS 证书，会为 VPS 自身选择并保存独立端口、增加独立的 Nginx 入口，不覆盖已有服务；否则使用局域网地址。可通过 `bash install-cloudex.sh --check` 只检查环境，不安装。公网模式需以 root 运行，脚本会配置已启用的 UFW/firewalld，但仍需确认服务商的入站防火墙放行新端口。没有现成证书时不会自动把控制接口暴露成公网 HTTP；可先配置 HTTPS 代理，再运行 `curl ... | CLOUDEX_PUBLIC_URL=https://你的地址 bash`。二维码包含 Token，不要分享或公开终端输出。运行远程脚本前可先打开上述 URL 检查内容。Windows 暂用下面的 PowerShell 启动方式。
+脚本安装到 `~/.local/share/cloudex`，支持 nvm 安装的 Node，生成并复用本机 Token，后台启动服务，确认可访问后打印配对二维码；再次运行可重新显示二维码。安装脚本默认设置 `FILE_ROOTS=/`，手机可浏览该运行用户有权限读取的全部目录；VPS 以 root 运行时包括系统文件和密钥，请妥善保管二维码和 Token。可通过 `FILE_ROOTS=/指定目录` 缩小范围。脚本优先使用 Tailscale；若 VPS 有公网 IP、Nginx 和匹配该 IP 的现有 HTTPS 证书，会为 VPS 自身选择并保存独立端口、增加独立的 Nginx 入口，不覆盖已有服务；否则使用局域网地址。可通过 `bash install-cloudex.sh --check` 只检查环境，不安装。公网模式需以 root 运行，脚本会配置已启用的 UFW/firewalld，但仍需确认服务商的入站防火墙放行新端口。没有现成证书时不会自动把控制接口暴露成公网 HTTP；可先配置 HTTPS 代理，再运行 `curl ... | CLOUDEX_PUBLIC_URL=https://你的地址 bash`。运行远程脚本前可先打开上述 URL 检查内容。Windows 暂用下面的 PowerShell 启动方式。
 
 已有本地仓库也可以直接启动：
 
@@ -130,7 +130,7 @@ cloudex --help
 | `CLAUDE_DEFAULT_MODEL` | 未设置 | Claude 新会话默认模型 |
 | `CLAUDE_COMMAND_ARGS` | `--print --output-format stream-json --verbose` | Claude headless 参数 |
 | `CLAUDE_RESUME_ARGS` | `--resume {sessionId}` | 恢复参数；`{sessionId}` 替换为 Claude session ID |
-| `FILE_ROOTS` | 当前目录 | 手机端可浏览的文件根路径（`;` 分隔） |
+| `FILE_ROOTS` | 当前目录（安装脚本为 `/`） | 手机端可浏览的文件根路径（`;` 分隔） |
 | `CLOUDEX_PUBLIC_URL` | 自动推断 | 二维码中固定展示的服务器地址 |
 | `CLOUDEX_STATE_DIR` | `.cloudex-state` | Token、审批历史等状态目录 |
 

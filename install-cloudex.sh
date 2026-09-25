@@ -7,7 +7,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
 只检查：bash install-cloudex.sh --check
 
 需要 macOS/Linux、Git、Node.js >= 22、npm，以及已安装并登录的 Codex CLI。
-默认安装到 ~/.local/share/cloudex；优先使用 Tailscale，其次使用已有证书的公网 HTTPS 或局域网。
+默认安装到 ~/.local/share/cloudex，FILE_ROOTS=/；优先使用 Tailscale，其次使用已有证书的公网 HTTPS 或局域网。
 可设置 CLOUDEX_INSTALL_DIR、FILE_ROOTS、PORT；有自建 HTTPS 反向代理时可设置 CLOUDEX_PUBLIC_URL。
 EOF
   exit 0
@@ -179,7 +179,7 @@ fi
 valid_port "$PORT" || { echo "PORT 必须是 1 到 65535 的端口号。" >&2; exit 1; }
 export PORT
 
-file_roots="${FILE_ROOTS:-$PWD}"
+file_roots="${FILE_ROOTS:-/}"
 cd "$install_dir"
 export FILE_ROOTS="$file_roots"
 export CLOUDEX_AGENT_PROVIDER="${CLOUDEX_AGENT_PROVIDER:-codex}"
