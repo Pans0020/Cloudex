@@ -41,6 +41,8 @@ final class AppViewModel: ObservableObject {
     @Published var localError: String? { didSet { rebuildRenderedMessages() } }
     @Published var attachedFiles: [RemoteFileEntry] = []
     @Published var pendingApprovals: [ApprovalRequest] = []
+    @Published var pendingInputs: [InputRequest] = []
+    @Published var presentedInput: InputRequest?
     @Published var systemMessages: [ChatMessage] = [] { didSet { rebuildRenderedMessages() } }
     @Published var messageIndex: [MessageIndexItem] = []
     @Published var pendingMessageJump: PendingMessageJump?
@@ -1414,6 +1416,9 @@ final class AppViewModel: ObservableObject {
             if let approvalsResponse: ApprovalsResponse = try? await candidateClient.get("/api/approvals") {
                 pendingApprovals = approvalsResponse.data
             }
+            if let inputsResponse: InputsResponse = try? await candidateClient.get("/api/inputs") {
+                pendingInputs = inputsResponse.data
+            }
         } else {
             isServerReachable = false
         }
@@ -1450,6 +1455,7 @@ final class AppViewModel: ObservableObject {
         }
         selectedProjectCWD = projectCWD
         selectedThreadID = thread.id
+        presentedInput = pendingInputs.first { $0.threadId == thread.id }
         selectedAgentProvider = thread.agentProvider
         UserDefaults.standard.set(selectedAgentProvider.rawValue, forKey: "cloudex.agentProvider")
         isCreatingNew = false
@@ -2192,7 +2198,10 @@ final class AppViewModel: ObservableObject {
                 Task { @MainActor in self?.handleThreadEvent(event, expectedThreadID: threadID) }
             }
             threadSSE.onOpen = { [weak self] in
-                Task { @MainActor in self?.threadStreamReplaying = true }
+                Task { @MainActor in
+                    self?.lastThreadEventID = 0
+                    self?.threadStreamReplaying = true
+                }
             }
             threadSSE.onDisconnect = { [weak self] message in
                 Task { @MainActor in
@@ -2207,6 +2216,20 @@ final class AppViewModel: ObservableObject {
     }
 
     private func handleGlobalEvent(_ event: SSEEvent) {
+        if event.name == "input/requested",
+           let input = try? JSONDecoder().decode(InputRequest.self, from: event.data) {
+            pendingInputs.removeAll { $0.id == input.id }
+            pendingInputs.append(input)
+            if input.threadId == selectedThreadID { presentedInput = input }
+            return
+        }
+        if event.name == "input/resolved",
+           let object = (try? JSONSerialization.jsonObject(with: event.data)) as? [String: String],
+           let id = object["id"] {
+            pendingInputs.removeAll { $0.id == id }
+            if presentedInput?.id == id { presentedInput = nil }
+            return
+        }
         if event.name == "approval/requested",
            let approval = try? JSONDecoder().decode(ApprovalRequest.self, from: event.data) {
             pendingApprovals.removeAll { $0.id == approval.id }
@@ -2248,6 +2271,15 @@ final class AppViewModel: ObservableObject {
             applyProjects(snapshot.projects)
             Task { await synchronizeSelectedThreadIfNeeded(from: snapshot.projects) }
         }
+    }
+
+    func respondToInput(_ input: InputRequest, response: [String: Any]) async throws {
+        var allowed = CharacterSet.urlPathAllowed
+        allowed.remove(charactersIn: "/")
+        let encoded = input.id.addingPercentEncoding(withAllowedCharacters: allowed) ?? input.id
+        let _: EmptyResponse = try await client.post("/api/inputs/\(encoded)/respond", json: response)
+        pendingInputs.removeAll { $0.id == input.id }
+        if presentedInput?.id == input.id { presentedInput = nil }
     }
 
     private func appendApprovalSystemMessage(approval: ApprovalRequest, decision: ApprovalDecision) {
@@ -2431,10 +2463,17 @@ final class AppViewModel: ObservableObject {
             reloadAfterEvent(expectedThreadID, waitForTerminalSnapshot: true)
         } else if method == "turn/completed" {
             liveRunning = false
+            let turn = params["turn"] as? [String: Any]
+            let turnStatus = turn?["status"] as? String
             if let errorText = notificationErrorText(params) {
                 localError = errorText
                 status = cloudexLocalized("任务失败：%@", errorText)
                 notifyTaskResultOnce(threadID: expectedThreadID, params: params, success: false, detail: errorText)
+            } else if turnStatus == "failed" || turnStatus == "interrupted" {
+                let detail = turnStatus == "interrupted" ? "任务已中断" : "任务失败"
+                localError = detail
+                status = detail
+                notifyTaskResultOnce(threadID: expectedThreadID, params: params, success: false, detail: detail)
             } else {
                 localError = nil
                 notifyTaskResultOnce(threadID: expectedThreadID, params: params, success: true)

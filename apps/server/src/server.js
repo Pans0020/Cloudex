@@ -29,6 +29,7 @@ const subscribers = new Map();
 const globalSubscribers = new Set();
 const eventHistory = new Map();
 const pendingApprovals = new Map();
+const pendingInputs = new Map();
 const EVENT_HISTORY_LIMIT = 250;
 const APPROVAL_HISTORY_FILE = path.join(config.stateDir, "approval-history.json");
 let approvalHistory = null;
@@ -456,6 +457,25 @@ function approvalFromRequest(message) {
 }
 
 client.on("serverRequest", (message) => {
+  if (["item/tool/requestUserInput", "mcpServer/elicitation/request"].includes(message.method)) {
+    const params = message.params || {};
+    const fields = Object.entries(params.requestedSchema?.properties || {}).map(([key, value]) => {
+      const schema = value && typeof value === "object" ? value : {};
+      const options = schema.enum || schema.oneOf?.map((option) => option.const);
+      return {
+        key,
+        title: schema.title || key,
+        description: schema.description || null,
+        type: typeof schema.type === "string" ? schema.type : "string",
+        options: Array.isArray(options) ? options.filter((option) => typeof option === "string") : null,
+        required: params.requestedSchema?.required?.includes(key) || false,
+      };
+    });
+    const input = { ...params, id: String(message.id), method: message.method, fields };
+    pendingInputs.set(input.id, input);
+    broadcastGlobal("input/requested", input);
+    return;
+  }
   const approval = approvalFromRequest(message);
   if (!approval) return;
   pendingApprovals.set(approval.id, { approval, rpcId: message.id, requestParams: message.params || {} });
@@ -468,6 +488,7 @@ client.on("notification", (message) => {
   const requestId = message.params?.requestId;
   if (requestId === undefined) return;
   const id = String(requestId);
+  if (pendingInputs.delete(id)) broadcastGlobal("input/resolved", { id });
   const pendingApproval = pendingApprovals.get(id);
   if (!pendingApproval) return;
   pendingApprovals.delete(id);
@@ -484,6 +505,11 @@ client.on("notification", (message) => {
     decision,
     approval: pendingApproval.approval,
   });
+});
+
+client.on("disconnected", () => {
+  for (const id of pendingInputs.keys()) broadcastGlobal("input/resolved", { id });
+  pendingInputs.clear();
 });
 
 function subscribe(threadId, res) {
@@ -1083,11 +1109,12 @@ async function resolveActiveTurn(threadId, { refresh = false } = {}) {
   if (cachedTurnId && !refresh) return { turnId: cachedTurnId, source: "cache" };
   const result = await readThreadDetail(threadId);
   const thread = result.thread || result;
-  const turnId = findActiveTurnId(thread);
+  const turnId = thread?.status?.type === "idle" ? null : findActiveTurnId(thread);
   if (turnId) client.setActiveTurn(threadId, turnId);
+  else client.clearActiveTurn(threadId);
   return {
-    turnId: turnId || cachedTurnId,
-    source: turnId ? (config.historySource === "cli-local" ? "cli-local" : "thread/read") : "cache",
+    turnId,
+    source: turnId ? (config.historySource === "cli-local" ? "cli-local" : "thread/read") : null,
     thread,
   };
 }
@@ -1165,6 +1192,7 @@ async function handle(req, res, url) {
     writeSse(res, "ready", { mode: "api-only" });
     if (latestProjectSnapshot) writeSse(res, "threads/changed", { reason: "replay", ...latestProjectSnapshot });
     for (const { approval } of pendingApprovals.values()) writeSse(res, "approval/requested", approval);
+    for (const input of pendingInputs.values()) writeSse(res, "input/requested", input);
     scheduleThreadSync("client-connected", 0);
     const keepAlive = setInterval(() => res.write(": keep-alive\n\n"), 15000);
     res.on("close", () => { clearInterval(keepAlive); cleanup(); });
@@ -1181,6 +1209,42 @@ async function handle(req, res, url) {
   }
   if (req.method === "GET" && url.pathname === "/api/approvals") {
     return json(res, 200, { data: [...pendingApprovals.values()].map(({ approval }) => approval) });
+  }
+  if (req.method === "GET" && url.pathname === "/api/inputs") {
+    return json(res, 200, { data: [...pendingInputs.values()] });
+  }
+  const inputMatch = url.pathname.match(/^\/api\/inputs\/([^/]+)\/respond$/);
+  if (req.method === "POST" && inputMatch) {
+    const id = decodeURIComponent(inputMatch[1]);
+    const input = pendingInputs.get(id);
+    if (!input) return json(res, 409, { error: "Input request is no longer pending" });
+    const response = await body(req);
+    if (input.method === "item/tool/requestUserInput") {
+      if (!response.answers || typeof response.answers !== "object" || Array.isArray(response.answers)) {
+        return json(res, 422, { error: "answers must be an object" });
+      }
+      for (const question of input.questions || []) {
+        if (!Array.isArray(response.answers[question.id]?.answers)
+          || !response.answers[question.id].answers.every((answer) => typeof answer === "string")) {
+          return json(res, 422, { error: `Missing answer for ${question.id}` });
+        }
+      }
+      client.respondServerRequest(id, { answers: response.answers });
+    } else {
+      if (!["accept", "decline", "cancel"].includes(response.action)) {
+        return json(res, 422, { error: "Invalid elicitation action" });
+      }
+      if (response.action === "accept" && response.content !== undefined
+        && (!response.content || typeof response.content !== "object" || Array.isArray(response.content))) {
+        return json(res, 422, { error: "content must be an object" });
+      }
+      client.respondServerRequest(id, response.action === "accept"
+        ? { action: "accept", content: response.content || {} }
+        : { action: response.action });
+    }
+    pendingInputs.delete(id);
+    broadcastGlobal("input/resolved", { id });
+    return json(res, 200, { ok: true });
   }
   const approvalMatch = url.pathname.match(/^\/api\/approvals\/([^/]+)\/respond$/);
   if (req.method === "POST" && approvalMatch) {
@@ -1553,7 +1617,7 @@ async function handle(req, res, url) {
         scheduleThreadSync("turn-stopped", 100);
         return json(res, 200, { stopped: true, threadId, turnId: null, source: "windows-cli" });
       }
-      const { turnId, source, thread } = await resolveActiveTurn(threadId);
+      const { turnId, source, thread } = await resolveActiveTurn(threadId, { refresh: true });
       if (!turnId) {
         const status = thread?.status?.type ? ` (${thread.status.type})` : "";
         const error = new Error(`No active turn for this thread${status}`);

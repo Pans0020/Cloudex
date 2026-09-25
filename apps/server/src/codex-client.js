@@ -266,6 +266,7 @@ export class CodexClient extends EventEmitter {
       this.subscribedThreads.clear();
       this.subscriptionRequests.clear();
       this.pendingServerRequests.clear();
+      this.activeTurns.clear();
       this.rejectPending(new CodexError("Managed Codex app-server connection closed"));
       this.emit("disconnected");
     });
@@ -302,6 +303,10 @@ export class CodexClient extends EventEmitter {
     const params = message.params || {};
     const threadId = params.threadId || params.thread?.id;
     if (message.method === "thread/started" && threadId) this.subscribedThreads.add(threadId);
+    if (message.method === "thread/closed" && threadId) {
+      this.subscribedThreads.delete(threadId);
+      this.activeTurns.delete(threadId);
+    }
     if (message.method === "turn/started" && threadId && params.turn?.id) this.activeTurns.set(threadId, params.turn.id);
     if ([
       "turn/completed",
@@ -378,6 +383,7 @@ export class CodexClient extends EventEmitter {
     this.subscribedThreads.clear();
     this.subscriptionRequests.clear();
     this.pendingServerRequests.clear();
+    this.activeTurns.clear();
   }
 
   async stop() {

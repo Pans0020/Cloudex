@@ -326,7 +326,15 @@ function addUniqueItem(turn, item) {
   if (!item?.text && item.type !== "userMessage" && item.type !== "commandExecution") return;
   if (turn.items.some((existing) => existing.id === item.id)) return;
   const text = itemPlainText(item).trim();
-  if (text && turn.items.some((existing) => existing.type === item.type && itemPlainText(existing).trim() === text)) return;
+  const duplicate = text && item.type !== "commandExecution"
+    ? turn.items.find((existing) => existing.type === item.type && itemPlainText(existing).trim() === text)
+    : null;
+  if (duplicate) {
+    if (item.type === "userMessage" && item.content?.some((part) => part.type === "image")) {
+      duplicate.content = item.content;
+    }
+    return;
+  }
   turn.items.push(item);
 }
 
@@ -547,16 +555,23 @@ function parseSessionLine(state, record) {
       return;
     }
     if (payload.type === "message" && payload.role === "user") {
-      // New rollouts store user input as response items, alongside injected
-      // instructions. Only explicitly tagged user text belongs in the chat.
+      // New rollouts store user input alongside injected instructions.
+      // Only explicitly tagged user text and images belong in the chat.
       const kinds = payload.internal_chat_message_metadata_passthrough?.content_item_kinds || [];
-      const text = textFromContent((payload.content || []).filter((_, index) => kinds[index] === "user.text"));
-      if (!text) return;
+      const content = (payload.content || []).flatMap((part, index) => {
+        if (kinds[index] === "user.text") return [{ type: "text", text: part.text || "" }];
+        if (kinds[index] === "user.image") return [{
+          type: "image", name: `图片 ${index + 1}`, path: part.path || null,
+          url: part.image_url || null,
+        }];
+        return [];
+      });
+      if (!content.some((part) => part.type === "image" || part.text?.trim())) return;
       const turn = getOrCreateTurn(state, turnId, timestamp);
       addUniqueItem(turn, {
         type: "userMessage",
         id: payload.id || `${turn.id}-user-${turn.items.length}`,
-        content: [{ type: "text", text }],
+        content,
         createdAt,
       });
       return;
@@ -577,6 +592,40 @@ function parseSessionLine(state, record) {
 
   if (record.type !== "event_msg") return;
   state.name = threadNameFromPayload(payload) || state.name;
+  if (payload.type === "item_completed") {
+    const completed = payload.item || {};
+    if (!["McpToolCall", "FileChange"].includes(completed.type)) return;
+    const turn = getOrCreateTurn(state, payload.turn_id, timestamp);
+    if (completed.type === "McpToolCall") {
+      addUniqueItem(turn, {
+        type: "commandExecution",
+        id: completed.id || `${turn.id}-mcp-${turn.items.length}`,
+        command: `${completed.server || "MCP"}.${completed.tool || "tool"}`,
+        activity: "ran",
+        status: completed.status || "completed",
+        createdAt,
+      });
+    } else {
+      const files = Object.keys(completed.changes || {});
+      if (!files.length) return;
+      const existingEdit = turn.items.findLast((item) => item.activity === "edited"
+        && files.some((file) => item.command?.includes(path.basename(file)))
+        && (item.status === "inProgress" || Math.abs((item.createdAt || 0) - createdAt) < 10));
+      if (existingEdit) {
+        existingEdit.status = completed.status || "completed";
+        return;
+      }
+      addUniqueItem(turn, {
+        type: "commandExecution",
+        id: completed.id || `${turn.id}-edit-${turn.items.length}`,
+        command: files.map((file) => path.basename(file)).join(", "),
+        activity: "edited",
+        status: completed.status || "completed",
+        createdAt,
+      });
+    }
+    return;
+  }
   if (payload.type === "token_count") {
     state.usage = usageFromPayload(payload, timestamp);
     return;

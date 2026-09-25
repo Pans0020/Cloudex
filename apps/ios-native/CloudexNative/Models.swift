@@ -279,6 +279,48 @@ struct ApprovalsResponse: Codable {
     let data: [ApprovalRequest]
 }
 
+struct InputsResponse: Codable {
+    let data: [InputRequest]
+}
+
+struct InputRequest: Codable, Identifiable, Equatable {
+    let id: String
+    let method: String
+    let threadId: String?
+    let serverName: String?
+    let mode: String?
+    let title: String?
+    let message: String?
+    let description: String?
+    let challenge: String?
+    let url: String?
+    let questions: [InputQuestion]?
+    let fields: [InputField]?
+}
+
+struct InputQuestion: Codable, Equatable, Identifiable {
+    let id: String
+    let header: String
+    let question: String
+    let options: [InputOption]?
+    let isSecret: Bool?
+}
+
+struct InputOption: Codable, Equatable {
+    let label: String
+    let description: String
+}
+
+struct InputField: Codable, Equatable, Identifiable {
+    let key: String
+    let title: String
+    let description: String?
+    let type: String
+    let options: [String]?
+    let required: Bool
+    var id: String { key }
+}
+
 struct ApprovalResolvedEvent: Codable {
     var id: String
     let threadId: String?
@@ -859,7 +901,7 @@ struct MessageAttachment: Identifiable, Equatable {
     let path: String?
     let kind: Kind
 
-    var id: String { "\(kind.rawValue):\(path ?? name)" }
+    var id: String { "\(kind.rawValue):\(path?.hasPrefix("data:") == true ? name : (path ?? name))" }
     var systemImage: String { kind == .image ? "photo" : "doc" }
 }
 

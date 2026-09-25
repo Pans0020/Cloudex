@@ -142,6 +142,16 @@ struct ContentView: View {
         .ignoresSafeArea(.keyboard, edges: .top)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            if let input = viewModel.pendingInputs.first(where: { $0.threadId == viewModel.selectedThreadID }) {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        viewModel.presentedInput = input
+                    } label: {
+                        Image(systemName: "questionmark.bubble")
+                    }
+                    .accessibilityLabel("回答 Codex 问题")
+                }
+            }
             ToolbarItem(placement: .principal) {
                 VStack(spacing: 1) {
                     Text(viewModel.navigationTitle)
@@ -197,6 +207,10 @@ struct ContentView: View {
                 viewModel.attach(file)
             }
             .environmentObject(viewModel)
+        }
+        .sheet(item: $viewModel.presentedInput) { input in
+            InputRequestSheet(input: input)
+                .environmentObject(viewModel)
         }
         .sheet(isPresented: $showingTokenUsage) {
             TokenUsageSheet(usage: viewModel.selectedThread?.usage)
@@ -1772,15 +1786,29 @@ private struct MessageBubble: View {
                 if message.role == .user, !message.attachments.isEmpty {
                     VStack(alignment: .leading, spacing: 6) {
                         ForEach(message.attachments) { attachment in
-                            HStack(spacing: 7) {
-                                Image(systemName: attachment.systemImage)
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(.secondary)
-                                Text(attachment.name)
-                                    .font(.caption.weight(.medium))
-                                    .lineLimit(1)
-                                    .truncationMode(.middle)
-                                Spacer(minLength: 0)
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack(spacing: 7) {
+                                    Image(systemName: attachment.systemImage)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(.secondary)
+                                    Text(attachment.name)
+                                        .font(.caption.weight(.medium))
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                    Spacer(minLength: 0)
+                                }
+                                if let path = attachment.path,
+                                   path.hasPrefix("data:image/"),
+                                   let encoded = path.split(separator: ",", maxSplits: 1).last,
+                                   let bytes = Data(base64Encoded: String(encoded)),
+                                   let image = UIImage(data: bytes) {
+                                    Image(uiImage: image)
+                                        .resizable()
+                                        .scaledToFit()
+                                        .frame(maxWidth: 260, maxHeight: 220)
+                                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                                        .accessibilityLabel(attachment.name)
+                                }
                             }
                             .padding(.horizontal, 9)
                             .padding(.vertical, 7)
@@ -3246,6 +3274,192 @@ struct CodexDiffLineRow: View {
         case .added: return Color.green.opacity(0.10)
         case .removed: return Color.red.opacity(0.10)
         case .context, .header: return Color(.secondarySystemBackground).opacity(0.55)
+        }
+    }
+}
+
+private struct InputRequestSheet: View {
+    @EnvironmentObject private var viewModel: AppViewModel
+    @Environment(\.dismiss) private var dismiss
+    let input: InputRequest
+    @State private var values: [String: String] = [:]
+    @State private var rawContent = "{}"
+    @State private var error: String?
+    @State private var sending = false
+
+    private var isQuestion: Bool { input.method == "item/tool/requestUserInput" }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                if let message = input.message, !message.isEmpty {
+                    Section { Text(message) }
+                }
+                if let description = input.description, !description.isEmpty {
+                    Section { Text(description) }
+                }
+                if let challenge = input.challenge, !challenge.isEmpty {
+                    Section("验证请求") { Text(challenge).textSelection(.enabled) }
+                }
+                if let url = input.url, let destination = URL(string: url),
+                   destination.scheme == "https" || destination.scheme == "http" {
+                    Section { Link("打开验证页面", destination: destination) }
+                }
+                if isQuestion {
+                    ForEach(input.questions ?? []) { question in
+                        Section(question.header) {
+                            Text(question.question)
+                            if let options = question.options, !options.isEmpty {
+                                Picker("选择回答", selection: value(for: question.id)) {
+                                    Text("请选择").tag("")
+                                    ForEach(options, id: \.label) { option in
+                                        Text(option.label).tag(option.label)
+                                    }
+                                }
+                                ForEach(options, id: \.label) { option in
+                                    Text("\(option.label)：\(option.description)")
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
+                            if question.isSecret == true {
+                                SecureField("回答", text: value(for: question.id))
+                            } else {
+                                TextField(optionsLabel(question), text: value(for: question.id))
+                            }
+                        }
+                    }
+                } else if let fields = input.fields, !fields.isEmpty {
+                    ForEach(fields) { field in
+                        Section(field.title) {
+                            if let options = field.options, !options.isEmpty {
+                                Picker(field.title, selection: value(for: field.key)) {
+                                    Text("请选择").tag("")
+                                    ForEach(options, id: \.self) { option in
+                                        Text(option).tag(option)
+                                    }
+                                }
+                            } else if field.type == "boolean" {
+                                Toggle(field.title, isOn: Binding(
+                                    get: { values[field.key] == "true" },
+                                    set: { values[field.key] = $0 ? "true" : "false" }
+                                ))
+                            } else {
+                                TextField(field.type == "array" ? "JSON 数组" : field.title,
+                                          text: value(for: field.key))
+                                    .textInputAutocapitalization(.never)
+                            }
+                            if let description = field.description {
+                                Text(description).font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                } else if input.mode != "url" {
+                    Section("回应内容 (JSON)") {
+                        TextEditor(text: $rawContent).frame(minHeight: 120)
+                    }
+                }
+                if let error { Text(error).foregroundStyle(.red) }
+            }
+            .navigationTitle(input.title ?? (isQuestion ? "Codex 提问" : "补充信息"))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("稍后") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("提交") { Task { await submit(action: "accept") } }
+                        .disabled(sending)
+                }
+                if !isQuestion {
+                    ToolbarItem(placement: .bottomBar) {
+                        Button("拒绝") { Task { await submit(action: "decline") } }
+                            .disabled(sending)
+                    }
+                }
+            }
+        }
+    }
+
+    private func value(for key: String) -> Binding<String> {
+        Binding(get: { values[key] ?? "" }, set: { values[key] = $0 })
+    }
+
+    private func optionsLabel(_ question: InputQuestion) -> String {
+        question.options?.isEmpty == false ? "或输入其他回答" : "回答"
+    }
+
+    private func response(action: String) throws -> [String: Any] {
+        if isQuestion {
+            var answers: [String: Any] = [:]
+            for question in input.questions ?? [] {
+                let answer = (values[question.id] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !answer.isEmpty else { throw InputError.message("请回答：\(question.question)") }
+                answers[question.id] = ["answers": [answer]]
+            }
+            return ["answers": answers]
+        }
+        if action != "accept" { return ["action": action] }
+        var content: [String: Any] = [:]
+        if let fields = input.fields, !fields.isEmpty {
+            for field in fields {
+                let value = (values[field.key] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                if field.required && value.isEmpty && field.type != "boolean" {
+                    throw InputError.message("请填写：\(field.title)")
+                }
+                if field.type == "boolean" {
+                    if field.required || !value.isEmpty { content[field.key] = value == "true" }
+                    continue
+                }
+                if value.isEmpty { continue }
+                switch field.type {
+                case "integer":
+                    guard let number = Int(value) else { throw InputError.message("\(field.title) 需要整数") }
+                    content[field.key] = number
+                case "number":
+                    guard let number = Double(value) else { throw InputError.message("\(field.title) 需要数字") }
+                    content[field.key] = number
+                case "array":
+                    guard let data = value.data(using: .utf8),
+                          let array = try? JSONSerialization.jsonObject(with: data, options: .fragmentsAllowed) as? [Any] else {
+                        throw InputError.message("\(field.title) 需要 JSON 数组")
+                    }
+                    content[field.key] = array
+                case "object":
+                    guard let data = value.data(using: .utf8),
+                          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                        throw InputError.message("\(field.title) 需要 JSON 对象")
+                    }
+                    content[field.key] = object
+                default: content[field.key] = value
+                }
+            }
+        } else if input.mode != "url" {
+            guard let data = rawContent.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw InputError.message("回应内容需要 JSON 对象")
+            }
+            content = object
+        }
+        return ["action": "accept", "content": content]
+    }
+
+    private func submit(action: String) async {
+        do {
+            let payload = try response(action: action)
+            sending = true
+            try await viewModel.respondToInput(input, response: payload)
+            dismiss()
+        } catch {
+            self.error = error.localizedDescription
+        }
+        sending = false
+    }
+
+    private enum InputError: LocalizedError {
+        case message(String)
+        var errorDescription: String? {
+            if case let .message(text) = self { return text }
+            return nil
         }
     }
 }
