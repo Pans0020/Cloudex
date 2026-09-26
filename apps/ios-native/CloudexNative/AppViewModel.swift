@@ -1205,13 +1205,24 @@ final class AppViewModel: ObservableObject {
         projects = fixtureThreads.map {
             CloudexProject(id: $0.id, name: String($0.id.dropFirst(3)), cwd: $0.cwd!, threads: [$0], updatedAt: nil)
         }
+        let scrollingFixture = ProcessInfo.processInfo.arguments.contains("--ui-scroll-fixture")
+        if scrollingFixture {
+            projects = projects.map { project in
+                let threads = (0..<80).map { index in
+                    CloudexThread(id: "\(project.id)-\(index)", name: "滚动回归 \(index)", preview: "历史会话",
+                                  cwd: project.cwd, status: nil, model: nil, createdAt: nil,
+                                  updatedAt: Double(1800000000 - index), usage: nil, provider: "codex")
+                }
+                return CloudexProject(id: project.id, name: project.name, cwd: project.cwd, threads: threads, updatedAt: nil)
+            }
+        }
         guard let thread else { draft = ""; return }
         selectedThreadID = thread.id
         selectedProjectCWD = thread.cwd
-        let turns: [[String: Any]] = (0..<6).map { index in
+        let turns: [[String: Any]] = (0..<(scrollingFixture ? 36 : 6)).map { index in
             ["id": "ui-turn-\(index)", "status": "completed", "items": [
                 ["type": "userMessage", "id": "ui-user-\(index)", "content": [["type": "text", "text": "检查第 \(index + 1) 轮消息"]]],
-                ["type": "agentMessage", "id": "ui-answer-\(index)", "text": "这是用于检查布局的回复。\n\n**重点**：输入框增长时，聊天区域需要跟着缩小，文字不能穿过工具栏。\n\n附件、语音、模型和访问模式在同一行，长输入只在输入框内部滚动。"]
+                ["type": "agentMessage", "id": "ui-answer-\(index)", "text": "这是用于检查布局的回复。\n\n**重点**：输入框增长时，聊天区域需要跟着缩小，文字不能穿过工具栏。\n\n附件、语音、模型和访问模式在同一行，长输入只在输入框内部滚动。" + (scrollingFixture ? "\n\n第 \(index) 轮 **Markdown**，`inline code` 与 [链接](https://example.com)。\n\n- 项目一\n- 项目二\n\n> 引用文本\n\n```swift\nlet count = \(index)\nprint(count)\n```\n\n| 列一 | 列二 |\n| --- | --- |\n| 内容 | 更多内容 |" : "")]
             ]]
         }
         let data = try! JSONSerialization.data(withJSONObject: turns)

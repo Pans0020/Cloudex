@@ -1171,6 +1171,8 @@ struct ContentView: View {
             hasLoadedChatContent = true
             return
         }
+        // Returning to the bottom must not re-layout identical messages or restart scrolling.
+        guard latest != chatContentSnapshot || isExplicitScrollInProgress else { return }
 
         if isPreparingInitialLayout {
             // Keep the hidden initial snapshot current while the first layout
@@ -2605,6 +2607,27 @@ private struct MarkdownText: View {
     var rendersMarkdown = true
     var onFileLink: ((URL) -> Void)? = nil
 
+    private final class CachedBlocks {
+        let value: [MarkdownBlock]
+        init(_ value: [MarkdownBlock]) { self.value = value }
+    }
+    private final class CachedInline {
+        let value: AttributedString
+        init(_ value: AttributedString) { self.value = value }
+    }
+    private static let blockCache: NSCache<NSString, CachedBlocks> = {
+        let cache = NSCache<NSString, CachedBlocks>()
+        cache.countLimit = 128
+        cache.totalCostLimit = 4 * 1024 * 1024
+        return cache
+    }()
+    private static let inlineCache: NSCache<NSString, CachedInline> = {
+        let cache = NSCache<NSString, CachedInline>()
+        cache.countLimit = 512
+        cache.totalCostLimit = 4 * 1024 * 1024
+        return cache
+    }()
+
     var body: some View {
         Group {
             if rendersMarkdown {
@@ -2658,22 +2681,30 @@ private struct MarkdownText: View {
         })
     }
 
-    private static func parseInline(_ text: String, highlightQuery: String?) -> AttributedString {
-        let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .full)
-        let parsed = (try? AttributedString(markdown: text, options: options)) ?? AttributedString(text)
+    static func parseInline(_ text: String, highlightQuery: String?) -> AttributedString {
+        let parsed = parsedText(text, plain: false)
         return highlightedAttributedString(markdownInlineCodeBackground(parsed), query: highlightQuery)
     }
 
     private static func parsePlainText(_ text: String, highlightQuery: String?) -> AttributedString {
-        let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        highlightedAttributedString(parsedText(text, plain: true), query: highlightQuery)
+    }
+
+    private static func parsedText(_ text: String, plain: Bool) -> AttributedString {
+        let key = "\(plain ? "plain" : "markdown"):\(text)" as NSString
+        if let cached = inlineCache.object(forKey: key) { return cached.value }
+        let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: plain ? .inlineOnlyPreservingWhitespace : .full)
         var parsed = (try? AttributedString(markdown: text, options: options)) ?? AttributedString(text)
-        for run in parsed.runs {
-            parsed[run.range].inlinePresentationIntent = nil
+        if plain {
+            for run in parsed.runs { parsed[run.range].inlinePresentationIntent = nil }
         }
-        return highlightedAttributedString(parsed, query: highlightQuery)
+        inlineCache.setObject(CachedInline(parsed), forKey: key, cost: text.utf8.count * 4)
+        return parsed
     }
 
     private static func blocks(from source: String) -> [MarkdownBlock] {
+        let key = source as NSString
+        if let cached = blockCache.object(forKey: key) { return cached.value }
         let lines = source
             .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
@@ -2791,6 +2822,7 @@ private struct MarkdownText: View {
             index += 1
         }
         flushParagraph()
+        blockCache.setObject(CachedBlocks(blocks), forKey: key, cost: source.utf8.count * 2)
         return blocks
     }
 
@@ -2891,8 +2923,8 @@ private struct AdaptiveConversationLayout: Layout {
         let widthLimit = fillsWidth
             ? max(1, availableWidth)
             : min(maximumWidth, max(1, availableWidth * maximumFraction))
-        let idealWidth = subview.sizeThatFits(.unspecified).width
-        let width = fillsWidth ? widthLimit : min(max(idealWidth, 1), widthLimit)
+        // Full-width answers already know their width; measuring them unbounded doubles text layout.
+        let width = fillsWidth ? widthLimit : min(max(subview.sizeThatFits(.unspecified).width, 1), widthLimit)
         let measured = subview.sizeThatFits(.init(width: width, height: proposal.height))
         return CGSize(width: width, height: measured.height)
     }
@@ -3025,14 +3057,12 @@ private struct MarkdownTableView: View {
     }
 
     private func inlineText(_ value: String) -> AttributedString {
-        let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .full)
         let normalized = value.replacingOccurrences(
             of: #"(?i)<br\s*/?>"#,
             with: "\n",
             options: .regularExpression
         )
-        let parsed = (try? AttributedString(markdown: normalized, options: options)) ?? AttributedString(normalized)
-        return highlightedAttributedString(markdownInlineCodeBackground(parsed), query: highlightQuery)
+        return MarkdownText.parseInline(normalized, highlightQuery: highlightQuery)
     }
 }
 

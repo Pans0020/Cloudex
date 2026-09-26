@@ -1,6 +1,63 @@
 import XCTest
 
 final class CloudexUITests: XCTestCase {
+    func testScrollToLatestAfterBrowsing() {
+        let app = scrollingApp()
+        app.buttons["展开CV"].tap()
+        app.buttons.containing(.staticText, identifier: "滚动回归 0").firstMatch.tap()
+        let chat = app.scrollViews["chat-history"]
+        XCTAssertTrue(chat.waitForExistence(timeout: 10))
+        let latestCode = app.staticTexts["let count = 35\nprint(count)"]
+        XCTAssertTrue(latestCode.waitForExistence(timeout: 5))
+        chat.swipeDown(velocity: .fast)
+        chat.swipeDown(velocity: .fast)
+        XCTAssertFalse(latestCode.isHittable)
+        let latest = app.buttons["滚动到最新消息"]
+        XCTAssertTrue(latest.waitForExistence(timeout: 5))
+        latest.tap()
+        let visible = XCTNSPredicateExpectation(predicate: NSPredicate(format: "hittable == true"), object: latestCode)
+        XCTAssertEqual(XCTWaiter.wait(for: [visible], timeout: 5), .completed)
+        snapshot("markdown-after-scroll-to-latest")
+    }
+
+    func testHomeScrollPerformance() {
+        let app = scrollingApp()
+        app.buttons["展开CV"].tap()
+        let list = app.collectionViews.firstMatch
+        XCTAssertTrue(list.exists)
+        measureScrolling(app, element: list)
+    }
+
+    func testConversationScrollPerformance() {
+        let app = scrollingApp()
+        app.buttons["展开CV"].tap()
+        app.buttons.containing(.staticText, identifier: "滚动回归 0").firstMatch.tap()
+        let chat = app.scrollViews["chat-history"]
+        XCTAssertTrue(chat.waitForExistence(timeout: 10))
+        XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "message-input").firstMatch.waitForExistence(timeout: 10))
+        measureScrolling(app, element: chat)
+    }
+
+    private func scrollingApp() -> XCUIApplication {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--ui-fixture", "--ui-scroll-fixture", "-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN"]
+        app.launch()
+        XCTAssertTrue(app.buttons["展开CV"].waitForExistence(timeout: 10))
+        return app
+    }
+
+    private func measureScrolling(_ app: XCUIApplication, element: XCUIElement) {
+        let options = XCTMeasureOptions()
+        options.iterationCount = 3
+        measure(metrics: [XCTOSSignpostMetric.scrollDecelerationMetric, XCTCPUMetric(application: app)], options: options) {
+            element.swipeUp(velocity: .fast)
+            element.swipeUp(velocity: .fast)
+            element.swipeDown(velocity: .fast)
+            element.swipeDown(velocity: .fast)
+        }
+    }
+
     func testComposerAndProjectLayout() {
         continueAfterFailure = false
         let app = XCUIApplication()

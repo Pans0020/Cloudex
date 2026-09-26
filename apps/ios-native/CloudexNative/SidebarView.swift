@@ -827,7 +827,8 @@ struct CloudexRootView: View {
         let shape = UnevenRoundedRectangle(topLeadingRadius: first ? 22 : 0, bottomLeadingRadius: last ? 22 : 0,
                                            bottomTrailingRadius: last ? 22 : 0, topTrailingRadius: first ? 22 : 0)
         // Native row separators divide conversations; never stroke each row as a box.
-        return shape.fill(.ultraThinMaterial).opacity(0.45)
+        // A translucent fill does not need a separate live blur for every scrolling row.
+        return shape.fill(Color(.secondarySystemGroupedBackground).opacity(0.55))
             .overlay(shape.fill(Color.primary.opacity(selected ? 0.045 : 0)))
     }
 
