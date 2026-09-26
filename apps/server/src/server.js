@@ -821,6 +821,11 @@ async function projectReview(candidate) {
 }
 
 async function listAllThreads(archived = false) {
+  // Share visibility across projects, search, thread lists and SSE snapshots.
+  return (await listProviderThreads(archived)).filter((thread) => projectCwdForThread(thread) !== null);
+}
+
+async function listProviderThreads(archived = false) {
   if (usesQwenProvider()) return qwenProvider.listThreads({ archived });
   if (usesClaudeProvider()) return claudeProvider.listThreads({ archived });
   if (usesBothProviders()) {
@@ -1021,6 +1026,13 @@ function projectCwdForThread(thread) {
   };
 
   if (temporaryRoots.some(isInside)) return null;
+
+  // Noninteractive helper runs can be labelled thread_source=user by Codex.
+  // Runtime workspaces identify these; image-prefixed prompts alone do not.
+  const isCodexExec = (!thread.provider || thread.provider === "codex")
+    && ["exec", "codex_exec"].includes(thread.source);
+  if (isCodexExec && (isInside(path.join(codexStateRoot, "pet-runs"))
+    || (process.platform === "darwin" && isInside(applicationSupportRoot)))) return null;
 
   // Codex creates dated scratch directories when a conversation is started
   // without choosing a project. Their final path component looks like a

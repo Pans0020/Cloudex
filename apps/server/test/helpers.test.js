@@ -33,6 +33,28 @@ test("application support sessions do not create a second project with the same 
   assert.deepEqual(projects.map((project) => project.threads[0].id), ["project", "app-data"]);
 });
 
+test("internal exec runs are hidden without hiding real image conversations or CLI projects", () => {
+  const home = os.homedir();
+  const petRuns = path.join(home, ".codex", "pet-runs", "example");
+  const appData = path.join(home, "Library", "Application Support", "Cue");
+  const image = '<image name=[Image #1] path="/picture.png"></image>Read this picture';
+  const threads = [
+    { id: "pet-qa", source: "exec", threadSource: "user", cwd: petRuns, preview: image },
+    { id: "pet-render", source: "exec", cwd: petRuns, preview: "Generate a sprite row" },
+    { id: "cue-benchmark", source: "exec", cwd: appData, preview: image },
+    { id: "real-image", source: "vscode", cwd: home, preview: image },
+    { id: "real-cli", source: "exec", cwd: path.join(home, "Project", "Cue"), preview: image },
+    { id: "real-home-cli", source: "exec", cwd: home, preview: image },
+    { id: "interactive-pet", source: "vscode", cwd: petRuns, preview: image },
+    { id: "skill-edit", source: "exec", cwd: path.join(home, ".codex", "skills"), preview: image },
+    { id: "prefix-sibling", source: "exec", cwd: path.join(home, ".codex", "pet-runs-backup"), preview: image },
+    { id: "other-provider", provider: "claude", source: "exec", cwd: petRuns, preview: image },
+  ];
+  const actual = projectsFromThreads(threads).flatMap((project) => project.threads.map((thread) => thread.id));
+  const expected = threads.filter((thread) => !["pet-qa", "pet-render", ...(process.platform === "darwin" ? ["cue-benchmark"] : [])].includes(thread.id)).map((thread) => thread.id);
+  assert.deepEqual(actual.sort(), expected.sort());
+});
+
 test("project has a package and a safe default workspace root", async () => {
   const packageJson = await import("../package.json", { with: { type: "json" } });
   assert.equal(packageJson.default.name, "cloudex");
