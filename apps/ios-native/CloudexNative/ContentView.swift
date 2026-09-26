@@ -138,7 +138,6 @@ struct ContentView: View {
     @State private var initialBottomScrollGeneration = 0
     @State private var isInitialBottomScrollInProgress = false
     @State private var isPreparingInitialLayout = true
-    @State private var isStaticConversationLocked = false
     @State private var messagePositioningGeneration = 0
     @State private var isMessagePositioningInProgress = false
     @State private var isProcessLayoutChangeInProgress = false
@@ -251,6 +250,13 @@ struct ContentView: View {
         .background(Color(.systemBackground))
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            #if DEBUG && targetEnvironment(simulator)
+            if ProcessInfo.processInfo.arguments.contains("--ui-stream-fixture") {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(viewModel.liveRunning ? "流式进行中" : "模拟连续回复") { viewModel.startUIFixtureStream() }
+                }
+            }
+            #endif
             if let input = viewModel.pendingInputs.first(where: { $0.threadId == viewModel.selectedThreadID }) {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
@@ -383,16 +389,10 @@ struct ContentView: View {
         }
         .onChange(of: viewModel.active) { _, active in
             if active {
-                isStaticConversationLocked = false
                 updateChatContent(force: true)
             } else if hasLoadedChatContent && !isPreparingInitialLayout {
-                // Apply the terminal snapshot once, then freeze completed
-                // conversations against background layout changes.
+                // Prepared Markdown can arrive after completion; equality suppresses no-op updates.
                 updateChatContent(force: true)
-                DispatchQueue.main.async {
-                    guard !viewModel.active, !isPreparingInitialLayout else { return }
-                    isStaticConversationLocked = true
-                }
             }
             guard !active else { return }
             let snapshot = MessageJumpItem.paired(
@@ -434,6 +434,9 @@ struct ContentView: View {
         .onChange(of: currentChatContent, initial: true) { _, _ in
             updateChatContent()
             fulfillPendingMessageJumpIfPossible()
+        }
+        .onChange(of: viewModel.isPreparingInitialMessages) { _, preparing in
+            if !preparing { updateChatContent() }
         }
         .onChange(of: viewModel.pendingMessageJump, initial: true) { _, _ in
             fulfillPendingMessageJumpIfPossible()
@@ -485,6 +488,9 @@ struct ContentView: View {
 
                     ForEach(content.messages) { message in
                         MessageBubble(
+                            viewModel: viewModel,
+                            client: viewModel.client,
+                            isActive: content.active,
                             message: message,
                             highlightQuery: messageTextHighlight?.messageID == message.id
                                 ? messageTextHighlight?.query
@@ -507,6 +513,7 @@ struct ContentView: View {
                                 floatingCollapseVisible = visible
                             }
                         )
+                        .equatable()
                         .id(message.id)
                         .accessibilityIdentifier("message-\(message.id)")
                         .onAppear {
@@ -641,8 +648,9 @@ struct ContentView: View {
             .onChange(of: viewModel.isLoadingOlderTurns) { _, loading in
                 guard !loading, let snapshot = olderHistoryScrollSnapshot else { return }
                 olderHistoryScrollSnapshot = nil
+                let generation = initialBottomScrollGeneration
                 let restore = {
-                    guard !viewModel.isLoadingOlderTurns else { return }
+                    guard !viewModel.isLoadingOlderTurns, initialBottomScrollGeneration == generation else { return }
                     let addedHeight = max(0, chatScrollController.contentSizeHeight() - snapshot.contentHeight)
                     _ = chatScrollController.restoreContentOffset(
                         CGPoint(x: snapshot.offset.x, y: snapshot.offset.y + addedHeight)
@@ -1106,9 +1114,9 @@ struct ContentView: View {
 
     private func updateChatContent(force: Bool = false) {
         guard isExpectedChatReady, !viewModel.isOpeningThread else { return }
-        if isStaticConversationLocked && !force { return }
         let latest = currentChatContent
         if !hasLoadedChatContent {
+            guard !viewModel.isPreparingInitialMessages else { return }
             beginInitialBottomPositioning()
             chatContentSnapshot = latest
             hasLoadedChatContent = true
@@ -1183,9 +1191,6 @@ struct ContentView: View {
             guard initialBottomScrollGeneration == generation else { return }
             isInitialBottomScrollInProgress = false
             isPreparingInitialLayout = false
-            if !viewModel.active {
-                isStaticConversationLocked = true
-            }
         }
     }
 
@@ -1198,12 +1203,12 @@ struct ContentView: View {
         scrollTargetMessageID = nil
         chatContentSnapshot = .empty
         hasLoadedChatContent = false
-        isStaticConversationLocked = false
         isPreparingInitialLayout = expectedThreadID?.hasPrefix("new-") != true
         isInitialBottomScrollInProgress = false
         isMessagePositioningInProgress = false
         isProcessLayoutChangeInProgress = false
         processExpansionScrollOffset = nil
+        olderHistoryScrollSnapshot = nil
         isAtChatBottom = true
         isFollowingChatBottom = true
         isUserScrollingChat = false
@@ -1764,8 +1769,11 @@ private struct PendingSteerBubble: View {
     }
 }
 
-private struct MessageBubble: View {
-    @EnvironmentObject private var viewModel: AppViewModel
+private struct MessageBubble: View, Equatable {
+    // Used for user actions only; unrelated model publications must not invalidate every row.
+    let viewModel: AppViewModel
+    let client: APIClient
+    let isActive: Bool
     let message: ChatMessage
     let highlightQuery: String?
     @Binding var collapseRequest: Int
@@ -1779,6 +1787,13 @@ private struct MessageBubble: View {
     @State private var previewItem: EditPreviewItem?
     @State private var previewLoadingPath: String?
     @State private var previewError: String?
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.viewModel === rhs.viewModel && lhs.client.serverURL == rhs.client.serverURL
+            && lhs.client.token == rhs.client.token && lhs.isActive == rhs.isActive
+            && lhs.message == rhs.message && lhs.highlightQuery == rhs.highlightQuery
+            && lhs.collapseRequest == rhs.collapseRequest
+    }
 
     @ViewBuilder
     var body: some View {
@@ -1796,9 +1811,7 @@ private struct MessageBubble: View {
         } else if message.role == .taskSummary || message.role == .compressed || message.role == .system {
             SystemTimelineBubble(message: message)
         } else if message.role == .assistant {
-            AdaptiveConversationLayout(fillsWidth: true) {
-                messageContent
-            }
+            messageContent
             .frame(maxWidth: .infinity, alignment: .leading)
             .sheet(item: $previewItem) { item in
                 NavigationStack {
@@ -1836,7 +1849,7 @@ private struct MessageBubble: View {
         } else {
             HStack {
                 if message.role == .user { Spacer(minLength: 42) }
-                AdaptiveConversationLayout(fillsWidth: message.role == .assistant) {
+                AdaptiveConversationLayout {
                     messageContent
                 }
                 if message.role != .user && message.role != .assistant {
@@ -1885,7 +1898,7 @@ private struct MessageBubble: View {
                                     Spacer(minLength: 0)
                                 }
                                 if attachment.kind == .image, let path = attachment.path {
-                                    AttachmentThumbnail(path: path, server: viewModel.serverURL, client: viewModel.client)
+                                    AttachmentThumbnail(path: path, server: client.serverURL, client: client)
                                         .frame(maxWidth: 260, maxHeight: 220)
                                         .clipShape(RoundedRectangle(cornerRadius: 6))
                                         .accessibilityLabel(attachment.name)
@@ -1901,9 +1914,9 @@ private struct MessageBubble: View {
 
                 if !message.text.isEmpty {
                     MarkdownText(
-                        text: message.text,
+                        document: message.markdown,
+                        fallbackText: message.text,
                         highlightQuery: highlightQuery,
-                        rendersMarkdown: message.role != .user,
                         onFileLink: message.role == .assistant ? { url in previewFile(url) } : nil
                     )
                         .font(.body)
@@ -2100,7 +2113,7 @@ private struct MessageBubble: View {
                     .foregroundStyle(.secondary)
                     .disabled(isPerformingAction)
                     .accessibilityLabel("填充到输入框")
-                } else if !viewModel.active {
+                } else if !isActive {
                     Button {
                         Task {
                             isPerformingAction = true
@@ -2184,7 +2197,7 @@ private struct ProcessSummaryBubble: View {
                         Image(systemName: "chevron.right.circle.fill")
                             .foregroundStyle(.secondary)
                             .rotationEffect(.degrees(expanded ? 90 : 0))
-                        MarkdownText(text: message.text)
+                        MarkdownText(document: message.markdown, fallbackText: message.text)
                             .font(.body.weight(.semibold))
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.leading)
@@ -2212,7 +2225,7 @@ private struct ProcessSummaryBubble: View {
                                             .font(.caption2.weight(.semibold))
                                             .foregroundStyle(.secondary)
                                     }
-                                    MarkdownText(text: item.text)
+                                    MarkdownText(document: item.markdown, fallbackText: item.text)
                                         .font(.body)
                                         .foregroundStyle(.primary)
                                         .textSelection(.enabled)
@@ -2513,62 +2526,32 @@ private struct SystemTimelineBubble: View {
 }
 
 private struct MarkdownText: View {
-    let text: String
+    let document: PreparedMarkdown?
+    let fallbackText: String
     var highlightQuery: String? = nil
-    var rendersMarkdown = true
     var onFileLink: ((URL) -> Void)? = nil
-
-    private final class CachedBlocks {
-        let value: [MarkdownBlock]
-        init(_ value: [MarkdownBlock]) { self.value = value }
-    }
-    private final class CachedInline {
-        let value: AttributedString
-        init(_ value: AttributedString) { self.value = value }
-    }
-    private static let blockCache: NSCache<NSString, CachedBlocks> = {
-        let cache = NSCache<NSString, CachedBlocks>()
-        cache.countLimit = 128
-        cache.totalCostLimit = 4 * 1024 * 1024
-        return cache
-    }()
-    private static let inlineCache: NSCache<NSString, CachedInline> = {
-        let cache = NSCache<NSString, CachedInline>()
-        cache.countLimit = 512
-        cache.totalCostLimit = 4 * 1024 * 1024
-        return cache
-    }()
 
     var body: some View {
         Group {
-            if rendersMarkdown {
+            if let document {
                 VStack(alignment: .leading, spacing: 8) {
-                    ForEach(Self.blocks(from: text)) { block in
+                    ForEach(document.blocks) { block in
                         switch block.content {
                         case let .paragraph(value):
-                            Text(Self.parseInline(value, highlightQuery: highlightQuery))
-                                .frame(maxWidth: .infinity, alignment: .leading)
+                            Text(styled(value)).frame(maxWidth: .infinity, alignment: .leading)
                         case let .quote(value):
                             HStack(alignment: .top, spacing: 9) {
-                                Rectangle()
-                                    .fill(Color.secondary.opacity(0.45))
-                                    .frame(width: 3)
-                                Text(Self.parseInline(value, highlightQuery: highlightQuery))
-                                    .foregroundStyle(.secondary)
+                                Rectangle().fill(Color.secondary.opacity(0.45)).frame(width: 3)
+                                Text(styled(value)).foregroundStyle(.secondary)
                                     .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            .padding(.vertical, 2)
+                            }.padding(.vertical, 2)
                         case let .list(items):
                             VStack(alignment: .leading, spacing: 4) {
                                 ForEach(items) { item in
                                     HStack(alignment: .firstTextBaseline, spacing: 8) {
-                                        Text(item.marker)
-                                            .font(.subheadline.weight(.semibold))
-                                            .foregroundStyle(.secondary)
-                                        Text(Self.parseInline(item.text, highlightQuery: highlightQuery))
-                                            .frame(maxWidth: .infinity, alignment: .leading)
-                                    }
-                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                        Text(item.marker).font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+                                        Text(styled(item.text)).frame(maxWidth: .infinity, alignment: .leading)
+                                    }.frame(maxWidth: .infinity, alignment: .leading)
                                 }
                             }
                         case let .code(value, language):
@@ -2579,7 +2562,8 @@ private struct MarkdownText: View {
                     }
                 }
             } else {
-                Text(Self.parsePlainText(text, highlightQuery: highlightQuery))
+                // Optimistic outgoing messages are literal text and appear immediately.
+                Text(highlightedAttributedString(fallbackText, query: highlightQuery))
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
@@ -2592,237 +2576,14 @@ private struct MarkdownText: View {
         })
     }
 
-    static func parseInline(_ text: String, highlightQuery: String?) -> AttributedString {
-        let parsed = parsedText(text, plain: false)
-        return highlightedAttributedString(markdownInlineCodeBackground(parsed), query: highlightQuery)
-    }
-
-    private static func parsePlainText(_ text: String, highlightQuery: String?) -> AttributedString {
-        highlightedAttributedString(parsedText(text, plain: true), query: highlightQuery)
-    }
-
-    private static func parsedText(_ text: String, plain: Bool) -> AttributedString {
-        let key = "\(plain ? "plain" : "markdown"):\(text)" as NSString
-        if let cached = inlineCache.object(forKey: key) { return cached.value }
-        let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: plain ? .inlineOnlyPreservingWhitespace : .full)
-        var parsed = (try? AttributedString(markdown: text, options: options)) ?? AttributedString(text)
-        if plain {
-            for run in parsed.runs { parsed[run.range].inlinePresentationIntent = nil }
-        }
-        inlineCache.setObject(CachedInline(parsed), forKey: key, cost: text.utf8.count * 4)
-        return parsed
-    }
-
-    private static func blocks(from source: String) -> [MarkdownBlock] {
-        let key = source as NSString
-        if let cached = blockCache.object(forKey: key) { return cached.value }
-        let lines = source
-            .replacingOccurrences(of: "\r\n", with: "\n")
-            .replacingOccurrences(of: "\r", with: "\n")
-            .split(separator: "\n", omittingEmptySubsequences: false)
-            .map(String.init)
-        var blocks: [MarkdownBlock] = []
-        var paragraph: [String] = []
-        var index = 0
-        var blockID = 0
-
-        func appendBlock(_ content: MarkdownBlock.Content) {
-            blocks.append(MarkdownBlock(id: blockID, content: content))
-            blockID += 1
-        }
-
-        func flushParagraph() {
-            let value = paragraph.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-            if !value.isEmpty {
-                appendBlock(.paragraph(value))
-            }
-            paragraph.removeAll(keepingCapacity: true)
-        }
-
-        while index < lines.count {
-            let line = lines[index]
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-
-            if let language = Self.fenceLanguage(in: trimmed) {
-                flushParagraph()
-                index += 1
-                var codeLines: [String] = []
-                while index < lines.count {
-                    let codeLine = lines[index]
-                    if codeLine.trimmingCharacters(in: .whitespaces).hasPrefix("```") {
-                        index += 1
-                        break
-                    }
-                    codeLines.append(codeLine)
-                    index += 1
-                }
-                appendBlock(.code(codeLines.joined(separator: "\n"), language))
-                continue
-            }
-
-            if index + 1 < lines.count,
-               trimmed.contains("|"),
-               Self.isTableSeparator(lines[index + 1]) {
-                flushParagraph()
-                var rows = [Self.tableRow(from: line)]
-                index += 2
-                while index < lines.count {
-                    let row = lines[index]
-                    let rowTrimmed = row.trimmingCharacters(in: .whitespaces)
-                    guard !rowTrimmed.isEmpty, rowTrimmed.contains("|") else { break }
-                    rows.append(Self.tableRow(from: row))
-                    index += 1
-                }
-                if rows.first?.count ?? 0 > 0 {
-                    appendBlock(.table(rows))
-                }
-                continue
-            }
-
-            if let item = Self.listItem(from: line, id: blockID) {
-                flushParagraph()
-                var items = [item]
-                index += 1
-                while index < lines.count {
-                    let nextLine = lines[index]
-                    guard let nextItem = Self.listItem(from: nextLine, id: blockID + items.count) else { break }
-                    items.append(nextItem)
-                    index += 1
-                }
-                appendBlock(.list(items))
-                continue
-            }
-
-            if Self.isQuoteLine(line) {
-                flushParagraph()
-                var quoteLines: [String] = []
-                while index < lines.count, Self.isQuoteLine(lines[index]) {
-                    quoteLines.append(Self.quoteText(from: lines[index]))
-                    index += 1
-                }
-                appendBlock(.quote(quoteLines.joined(separator: "\n")))
-                continue
-            }
-
-            if Self.isIndentedCode(line) {
-                flushParagraph()
-                var codeLines: [String] = []
-                while index < lines.count {
-                    let codeLine = lines[index]
-                    if codeLine.isEmpty {
-                        codeLines.append("")
-                        index += 1
-                    } else if Self.isIndentedCode(codeLine) {
-                        let indentation = codeLine.hasPrefix("\t") ? 1 : min(4, codeLine.count)
-                        codeLines.append(String(codeLine.dropFirst(indentation)))
-                        index += 1
-                    } else {
-                        break
-                    }
-                }
-                while codeLines.last?.isEmpty == true { codeLines.removeLast() }
-                appendBlock(.code(codeLines.joined(separator: "\n"), ""))
-                continue
-            }
-
-            if trimmed.isEmpty {
-                flushParagraph()
-            } else {
-                paragraph.append(line)
-            }
-            index += 1
-        }
-        flushParagraph()
-        blockCache.setObject(CachedBlocks(blocks), forKey: key, cost: source.utf8.count * 2)
-        return blocks
-    }
-
-    private static func fenceLanguage(in line: String) -> String? {
-        guard line.hasPrefix("```") else { return nil }
-        return String(line.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private static func isIndentedCode(_ line: String) -> Bool {
-        line.hasPrefix("    ") || line.hasPrefix("\t")
-    }
-
-    private static func isQuoteLine(_ line: String) -> Bool {
-        line.trimmingCharacters(in: .whitespaces).hasPrefix(">")
-    }
-
-    private static func quoteText(from line: String) -> String {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        return String(trimmed.dropFirst()).trimmingCharacters(in: .whitespaces)
-    }
-
-    private static func listItem(from line: String, id: Int) -> MarkdownListItem? {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { return nil }
-
-        if let first = trimmed.first, ["-", "*", "+"].contains(first) {
-            let remainder = trimmed.dropFirst()
-            guard remainder.first?.isWhitespace == true else { return nil }
-            let text = remainder.trimmingCharacters(in: .whitespaces)
-            guard !text.isEmpty else { return nil }
-            return MarkdownListItem(id: id, marker: "•", text: text)
-        }
-
-        var digits = ""
-        var index = trimmed.startIndex
-        while index < trimmed.endIndex, trimmed[index].isNumber {
-            digits.append(trimmed[index])
-            index = trimmed.index(after: index)
-        }
-        guard !digits.isEmpty, index < trimmed.endIndex else { return nil }
-        let separator = trimmed[index]
-        guard separator == "." || separator == ")" else { return nil }
-        index = trimmed.index(after: index)
-        guard index < trimmed.endIndex, trimmed[index].isWhitespace else { return nil }
-        let text = trimmed[index...].trimmingCharacters(in: .whitespaces)
-        guard !text.isEmpty else { return nil }
-        return MarkdownListItem(id: id, marker: "\(digits).", text: text)
-    }
-
-    private static func isTableSeparator(_ line: String) -> Bool {
-        let cells = tableRow(from: line)
-        guard cells.count >= 2 else { return false }
-        return cells.allSatisfy { cell in
-            let value = cell.trimmingCharacters(in: .whitespaces)
-            let withoutEdges = value.trimmingCharacters(in: CharacterSet(charactersIn: ":"))
-            return withoutEdges.count >= 3 && withoutEdges.allSatisfy { $0 == "-" }
-        }
-    }
-
-    private static func tableRow(from line: String) -> [String] {
-        var value = line.trimmingCharacters(in: .whitespaces)
-        if value.hasPrefix("|") { value.removeFirst() }
-        if value.hasSuffix("|") { value.removeLast() }
-
-        var cells: [String] = []
-        var current = ""
-        var escaped = false
-        for character in value {
-            if character == "|" && !escaped {
-                cells.append(current.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "\\|", with: "|"))
-                current = ""
-            } else {
-                current.append(character)
-            }
-            escaped = character == "\\" && !escaped
-        }
-        cells.append(current.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "\\|", with: "|"))
-        return cells
+    private func styled(_ text: AttributedString) -> AttributedString {
+        highlightedAttributedString(markdownInlineCodeBackground(text), query: highlightQuery)
     }
 }
 
 private struct AdaptiveConversationLayout: Layout {
     private let maximumWidth: CGFloat = 720
     private let maximumFraction: CGFloat = 0.82
-    private let fillsWidth: Bool
-
-    init(fillsWidth: Bool = false) {
-        self.fillsWidth = fillsWidth
-    }
 
     func sizeThatFits(
         proposal: ProposedViewSize,
@@ -2831,11 +2592,8 @@ private struct AdaptiveConversationLayout: Layout {
     ) -> CGSize {
         guard let subview = subviews.first else { return .zero }
         let availableWidth = proposal.width ?? maximumWidth
-        let widthLimit = fillsWidth
-            ? max(1, availableWidth)
-            : min(maximumWidth, max(1, availableWidth * maximumFraction))
-        // Full-width answers already know their width; measuring them unbounded doubles text layout.
-        let width = fillsWidth ? widthLimit : min(max(subview.sizeThatFits(.unspecified).width, 1), widthLimit)
+        let widthLimit = min(maximumWidth, max(1, availableWidth * maximumFraction))
+        let width = min(max(subview.sizeThatFits(.unspecified).width, 1), widthLimit)
         let measured = subview.sizeThatFits(.init(width: width, height: proposal.height))
         return CGSize(width: width, height: measured.height)
     }
@@ -2855,24 +2613,6 @@ private struct AdaptiveConversationLayout: Layout {
     }
 }
 
-private struct MarkdownBlock: Identifiable {
-    enum Content {
-        case paragraph(String)
-        case quote(String)
-        case list([MarkdownListItem])
-        case code(String, String)
-        case table([[String]])
-    }
-
-    let id: Int
-    let content: Content
-}
-
-private struct MarkdownListItem: Identifiable {
-    let id: Int
-    let marker: String
-    let text: String
-}
 
 private struct MarkdownCodeBlock: View {
     let source: String
@@ -2929,7 +2669,7 @@ private struct MarkdownCodeBlock: View {
 }
 
 private struct MarkdownTableView: View {
-    let rows: [[String]]
+    let rows: [[AttributedString]]
     let highlightQuery: String?
 
     var body: some View {
@@ -2939,7 +2679,7 @@ private struct MarkdownTableView: View {
                 ForEach(Array(rows.enumerated()), id: \.offset) { rowIndex, row in
                     GridRow {
                         ForEach(0..<columnCount, id: \.self) { column in
-                            Text(inlineText(row.indices.contains(column) ? row[column] : ""))
+                            Text(highlightedAttributedString(markdownInlineCodeBackground(row.indices.contains(column) ? row[column] : AttributedString("")), query: highlightQuery))
                                 .font(.subheadline)
                                 .foregroundStyle(.primary)
                                 .multilineTextAlignment(.leading)
@@ -2967,14 +2707,6 @@ private struct MarkdownTableView: View {
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
-    private func inlineText(_ value: String) -> AttributedString {
-        let normalized = value.replacingOccurrences(
-            of: #"(?i)<br\s*/?>"#,
-            with: "\n",
-            options: .regularExpression
-        )
-        return MarkdownText.parseInline(normalized, highlightQuery: highlightQuery)
-    }
 }
 
 private struct ExecutionStepRow: View {

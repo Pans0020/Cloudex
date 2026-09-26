@@ -105,7 +105,9 @@ struct CloudexRootView: View {
     }
 
     private var phoneNavigation: some View {
-        NavigationStack(path: $navigationPath) {
+        let projects = filteredProjects
+        let matches = matchesByThreadID
+        return NavigationStack(path: $navigationPath) {
             List {
                 serverOverviewSection
 
@@ -120,7 +122,7 @@ struct CloudexRootView: View {
                     }
                 }
 
-                ForEach(filteredProjects) { project in
+                ForEach(projects) { project in
                     Section {
                         projectHeader(project)
                             .listRowBackground(projectCardBackground(project, first: true, last: isProjectCollapsed(project)))
@@ -132,7 +134,7 @@ struct CloudexRootView: View {
                                 VStack(alignment: .leading, spacing: 0) {
                                     conversationButton(thread, projectCWD: project.isNoProjectLike ? nil : project.cwd)
 
-                                    ForEach(matchesByThreadID[thread.id] ?? []) { match in
+                                    ForEach(matches[thread.id] ?? []) { match in
                                         searchMatchButton(
                                             match,
                                             thread: thread,
@@ -147,7 +149,7 @@ struct CloudexRootView: View {
                     }
                 }
 
-                if filteredProjects.isEmpty, !isSearchingMessages {
+                if projects.isEmpty, !isSearchingMessages {
                     ContentUnavailableView.search(text: searchQuery)
                         .listRowBackground(Color.clear)
                 }
@@ -262,7 +264,9 @@ struct CloudexRootView: View {
     }
 
     private func iPadSidebarColumn(windowed: Bool, bottomSafeArea: CGFloat) -> some View {
-        List {
+        let projects = iPadSidebarProjects
+        let matches = matchesByThreadID
+        return List {
             serverOverviewSection
 
             if !pinnedConversations.isEmpty {
@@ -274,7 +278,7 @@ struct CloudexRootView: View {
                 }
             }
 
-            ForEach(iPadSidebarProjects) { project in
+            ForEach(projects) { project in
                 Section {
                     projectHeader(project)
                         .listRowBackground(projectCardBackground(project, first: true, last: isProjectCollapsed(project)))
@@ -293,7 +297,7 @@ struct CloudexRootView: View {
                             VStack(alignment: .leading, spacing: 0) {
                                 iPadConversationButton(thread, project: project)
 
-                                ForEach(matchesByThreadID[thread.id] ?? []) { match in
+                                ForEach(matches[thread.id] ?? []) { match in
                                     iPadSearchMatchButton(match, thread: thread, project: project)
                                 }
                             }
@@ -304,7 +308,7 @@ struct CloudexRootView: View {
                 }
             }
 
-            if iPadSidebarProjects.isEmpty, !isSearchingMessages {
+            if projects.isEmpty, !isSearchingMessages {
                 ContentUnavailableView.search(text: searchQuery)
                     .listRowBackground(Color.clear)
             }
@@ -502,12 +506,14 @@ struct CloudexRootView: View {
 
     private var filteredProjects: [CloudexProject] {
         let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        let matches = matchesByThreadID
+        let pinned = viewModel.pinnedThreadIDs
         return viewModel.agentProjects.compactMap { project in
             let threads = project.threads
                 .filter { thread in
-                    !viewModel.isPinned(thread.id)
+                    !pinned.contains(thread.id)
                         && (query.isEmpty
-                        || matchesByThreadID[thread.id]?.isEmpty == false
+                        || matches[thread.id]?.isEmpty == false
                         || [thread.title, thread.preview ?? "", thread.cwd ?? "", project.displayName]
                             .contains { $0.localizedCaseInsensitiveContains(query) })
                 }

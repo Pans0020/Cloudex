@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		A20000000000000000000001 = {isa = PBXBuildFile; fileRef = B20000000000000000000001; };
 		A10000000000000000000001 = {isa = PBXBuildFile; fileRef = B10000000000000000000001; };
 		A00000000000000000000001 /* CloudexNativeApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000001 /* CloudexNativeApp.swift */; };
 		A00000000000000000000002 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000002 /* Models.swift */; };
@@ -40,6 +41,7 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		B20000000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownRendering.swift; sourceTree = "<group>"; };
 		B10000000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudexUITests.swift; sourceTree = "<group>"; };
 		B10000000000000000000002 = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = CloudexUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		B00000000000000000000001 /* CloudexNativeApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudexNativeApp.swift; sourceTree = "<group>"; };
@@ -124,6 +126,7 @@
 			isa = PBXGroup;
 			children = (
 				B00000000000000000000001 /* CloudexNativeApp.swift */,
+				B20000000000000000000001,
 				B00000000000000000000002 /* Models.swift */,
 				B00000000000000000000003 /* APIClient.swift */,
 				B00000000000000000000004 /* SSEClient.swift */,
@@ -265,6 +268,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				A00000000000000000000001 /* CloudexNativeApp.swift in Sources */,
+				A20000000000000000000001,
 				A00000000000000000000002 /* Models.swift in Sources */,
 				A00000000000000000000003 /* APIClient.swift in Sources */,
 				A00000000000000000000004 /* SSEClient.swift in Sources */,

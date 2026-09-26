@@ -57,6 +57,7 @@ final class AppViewModel: ObservableObject {
     @Published private(set) var pinnedThreadIDs: Set<String>
     @Published var projects: [CloudexProject] = []
     @Published var renderedMessages: [ChatMessage] = []
+    @Published private(set) var isPreparingInitialMessages = false
     @Published var pendingOutgoing: ChatMessage? { didSet { rebuildRenderedMessages() } }
     @Published var models: [CodexModel] = []
     @Published var selectedProjectCWD: String?
@@ -78,8 +79,11 @@ final class AppViewModel: ObservableObject {
     @Published var isOpeningThread = false
     @Published private(set) var isLoadingOlderTurns = false
     @Published var isCreatingNew = false
-    @Published var liveMessages: [ChatMessage] = [] { didSet { scheduleRenderedMessagesRebuild() } }
-    @Published var liveRunning = false
+    // Token fragments are internal state; only coalesced rendered messages notify the UI.
+    private var liveMessages: [ChatMessage] = [] { didSet { scheduleRenderedMessagesRebuild() } }
+    @Published var liveRunning = false {
+        didSet { if oldValue && !liveRunning { rebuildRenderedMessages() } }
+    }
     @Published var localError: String? { didSet { rebuildRenderedMessages() } }
     @Published var attachedFiles: [RemoteFileEntry] = []
     @Published var pendingApprovals: [ApprovalRequest] = []
@@ -121,6 +125,11 @@ final class AppViewModel: ObservableObject {
     private var sentTaskResultNotificationKeys = Set<String>()
     private var pendingSteerAutoSendInFlight = false
     private var renderedMessagesRebuildTask: Task<Void, Never>?
+    private var renderEpoch = 0
+    private var renderRequestID = 0
+    private var publishedRenderID = 0
+    private var pendingRender: (epoch: Int, id: Int, messages: [ChatMessage])?
+    private var renderPreparationTask: Task<Void, Never>?
 
     init() {
         let defaults = UserDefaults.standard
@@ -404,19 +413,85 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    private func rebuildRenderedMessages() {
-        renderedMessages = buildMessages()
+    private func rebuildRenderedMessages(invalidateInFlight: Bool = true) {
+        renderedMessagesRebuildTask?.cancel()
+        renderedMessagesRebuildTask = nil
+        if invalidateInFlight { renderEpoch += 1 }
+        renderRequestID += 1
+        let previous = Dictionary(uniqueKeysWithValues: renderedMessages.map { ($0.id, $0) })
+        let next = buildMessages().map { reuseMarkdown($0, previous: previous[$0.id]) }
+        if !next.contains(where: needsMarkdown) {
+            pendingRender = nil
+            publishedRenderID = renderRequestID
+            if renderedMessages != next { renderedMessages = next }
+            if isPreparingInitialMessages { isPreparingInitialMessages = false }
+            return
+        }
+        // Sending must remain immediate even while an older assistant reply is being prepared.
+        if let outgoing = pendingOutgoing, next.contains(where: { $0.id == outgoing.id }) {
+            if let index = renderedMessages.firstIndex(where: { $0.id == outgoing.id }) {
+                if renderedMessages[index] != outgoing { renderedMessages[index] = outgoing }
+            } else {
+                renderedMessages.append(outgoing)
+            }
+        }
+        pendingRender = (renderEpoch, renderRequestID, next)
+        if renderedMessages.isEmpty && !isPreparingInitialMessages { isPreparingInitialMessages = true }
+        guard renderPreparationTask == nil else { return }
+        renderPreparationTask = Task { [weak self] in
+            while let self, let request = self.pendingRender {
+                self.pendingRender = nil
+                var prepared: [ChatMessage] = []
+                for message in request.messages {
+                    guard !Task.isCancelled, self.renderEpoch == request.epoch else { break }
+                    prepared.append(await self.prepareMarkdown(message))
+                }
+                guard !Task.isCancelled else { return }
+                if self.renderEpoch == request.epoch && request.id > self.publishedRenderID {
+                    self.publishedRenderID = request.id
+                    if self.renderedMessages != prepared { self.renderedMessages = prepared }
+                    if self.isPreparingInitialMessages { self.isPreparingInitialMessages = false }
+                }
+            }
+            self?.renderPreparationTask = nil
+        }
+    }
+
+    private func needsMarkdown(_ message: ChatMessage) -> Bool {
+        ((!message.text.isEmpty && (message.role == .assistant || message.role == .processSummary)) && message.markdown == nil)
+            || (message.processItems?.contains(where: needsMarkdown) ?? false)
+    }
+
+    private func reuseMarkdown(_ message: ChatMessage, previous: ChatMessage?) -> ChatMessage {
+        var result = message
+        if previous?.text == message.text && previous?.role == message.role { result.markdown = previous?.markdown }
+        if let items = message.processItems {
+            let previousItems = Dictionary((previous?.processItems ?? []).map { ($0.id, $0) }, uniquingKeysWith: { _, new in new })
+            result.processItems = items.map { reuseMarkdown($0, previous: previousItems[$0.id]) }
+        }
+        return result
+    }
+
+    private func prepareMarkdown(_ message: ChatMessage) async -> ChatMessage {
+        var result = message
+        if !message.text.isEmpty && (message.role == .assistant || message.role == .processSummary) && message.markdown == nil {
+            result.markdown = try? await MarkdownRenderer.shared.prepare(message.text)
+        }
+        if let items = message.processItems {
+            var prepared: [ChatMessage] = []
+            for item in items { prepared.append(await prepareMarkdown(item)) }
+            result.processItems = prepared
+        }
+        return result
     }
 
     private func scheduleRenderedMessagesRebuild() {
-        renderedMessagesRebuildTask?.cancel()
+        guard renderedMessagesRebuildTask == nil else { return }
         renderedMessagesRebuildTask = Task { [weak self] in
-            // Token deltas can arrive many times per second. Coalesce them so
-            // the entire timeline and Markdown view tree are not rebuilt for
-            // every tiny fragment.
+            // Throttle, not debounce: continuous tokens must not postpone publication.
             try? await Task.sleep(for: .milliseconds(60))
             guard !Task.isCancelled else { return }
-            self?.rebuildRenderedMessages()
+            self?.rebuildRenderedMessages(invalidateInFlight: false)
         }
     }
 
@@ -1166,6 +1241,7 @@ final class AppViewModel: ObservableObject {
         liveMessageTurnIDs = [:]
         suppressedCompactionMessageIDs = []
         liveOrderingClock = 0
+        rebuildRenderedMessages()
     }
 
     private func removePersistedLiveMessages(from result: ThreadDetail) {
@@ -1192,8 +1268,33 @@ final class AppViewModel: ObservableObject {
     }
 
     #if DEBUG && targetEnvironment(simulator)
+    private var uiFixtureStreamTask: Task<Void, Never>?
+
+    func startUIFixtureStream() {
+        guard ProcessInfo.processInfo.arguments.contains("--ui-stream-fixture") else { return }
+        uiFixtureStreamTask?.cancel()
+        let thread = selectedThreadID
+        liveRunning = true
+        beginLiveMessage(id: "ui-stream", turnID: "ui-turn-5", text: "流式输出：")
+        uiFixtureStreamTask = Task { [weak self] in
+            for _ in 0..<500 {
+                try? await Task.sleep(for: .milliseconds(10))
+                guard !Task.isCancelled, let self, self.selectedThreadID == thread else { return }
+                self.appendLiveDelta(id: "ui-stream", turnID: "ui-turn-5", delta: "文")
+            }
+            guard let self else { return }
+            self.appendLiveDelta(id: "ui-stream", turnID: "ui-turn-5", delta: "终态已到达")
+            self.liveRunning = false
+        }
+    }
+
     // In-memory UI regression data only; never creates Codex sessions or contacts a server.
     private func loadUIFixture(thread: CloudexThread? = nil) async {
+        isOpeningThread = true
+        defer { isOpeningThread = false }
+        uiFixtureStreamTask?.cancel()
+        clearLiveMessages()
+        liveRunning = false
         selectedModelID = "gpt-6-sol"
         codexMode = .fullAccess
         isServerReachable = true
@@ -1219,11 +1320,12 @@ final class AppViewModel: ObservableObject {
         guard let thread else { draft = ""; return }
         selectedThreadID = thread.id
         selectedProjectCWD = thread.cwd
-        var turns: [[String: Any]] = (0..<(scrollingFixture ? 36 : 6)).map { index in
-            ["id": "ui-turn-\(index)", "status": "completed", "items": [
+        var turns: [[String: Any]] = (0..<(scrollingFixture ? 36 : 6)).map { index -> [String: Any] in
+            let items: [[String: Any]] = [
                 ["type": "userMessage", "id": "ui-user-\(index)", "content": [["type": "text", "text": "检查第 \(index + 1) 轮消息"]]],
                 ["type": "agentMessage", "id": "ui-answer-\(index)", "text": "这是用于检查布局的回复。\n\n**重点**：输入框增长时，聊天区域需要跟着缩小，文字不能穿过工具栏。\n\n附件、语音、模型和访问模式在同一行，长输入只在输入框内部滚动。" + (scrollingFixture ? "\n\n第 \(index) 轮 **Markdown**，`inline code` 与 [链接](https://example.com)。\n\n- 项目一\n- 项目二\n\n> 引用文本\n\n```swift\nlet count = \(index)\nprint(count)\n```\n\n| 列一 | 列二 |\n| --- | --- |\n| 内容 | 更多内容 |" : "")]
-            ]]
+            ]
+            return ["id": "ui-turn-\(index)", "status": "completed", "items": items]
         }
         if ProcessInfo.processInfo.arguments.contains("--ui-uneven-fixture") {
             turns = (0..<36).map { index in
@@ -1233,8 +1335,19 @@ final class AppViewModel: ObservableObject {
                 ]]
             }
         }
+        if ProcessInfo.processInfo.arguments.contains("--ui-stream-fixture") {
+            turns[5]["status"] = "inProgress"
+            for index in turns.indices {
+                var items = turns[index]["items"] as! [[String: Any]]
+                for item in items.indices { items[item]["createdAt"] = Double(1700000000 + index * 2 + item) }
+                turns[index]["items"] = items
+            }
+        }
+        if thread.id == "ui-Calcu", ProcessInfo.processInfo.arguments.contains("--ui-empty-second-fixture") { turns = [] }
         let data = try! JSONSerialization.data(withJSONObject: turns)
-        detail = ThreadDetail(thread: thread, turns: try! JSONDecoder().decode([CloudexTurn].self, from: data))
+        let paginated = ProcessInfo.processInfo.arguments.contains("--ui-pagination-fixture")
+        detail = ThreadDetail(thread: thread, turns: try! JSONDecoder().decode([CloudexTurn].self, from: data),
+                              hasMoreBefore: paginated, nextBefore: paginated ? "ui-older" : nil)
         let renderer = UIGraphicsImageRenderer(size: CGSize(width: 200, height: 130))
         let image = renderer.image { context in
             UIColor.systemTeal.setFill(); context.fill(CGRect(x: 0, y: 0, width: 200, height: 130))
@@ -1852,13 +1965,7 @@ final class AppViewModel: ObservableObject {
         }
 
         do {
-            let result: ThreadDetail = try await client.get(
-                client.threadPath(threadID),
-                queryItems: [
-                    URLQueryItem(name: "limit", value: "12"),
-                    URLQueryItem(name: "before", value: before),
-                ]
-            )
+            let result = try await olderTurnsPage(threadID: threadID, before: before)
             guard selectedThreadID == threadID,
                   olderTurnsLoadGeneration == generation,
                   let latest = detail else { return }
@@ -1876,9 +1983,29 @@ final class AppViewModel: ObservableObject {
             Task.detached(priority: .utility) {
                 cache.saveThreadDetail(updated, threadID: threadID)
             }
+            // Keep the loading boundary aligned with publication, not just the HTTP response.
+            await renderPreparationTask?.value
         } catch {
             status = "读取更早消息失败：\(error.localizedDescription)"
         }
+    }
+
+    private func olderTurnsPage(threadID: String, before: String) async throws -> ThreadDetail {
+        #if DEBUG && targetEnvironment(simulator)
+        if ProcessInfo.processInfo.arguments.contains("--ui-pagination-fixture"), let current = detail {
+            try await Task.sleep(for: .milliseconds(300))
+            let items: [[String: Any]] = [["id": "ui-older-turn", "status": "completed", "items": [
+                ["type": "agentMessage", "id": "ui-older-answer",
+                 "text": String(repeating: "**更早的历史**，加载后保留原来阅读的位置。\n\n", count: 100)]
+            ]]]
+            let data = try JSONSerialization.data(withJSONObject: items)
+            return ThreadDetail(thread: current.thread, turns: try JSONDecoder().decode([CloudexTurn].self, from: data),
+                                hasMoreBefore: false, nextBefore: nil)
+        }
+        #endif
+        return try await client.get(client.threadPath(threadID), queryItems: [
+            URLQueryItem(name: "limit", value: "12"), URLQueryItem(name: "before", value: before)
+        ])
     }
 
     func loadMessageFromIndex(messageID: String, turnID: String) async -> Bool {
@@ -1899,10 +2026,11 @@ final class AppViewModel: ObservableObject {
             detail = ThreadDetail(
                 thread: latest.thread,
                 turns: turns,
-                hasMoreBefore: false,
-                nextBefore: nil
+                hasMoreBefore: latest.hasMoreBefore,
+                nextBefore: latest.nextBefore
             )
-            return true
+            await renderPreparationTask?.value
+            return selectedThreadID == threadID
         } catch {
             status = "读取过程详情失败：\(error.localizedDescription)"
             return false

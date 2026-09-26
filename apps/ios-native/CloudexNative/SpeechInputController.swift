@@ -6,10 +6,11 @@ final class SpeechInputController: ObservableObject {
     @Published private(set) var isRecording = false
     @Published var errorMessage: String?
 
-    private let engine = AVAudioEngine()
+    private lazy var engine = AVAudioEngine()
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
     private var tapInstalled = false
+    private var sessionActive = false
 
     func start(onText: @escaping (String) -> Void) async {
         guard !isRecording else { return }
@@ -35,6 +36,7 @@ final class SpeechInputController: ObservableObject {
             let session = AVAudioSession.sharedInstance()
             try session.setCategory(.playAndRecord, mode: .measurement, options: .duckOthers)
             try session.setActive(true, options: .notifyOthersOnDeactivation)
+            sessionActive = true
             let request = SFSpeechAudioBufferRecognitionRequest()
             request.shouldReportPartialResults = true
             self.request = request
@@ -59,6 +61,8 @@ final class SpeechInputController: ObservableObject {
     }
 
     func stop() {
+        // Merely leaving a conversation must not synchronously touch the audio server.
+        guard sessionActive || tapInstalled || request != nil || recognitionTask != nil else { return }
         if engine.isRunning { engine.stop() }
         if tapInstalled {
             engine.inputNode.removeTap(onBus: 0)
@@ -69,6 +73,9 @@ final class SpeechInputController: ObservableObject {
         recognitionTask = nil
         request = nil
         isRecording = false
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        if sessionActive {
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            sessionActive = false
+        }
     }
 }

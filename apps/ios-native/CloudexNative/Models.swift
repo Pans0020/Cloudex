@@ -956,6 +956,7 @@ struct ChatMessage: Identifiable, Equatable {
     var processItemCount: Int? = nil
     var processDetailsLoaded: Bool = true
     var attachments: [MessageAttachment] = []
+    var markdown: PreparedMarkdown? = nil
 }
 
 struct SSEEvent {

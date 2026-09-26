@@ -1,6 +1,71 @@
 import XCTest
 
 final class CloudexUITests: XCTestCase {
+    func testLoadingOlderMarkdownKeepsReadingPosition() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--ui-fixture", "--ui-pagination-fixture", "-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN"]
+        app.launch()
+        XCTAssertTrue(app.buttons["展开CV"].waitForExistence(timeout: 10))
+        app.buttons["展开CV"].tap()
+        app.buttons.containing(.staticText, identifier: "布局回归 CV").firstMatch.tap()
+        let chat = app.scrollViews["chat-history"]
+        let first = app.staticTexts["检查第 1 轮消息"]
+        for _ in 0..<8 {
+            if first.isHittable { break }
+            chat.swipeDown(velocity: .slow)
+        }
+        XCTAssertTrue(first.isHittable)
+        let before = first.frame.minY
+        // Wait for the existing page's loading state to settle without another gesture.
+        let moved = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            !first.isHittable || abs(first.frame.minY - before) > 80
+        }, object: nil)
+        moved.isInverted = true
+        XCTAssertEqual(XCTWaiter.wait(for: [moved], timeout: 2), .completed)
+        chat.swipeDown(velocity: .slow)
+        let older = app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "更早的历史")).firstMatch
+        XCTAssertTrue(older.waitForExistence(timeout: 5))
+        snapshot("older-markdown-page")
+    }
+
+    func testSwitchingDuringStreamDoesNotLeakIntoEmptyConversation() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--ui-fixture", "--ui-stream-fixture", "--ui-empty-second-fixture", "-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN"]
+        app.launch()
+        XCTAssertTrue(app.buttons["展开CV"].waitForExistence(timeout: 10))
+        app.buttons["展开CV"].tap()
+        app.buttons.containing(.staticText, identifier: "布局回归 CV").firstMatch.tap()
+        app.buttons["模拟连续回复"].tap()
+        app.navigationBars.buttons.element(boundBy: 0).tap()
+        app.buttons["展开Calcu"].tap()
+        app.buttons.containing(.staticText, identifier: "布局回归 Calcu").firstMatch.tap()
+        XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "message-input").firstMatch.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.scrollViews["chat-history"].isHittable, "An empty conversation must finish initial positioning")
+        let stale = app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "流式输出：")).firstMatch
+        let leaked = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == true"), object: stale)
+        leaked.isInverted = true
+        XCTAssertEqual(XCTWaiter.wait(for: [leaked], timeout: 6), .completed)
+        snapshot("empty-conversation-after-stream-switch")
+    }
+
+    func testContinuousStreamingPublishesBeforeCompletion() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--ui-fixture", "--ui-stream-fixture", "-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN"]
+        app.launch()
+        XCTAssertTrue(app.buttons["展开CV"].waitForExistence(timeout: 10))
+        app.buttons["展开CV"].tap()
+        app.buttons.containing(.staticText, identifier: "布局回归 CV").firstMatch.tap()
+        app.buttons["模拟连续回复"].tap()
+        let partial = app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@ AND NOT label CONTAINS %@", "流式输出：文", "终态已到达")).firstMatch
+        XCTAssertTrue(partial.waitForExistence(timeout: 3), "Continuous 10 ms deltas must publish before the stream ends")
+        XCTAssertTrue(app.buttons["流式进行中"].exists)
+        let terminal = app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "终态已到达")).firstMatch
+        XCTAssertTrue(terminal.waitForExistence(timeout: 10))
+        snapshot("streaming-final-markdown")
+    }
+
     func testBottomRemainsVisibleAfterRepeatedFlicks() {
         let app = scrollingApp(extraArguments: ["--ui-uneven-fixture"])
         app.buttons["展开CV"].tap()
