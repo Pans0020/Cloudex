@@ -360,7 +360,7 @@ struct ContentView: View {
                 let isReady = isNewChat
                     || (expectedThreadID == viewModel.selectedThreadID && !viewModel.isOpeningThread)
                 let content = isReady ? chatContentSnapshot : .empty
-                LazyVStack(alignment: .leading, spacing: 12) {
+                LazyVStack(alignment: .leading, spacing: 18) {
                     if !isReady {
                         ProgressView("正在打开对话…")
                             .frame(maxWidth: .infinity)
@@ -459,7 +459,7 @@ struct ContentView: View {
                     // Keeping this close to the actual composer height avoids
                     // leaving a visible gap below the running-task spinner.
                     Color.clear
-                        .frame(height: viewModel.attachedFiles.isEmpty ? 112 : 156)
+                        .frame(height: viewModel.attachedFiles.isEmpty ? 152 : 196)
                         .id("chat-bottom")
                 }
                 .padding(.horizontal, 16)
@@ -827,7 +827,8 @@ struct ContentView: View {
     }
 
     private var composerControlStack: some View {
-        HStack(alignment: .bottom, spacing: 10) {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
             Menu {
                 Button { showingFilePicker = true } label: {
                     Label("电脑文件", systemImage: "folder")
@@ -838,11 +839,10 @@ struct ContentView: View {
             } label: {
                 Image(systemName: "paperclip")
                     .font(.body.weight(.semibold))
-                    .frame(width: 46, height: 46)
+                    .frame(width: 38, height: 34)
                     .contentShape(Circle())
             }
             .buttonStyle(.plain)
-            .liquidGlass(in: Circle(), interactive: true)
             .accessibilityLabel("添加附件")
 
             Button {
@@ -860,11 +860,10 @@ struct ContentView: View {
                 Image(systemName: speechInput.isRecording ? "stop.circle.fill" : "mic")
                     .font(.body.weight(.semibold))
                     .foregroundStyle(speechInput.isRecording ? Color.red : Color.primary)
-                    .frame(width: 46, height: 46)
+                    .frame(width: 38, height: 34)
                     .contentShape(Circle())
             }
             .buttonStyle(.plain)
-            .liquidGlass(in: Circle(), interactive: true)
             .accessibilityLabel(speechInput.isRecording ? "停止语音输入" : "开始语音输入")
 
             if !agentBuiltInCommands.isEmpty {
@@ -889,13 +888,20 @@ struct ContentView: View {
                 } label: {
                     Text("/")
                         .font(.system(size: 22, weight: .medium, design: .rounded))
-                        .frame(width: 46, height: 46)
+                        .frame(width: 38, height: 34)
                         .contentShape(Circle())
                 }
                 .buttonStyle(.plain)
-                .liquidGlass(in: Circle(), interactive: true)
                 .accessibilityLabel("打开内置命令")
             }
+            Spacer(minLength: 0)
+            if speechInput.isRecording {
+                Text("正在听写")
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+            }
+            }
+            .padding(.horizontal, 27)
 
             HStack(alignment: .bottom, spacing: 4) {
                 ZStack(alignment: .topLeading) {
@@ -961,7 +967,7 @@ struct ContentView: View {
             .padding(.vertical, 4)
             .padding(.trailing, 6)
             .padding(.leading, 3)
-            .liquidGlass(in: RoundedRectangle(cornerRadius: 27, style: .continuous), interactive: true)
+            .liquidGlass(in: RoundedRectangle(cornerRadius: 12, style: .continuous), interactive: true)
             .overlay(alignment: .bottomLeading) {
                 if !slashSuggestions.isEmpty {
                     VStack(alignment: .leading, spacing: 0) {
@@ -1003,7 +1009,7 @@ struct ContentView: View {
                 }
             }
         }
-        .padding(.horizontal, 24)
+        .padding(.horizontal, 20)
         .padding(.top, 10)
         .padding(.bottom, bottomControlPadding)
     }
@@ -1827,9 +1833,16 @@ private struct MessageBubble: View {
 
     private var messageContent: some View {
         VStack(alignment: .leading, spacing: 5) {
-            Text(roleTitle)
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(message.role == .error ? Color.red : Color.secondary)
+            HStack(spacing: 6) {
+                if message.role == .user || message.role == .assistant {
+                    Circle()
+                        .fill(message.role == .user ? Color.teal : Color.orange)
+                        .frame(width: 6, height: 6)
+                }
+                Text(roleTitle)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(message.role == .error ? Color.red : Color.secondary)
+            }
 
             if message.role == .error {
                 VStack(alignment: .leading, spacing: 6) {
@@ -1900,17 +1913,20 @@ private struct MessageBubble: View {
             messageFooter
         }
         .padding(.horizontal, 14)
-        .padding(.vertical, 11)
+        .padding(.vertical, 13)
         .frame(minWidth: 0)
         .frame(
             maxWidth: message.role == .assistant || message.role == .error ? .infinity : nil,
             alignment: .leading
         )
-        .background(message.role == .user ? bubbleColor : .clear,
-                    in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .background(messageBackground,
+                    in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay {
             if message.role == .error {
-                RoundedRectangle(cornerRadius: 16).stroke(Color.red.opacity(0.3))
+                RoundedRectangle(cornerRadius: 10).stroke(Color.red.opacity(0.3))
+            } else if message.role == .assistant || message.role == .user {
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(Color(.separator).opacity(0.25), lineWidth: 0.6)
             }
         }
     }
@@ -2010,7 +2026,13 @@ private struct MessageBubble: View {
         }
     }
 
-    private var bubbleColor: Color { Color.gray.opacity(0.18) }
+    private var messageBackground: Color {
+        switch message.role {
+        case .user: return Color.teal.opacity(0.13)
+        case .assistant: return Color(.secondarySystemBackground)
+        default: return .clear
+        }
+    }
 
     private var messageTime: String {
         DateFormatting.messageTime(from: message.createdAt)
