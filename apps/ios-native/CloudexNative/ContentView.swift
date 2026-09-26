@@ -591,7 +591,6 @@ struct ContentView: View {
                 guard !isMessagePositioningInProgress,
                       isFollowingChatBottom || isExplicitScrollInProgress else { return }
                 let generation = explicitScrollGeneration
-                let initialGeneration = initialBottomScrollGeneration
                 let requestGeneration = scrollToBottomRequest
                 DispatchQueue.main.async {
                     guard !isMessagePositioningInProgress,
@@ -599,72 +598,16 @@ struct ContentView: View {
                           isFollowingChatBottom
                             || (isExplicitScrollInProgress && explicitScrollGeneration == generation) else { return }
 
-                    let initialStillOwnsScroll = isInitialBottomScrollInProgress
-                        && initialBottomScrollGeneration == initialGeneration
-                        && isFollowingChatBottom
-                        && !isUserScrollingChat
-                    if initialStillOwnsScroll {
+                    // LazyVStack's contentSize includes estimates for unmeasured rows.
+                    // Let SwiftUI resolve the actual bottom anchor; never overwrite its
+                    // offset with that estimated height or restart native animations.
+                    if isInitialBottomScrollInProgress || isExplicitScrollInProgress {
                         var transaction = Transaction()
                         transaction.disablesAnimations = true
                         withTransaction(transaction) {
                             proxy.scrollTo("chat-bottom", anchor: .bottom)
                         }
-
-                        // One anchor repeat lets LazyVStack materialize the
-                        // target row. A single native reconciliation then
-                        // accounts for adjusted insets without repeatedly
-                        // chasing a growing contentSize.
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
-                            guard isInitialBottomScrollInProgress,
-                                  initialBottomScrollGeneration == initialGeneration,
-                                  scrollToBottomRequest == requestGeneration,
-                                  isFollowingChatBottom,
-                                  !isUserScrollingChat else { return }
-                            var repeatTransaction = Transaction()
-                            repeatTransaction.disablesAnimations = true
-                            withTransaction(repeatTransaction) {
-                                proxy.scrollTo("chat-bottom", anchor: .bottom)
-                            }
-                        }
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                            guard isInitialBottomScrollInProgress,
-                                  initialBottomScrollGeneration == initialGeneration,
-                                  scrollToBottomRequest == requestGeneration else { return }
-                            if isFollowingChatBottom && !isUserScrollingChat {
-                                _ = chatScrollController.scrollToBottom(animated: false)
-                            }
-                            isInitialBottomScrollInProgress = false
-                            isAtChatBottom = chatScrollController.isAtBottom()
-                        }
-                        return
-                    }
-
-                    let explicitStillOwnsScroll = isExplicitScrollInProgress
-                        && explicitScrollGeneration == generation
-                    if explicitStillOwnsScroll {
-                        // The button can be tapped while LazyVStack is still
-                        // materializing the newest rows. Re-anchor the bottom
-                        // sentinel first, then recompute UIScrollView's
-                        // content height several times as layout settles.
-                        let reconcileBottom = {
-                            guard scrollToBottomRequest == requestGeneration,
-                                  explicitScrollGeneration == generation,
-                                  isExplicitScrollInProgress else { return }
-                            var transaction = Transaction()
-                            transaction.disablesAnimations = true
-                            withTransaction(transaction) {
-                                proxy.scrollTo("chat-bottom", anchor: .bottom)
-                            }
-                            _ = chatScrollController.scrollToBottom(animated: true)
-                            isAtChatBottom = true
-                        }
-                        reconcileBottom()
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: reconcileBottom)
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: reconcileBottom)
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.50, execute: reconcileBottom)
-                        return
-                    }
-                    if !chatScrollController.scrollToBottom(animated: true) {
+                    } else {
                         withAnimation(.easeOut(duration: 0.28)) {
                             proxy.scrollTo("chat-bottom", anchor: .bottom)
                         }
@@ -1238,12 +1181,6 @@ struct ContentView: View {
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
             guard initialBottomScrollGeneration == generation else { return }
-            if isFollowingChatBottom && !isUserScrollingChat {
-                // The final native correction runs while the content is still
-                // hidden, so revealing it cannot expose an intermediate offset.
-                _ = chatScrollController.scrollToBottom(animated: false)
-                isAtChatBottom = chatScrollController.isAtBottom()
-            }
             isInitialBottomScrollInProgress = false
             isPreparingInitialLayout = false
             if !viewModel.active {
@@ -1555,32 +1492,6 @@ private final class ChatScrollController: ObservableObject {
         )
         let targetY = min(max(offset.y, minimumY), maximumY)
         scrollView.setContentOffset(CGPoint(x: offset.x, y: targetY), animated: false)
-        return true
-    }
-
-    @discardableResult
-    func scrollToBottom(animated: Bool) -> Bool {
-        guard let scrollView, scrollView.window != nil else { return false }
-
-        // Stop both an active drag and any remaining deceleration before
-        // starting the explicit navigation animation. Toggling the pan
-        // recognizer forces UIKit to cancel the gesture immediately.
-        let currentOffset = scrollView.contentOffset
-        scrollView.layer.removeAllAnimations()
-        scrollView.setContentOffset(currentOffset, animated: false)
-        scrollView.panGestureRecognizer.isEnabled = false
-        scrollView.panGestureRecognizer.isEnabled = true
-        scrollView.layoutIfNeeded()
-
-        let minimumY = -scrollView.adjustedContentInset.top
-        let maximumY = max(
-            minimumY,
-            scrollView.contentSize.height
-                - scrollView.bounds.height
-                + scrollView.adjustedContentInset.bottom
-        )
-        let target = CGPoint(x: scrollView.contentOffset.x, y: maximumY)
-        scrollView.setContentOffset(target, animated: animated)
         return true
     }
 

@@ -1219,11 +1219,19 @@ final class AppViewModel: ObservableObject {
         guard let thread else { draft = ""; return }
         selectedThreadID = thread.id
         selectedProjectCWD = thread.cwd
-        let turns: [[String: Any]] = (0..<(scrollingFixture ? 36 : 6)).map { index in
+        var turns: [[String: Any]] = (0..<(scrollingFixture ? 36 : 6)).map { index in
             ["id": "ui-turn-\(index)", "status": "completed", "items": [
                 ["type": "userMessage", "id": "ui-user-\(index)", "content": [["type": "text", "text": "检查第 \(index + 1) 轮消息"]]],
                 ["type": "agentMessage", "id": "ui-answer-\(index)", "text": "这是用于检查布局的回复。\n\n**重点**：输入框增长时，聊天区域需要跟着缩小，文字不能穿过工具栏。\n\n附件、语音、模型和访问模式在同一行，长输入只在输入框内部滚动。" + (scrollingFixture ? "\n\n第 \(index) 轮 **Markdown**，`inline code` 与 [链接](https://example.com)。\n\n- 项目一\n- 项目二\n\n> 引用文本\n\n```swift\nlet count = \(index)\nprint(count)\n```\n\n| 列一 | 列二 |\n| --- | --- |\n| 内容 | 更多内容 |" : "")]
             ]]
+        }
+        if ProcessInfo.processInfo.arguments.contains("--ui-uneven-fixture") {
+            turns = (0..<36).map { index in
+                let text = index == 35 ? "这是实际的最后一条回复。" : String(repeating: "第 \(index) 轮：长短不一的历史消息，用于检查懒加载估算高度变化。\n\n", count: index % 3 == 0 ? 28 : 2)
+                return ["id": "ui-turn-\(index)", "status": "completed", "items": [
+                    ["type": "agentMessage", "id": "ui-answer-\(index)", "text": text]
+                ]]
+            }
         }
         let data = try! JSONSerialization.data(withJSONObject: turns)
         detail = ThreadDetail(thread: thread, turns: try! JSONDecoder().decode([CloudexTurn].self, from: data))

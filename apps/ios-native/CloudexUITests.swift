@@ -1,6 +1,26 @@
 import XCTest
 
 final class CloudexUITests: XCTestCase {
+    func testBottomRemainsVisibleAfterRepeatedFlicks() {
+        let app = scrollingApp(extraArguments: ["--ui-uneven-fixture"])
+        app.buttons["展开CV"].tap()
+        app.buttons.containing(.staticText, identifier: "滚动回归 0").firstMatch.tap()
+        let chat = app.scrollViews["chat-history"]
+        let last = app.staticTexts["这是实际的最后一条回复。"]
+        XCTAssertTrue(last.waitForExistence(timeout: 10))
+        for iteration in 0..<3 {
+            chat.swipeDown(velocity: .fast)
+            chat.swipeDown(velocity: .fast)
+            let latest = app.buttons["滚动到最新消息"]
+            XCTAssertTrue(latest.waitForExistence(timeout: 5))
+            latest.tap()
+            for _ in 0..<3 { chat.swipeUp(velocity: .fast) }
+            snapshot("bottom-after-flicks-\(iteration)")
+            XCTAssertTrue(last.isHittable, "The last reply must remain visible at the bottom")
+            XCTAssertLessThan(chat.frame.maxY - last.frame.maxY, 100, "No empty viewport below the final reply")
+        }
+    }
+
     func testScrollToLatestAfterBrowsing() {
         let app = scrollingApp()
         app.buttons["展开CV"].tap()
@@ -38,10 +58,11 @@ final class CloudexUITests: XCTestCase {
         measureScrolling(app, element: chat)
     }
 
-    private func scrollingApp() -> XCUIApplication {
+    private func scrollingApp(extraArguments: [String] = []) -> XCUIApplication {
         continueAfterFailure = false
         let app = XCUIApplication()
         app.launchArguments = ["--ui-fixture", "--ui-scroll-fixture", "-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN"]
+        app.launchArguments += extraArguments
         app.launch()
         XCTAssertTrue(app.buttons["展开CV"].waitForExistence(timeout: 10))
         return app
