@@ -56,6 +56,9 @@ final class CloudexNotificationManager: NSObject, UNUserNotificationCenterDelega
     private var appIsInForeground = true
 
     func configure() {
+        #if DEBUG && targetEnvironment(simulator)
+        if ProcessInfo.processInfo.arguments.contains("--ui-fixture") { return }
+        #endif
         let center = UNUserNotificationCenter.current()
         center.delegate = self
         center.setNotificationCategories([

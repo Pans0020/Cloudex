@@ -11,6 +11,109 @@ private enum ConversationSubpage: Hashable {
     case review
 }
 
+// Only the composer observes keystrokes; the message tree does not re-render.
+private struct ComposerDraftScope<Content: View>: View {
+    @ObservedObject var draft: ComposerDraft
+    @ViewBuilder let content: () -> Content
+
+    var body: some View { content() }
+}
+
+private struct AttachmentThumbnail: View {
+    let path: String
+    let server: String
+    let client: APIClient
+    @State private var image: UIImage?
+    @State private var failed = false
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(uiImage: image).resizable().scaledToFit()
+            } else {
+                Image(systemName: failed ? "photo.badge.exclamationmark" : "photo")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color(.tertiarySystemFill))
+            }
+        }
+        .task(id: "\(server)|\(path)") {
+            image = AttachmentImageCache.image(path: path, server: server)
+            failed = false
+            guard image == nil else { return }
+            do {
+                let data: Data
+                if path.hasPrefix("data:image/"), let encoded = path.split(separator: ",", maxSplits: 1).last,
+                   let decoded = Data(base64Encoded: String(encoded)) {
+                    data = decoded
+                } else {
+                    data = try await client.download("/api/file", queryItems: [URLQueryItem(name: "path", value: path)])
+                }
+                guard !Task.isCancelled else { return }
+                let prepared = await AttachmentImageCache.prepare(data, path: path, server: server)
+                guard !Task.isCancelled else { return }
+                image = prepared
+                failed = image == nil
+            } catch {
+                if !Task.isCancelled { failed = true }
+            }
+        }
+    }
+}
+
+private struct ComposerTextInput: UIViewRepresentable {
+    @Binding var text: String
+    @Binding var focused: Bool
+
+    func makeUIView(context: Context) -> UITextView {
+        let view = UITextView()
+        view.delegate = context.coordinator
+        view.font = .preferredFont(forTextStyle: .body)
+        view.adjustsFontForContentSizeCategory = true
+        view.backgroundColor = .clear
+        view.isScrollEnabled = true
+        view.clipsToBounds = true
+        view.textContainerInset = UIEdgeInsets(top: 10, left: 8, bottom: 10, right: 8)
+        view.textContainer.lineFragmentPadding = 0
+        view.accessibilityIdentifier = "message-input"
+        view.accessibilityLabel = "消息输入框"
+        view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return view
+    }
+
+    func updateUIView(_ view: UITextView, context: Context) {
+        context.coordinator.parent = self
+        if view.text != text { view.text = text }
+        if context.coordinator.requestedFocus != focused {
+            context.coordinator.requestedFocus = focused
+            if focused && !view.isFirstResponder { view.becomeFirstResponder() }
+            if !focused && view.isFirstResponder { view.resignFirstResponder() }
+        }
+        view.invalidateIntrinsicContentSize()
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: UITextView, context: Context) -> CGSize? {
+        guard let width = proposal.width else { return nil }
+        let maximum = (uiView.font?.lineHeight ?? 22) * 5 + 20
+        let height = uiView.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude)).height
+        return CGSize(width: width, height: min(maximum, max(44, ceil(height))))
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+    final class Coordinator: NSObject, UITextViewDelegate {
+        var parent: ComposerTextInput
+        var requestedFocus = false
+        init(_ parent: ComposerTextInput) { self.parent = parent }
+        func textViewDidChange(_ view: UITextView) { parent.text = view.text }
+        func textViewDidBeginEditing(_ view: UITextView) {
+            if !parent.focused { parent.focused = true }
+        }
+        func textViewDidEndEditing(_ view: UITextView) {
+            if parent.focused { parent.focused = false }
+        }
+    }
+}
+
 private struct OlderHistoryScrollSnapshot {
     let offset: CGPoint
     let contentHeight: CGFloat
@@ -18,8 +121,6 @@ private struct OlderHistoryScrollSnapshot {
 
 struct ContentView: View {
     @EnvironmentObject private var viewModel: AppViewModel
-    @Environment(\.cloudexIsWindowedIPad) private var isWindowedIPad
-    @Environment(\.cloudexBottomSafeArea) private var bottomSafeArea
     @StateObject private var chatScrollController = ChatScrollController()
     @StateObject private var speechInput = SpeechInputController()
     let expectedThreadID: String?
@@ -56,8 +157,7 @@ struct ContentView: View {
     @State private var taskTimerStartedAt: Double?
     @State private var taskTimerCompletedAt: Double?
     @State private var taskTimerHidden = true
-    @FocusState private var composerFocused: Bool
-    @State private var keyboardHeight: CGFloat = 0
+    @State private var composerFocused = false
     @State private var olderHistoryScrollSnapshot: OlderHistoryScrollSnapshot?
 
     init(
@@ -72,6 +172,7 @@ struct ContentView: View {
     }
 
     var body: some View {
+        VStack(spacing: 0) {
         ZStack {
             liquidBackground
             chat
@@ -139,11 +240,15 @@ struct ContentView: View {
                     }
                     .padding(.bottom, 6)
                 }
-                composer
             }
             .animation(.easeInOut(duration: 0.18), value: isFollowingChatBottom)
         }
-        .ignoresSafeArea(.keyboard, edges: .top)
+        .clipped()
+        ComposerDraftScope(draft: viewModel.composerDraft) {
+            composer
+        }
+        }
+        .background(Color(.systemBackground))
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             if let input = viewModel.pendingInputs.first(where: { $0.threadId == viewModel.selectedThreadID }) {
@@ -223,13 +328,16 @@ struct ContentView: View {
         }
         .photosPicker(isPresented: $showingPhotosPicker, selection: $selectedPhoto, matching: .images)
         .onChange(of: selectedPhoto) { _, item in
+            guard let item else { return }
             Task {
-                guard let data = try? await item?.loadTransferable(type: Data.self),
-                      let image = UIImage(data: data),
-                      let jpeg = image.jpegData(compressionQuality: 0.85) else {
+                guard let data = try? await item.loadTransferable(type: Data.self) else {
                     viewModel.status = "无法读取所选照片"
                     return
                 }
+                let jpeg = await Task.detached(priority: .userInitiated) {
+                    UIImage(data: data)?.jpegData(compressionQuality: 0.85)
+                }.value
+                guard let jpeg else { viewModel.status = "无法读取所选照片"; return }
                 _ = await viewModel.attachPhoneImage(jpeg)
                 selectedPhoto = nil
             }
@@ -339,13 +447,6 @@ struct ContentView: View {
         .onChange(of: expectedThreadID, initial: true) { _, _ in
             resetChatLayoutForNewThread()
         }
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { note in
-            guard let value = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue else { return }
-            keyboardHeight = max(0, UIScreen.main.bounds.maxY - value.cgRectValue.minY)
-        }
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
-            keyboardHeight = 0
-        }
     }
 
     private var liquidBackground: some View {
@@ -407,6 +508,7 @@ struct ContentView: View {
                             }
                         )
                         .id(message.id)
+                        .accessibilityIdentifier("message-\(message.id)")
                         .onAppear {
                             guard message.id == content.messages.first?.id,
                                   viewModel.hasMoreHistory,
@@ -455,11 +557,8 @@ struct ContentView: View {
                         .padding(.vertical, 8)
                     }
 
-                    // Reserve only the space needed by the overlaid composer.
-                    // Keeping this close to the actual composer height avoids
-                    // leaving a visible gap below the running-task spinner.
                     Color.clear
-                        .frame(height: viewModel.attachedFiles.isEmpty ? 152 : 196)
+                        .frame(height: 8)
                         .id("chat-bottom")
                 }
                 .padding(.horizontal, 16)
@@ -470,8 +569,13 @@ struct ContentView: View {
                 }
             }
             .nativeTopScrollEdgeEffect()
+            .accessibilityIdentifier("chat-history")
             .scrollDisabled(viewModel.isOpeningThread || isPreparingInitialLayout)
             .scrollDismissesKeyboard(.interactively)
+            .simultaneousGesture(DragGesture(minimumDistance: 16).onChanged { value in
+                if composerFocused && value.translation.height > 24 { composerFocused = false }
+            })
+            .followChatViewportBottom(isFollowingChatBottom)
             .trackChatScroll(
                 isAtBottom: $isAtChatBottom,
                 isFollowingBottom: $isFollowingChatBottom,
@@ -616,23 +720,35 @@ struct ContentView: View {
                     HStack(spacing: 7) {
                         ForEach(viewModel.attachedFiles) { file in
                             HStack(spacing: 5) {
-                                Image(systemName: "doc")
-                                Text(file.name).lineLimit(1)
+                                if file.isImage {
+                                    AttachmentThumbnail(path: file.path, server: viewModel.serverURL, client: viewModel.client)
+                                        .frame(width: 62, height: 62)
+                                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                                        .accessibilityIdentifier("attachment-thumbnail")
+                                } else {
+                                    Image(systemName: "doc")
+                                    Text(file.name).lineLimit(1).frame(maxWidth: 180)
+                                }
                                 Button { viewModel.removeAttachment(file) } label: {
                                     Image(systemName: "xmark.circle.fill")
+                                        .frame(width: 32, height: 44)
                                 }
+                                .accessibilityLabel("移除\(file.name)")
                             }
                             .font(.caption)
                             .padding(.horizontal, 9)
                             .padding(.vertical, 6)
-                            .liquidGlass(in: Capsule(), interactive: true)
+                            .background(.ultraThinMaterial.opacity(0.3), in: RoundedRectangle(cornerRadius: 10))
+                            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.blue.opacity(0.2), lineWidth: 0.7))
                         }
                     }
                     .padding(.horizontal, 14)
                 }
             }
 
+            ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 7) {
+                attachmentAndVoiceControls
                 Menu {
                     Button {
                         Task { await viewModel.loadModelsIfNeeded(force: true) }
@@ -747,8 +863,6 @@ struct ContentView: View {
                 .layoutPriority(0)
                 .accessibilityLabel("切换执行模式")
 
-                Spacer(minLength: 0)
-
                 taskTimerBubble
 
                 Button {
@@ -767,20 +881,19 @@ struct ContentView: View {
                 .accessibilityLabel("查看本轮 Token 使用量")
             }
             .padding(.horizontal, 20)
+            .padding(.vertical, 4)
+            }
 
             composerControls
         }
+        .padding(.top, 6)
+        .background(Color(.systemBackground))
+        .overlay(alignment: .top) { Divider() }
     }
 
     @ViewBuilder
     private var composerControls: some View {
-        if #available(iOS 26.0, *) {
-            GlassEffectContainer(spacing: 12) {
-                composerControlStack
-            }
-        } else {
-            composerControlStack
-        }
+        composerControlStack
     }
 
     private var agentBuiltInCommands: [AgentBuiltInCommand] {
@@ -826,9 +939,8 @@ struct ContentView: View {
         }
     }
 
-    private var composerControlStack: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 6) {
+    private var attachmentAndVoiceControls: some View {
+        Group {
             Menu {
                 Button { showingFilePicker = true } label: {
                     Label("电脑文件", systemImage: "folder")
@@ -839,10 +951,11 @@ struct ContentView: View {
             } label: {
                 Image(systemName: "paperclip")
                     .font(.body.weight(.semibold))
-                    .frame(width: 38, height: 34)
+                    .frame(width: 44, height: 36)
                     .contentShape(Circle())
             }
             .buttonStyle(.plain)
+            .liquidGlass(in: Capsule(), interactive: true)
             .accessibilityLabel("添加附件")
 
             Button {
@@ -860,10 +973,11 @@ struct ContentView: View {
                 Image(systemName: speechInput.isRecording ? "stop.circle.fill" : "mic")
                     .font(.body.weight(.semibold))
                     .foregroundStyle(speechInput.isRecording ? Color.red : Color.primary)
-                    .frame(width: 38, height: 34)
+                    .frame(width: 44, height: 36)
                     .contentShape(Circle())
             }
             .buttonStyle(.plain)
+            .liquidGlass(in: Capsule(), interactive: true)
             .accessibilityLabel(speechInput.isRecording ? "停止语音输入" : "开始语音输入")
 
             if !agentBuiltInCommands.isEmpty {
@@ -892,32 +1006,30 @@ struct ContentView: View {
                         .contentShape(Circle())
                 }
                 .buttonStyle(.plain)
+                .liquidGlass(in: Capsule(), interactive: true)
                 .accessibilityLabel("打开内置命令")
             }
-            Spacer(minLength: 0)
             if speechInput.isRecording {
                 Text("正在听写")
                     .font(.caption2)
                     .foregroundStyle(.red)
             }
-            }
-            .padding(.horizontal, 27)
+        }
+    }
 
+    private var composerControlStack: some View {
             HStack(alignment: .bottom, spacing: 4) {
-                ZStack(alignment: .topLeading) {
-                    if viewModel.draft.isEmpty {
-                        Text(cloudexLocalized(viewModel.selectedThreadID == nil ? "向 Codex 发送新指令…" : "继续发送指令…"))
-                            .foregroundStyle(.tertiary)
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 10)
+                ComposerTextInput(text: Binding(get: { viewModel.draft }, set: { viewModel.draft = $0 }),
+                                  focused: Binding(get: { composerFocused }, set: { composerFocused = $0 }))
+                    .overlay(alignment: .topLeading) {
+                        if viewModel.draft.isEmpty {
+                            Text(cloudexLocalized(viewModel.selectedThreadID == nil ? "向 Codex 发送新指令…" : "继续发送指令…"))
+                                .foregroundStyle(.tertiary)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 10)
+                                .allowsHitTesting(false)
+                        }
                     }
-                    TextEditor(text: $viewModel.draft)
-                        .scrollContentBackground(.hidden)
-                        .frame(minHeight: 38, maxHeight: 110)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .focused($composerFocused)
-                }
-                .padding(.leading, 4)
 
                 if viewModel.active {
                     if viewModel.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -967,7 +1079,8 @@ struct ContentView: View {
             .padding(.vertical, 4)
             .padding(.trailing, 6)
             .padding(.leading, 3)
-            .liquidGlass(in: RoundedRectangle(cornerRadius: 12, style: .continuous), interactive: true)
+            .background(.ultraThinMaterial.opacity(0.3), in: RoundedRectangle(cornerRadius: 14))
+            .overlay { RoundedRectangle(cornerRadius: 14).stroke(Color.blue.opacity(composerFocused ? 0.55 : 0.24), lineWidth: composerFocused ? 1.1 : 0.7) }
             .overlay(alignment: .bottomLeading) {
                 if !slashSuggestions.isEmpty {
                     VStack(alignment: .leading, spacing: 0) {
@@ -1008,17 +1121,8 @@ struct ContentView: View {
                     .offset(y: -52)
                 }
             }
-        }
         .padding(.horizontal, 20)
-        .padding(.top, 10)
-        .padding(.bottom, bottomControlPadding)
-    }
-
-    private var bottomControlPadding: CGFloat {
-        if keyboardHeight > 0 { return 18 }
-        guard UIDevice.current.userInterfaceIdiom == .pad else { return -7 }
-        guard isWindowedIPad else { return 0 }
-        return max(0, 24 - bottomSafeArea)
+        .padding(.bottom, 8)
     }
 
     private var isSendButtonDisabled: Bool {
@@ -1416,7 +1520,6 @@ private final class ChatScrollController: ObservableObject {
 
     func isAtBottom(tolerance: CGFloat = 24) -> Bool {
         guard let scrollView, scrollView.window != nil else { return false }
-        scrollView.layoutIfNeeded()
         let minimumY = -scrollView.adjustedContentInset.top
         let maximumY = max(
             minimumY,
@@ -1868,14 +1971,8 @@ private struct MessageBubble: View {
                                         .truncationMode(.middle)
                                     Spacer(minLength: 0)
                                 }
-                                if let path = attachment.path,
-                                   path.hasPrefix("data:image/"),
-                                   let encoded = path.split(separator: ",", maxSplits: 1).last,
-                                   let bytes = Data(base64Encoded: String(encoded)),
-                                   let image = UIImage(data: bytes) {
-                                    Image(uiImage: image)
-                                        .resizable()
-                                        .scaledToFit()
+                                if attachment.kind == .image, let path = attachment.path {
+                                    AttachmentThumbnail(path: path, server: viewModel.serverURL, client: viewModel.client)
                                         .frame(maxWidth: 260, maxHeight: 220)
                                         .clipShape(RoundedRectangle(cornerRadius: 6))
                                         .accessibilityLabel(attachment.name)
@@ -3893,6 +3990,15 @@ extension View {
             self.scrollEdgeEffectStyle(.soft, for: .top)
         } else {
             self
+        }
+    }
+
+    @ViewBuilder
+    func followChatViewportBottom(_ following: Bool) -> some View {
+        if #available(iOS 18.0, *) {
+            self.defaultScrollAnchor(following ? .bottom : nil, for: .sizeChanges)
+        } else {
+            self.defaultScrollAnchor(following ? .bottom : nil)
         }
     }
 

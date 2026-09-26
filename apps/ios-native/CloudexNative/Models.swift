@@ -907,6 +907,11 @@ struct RemoteFileEntry: Codable, Identifiable, Hashable {
 
     var id: String { path }
     var isDirectory: Bool { type == "directory" }
+    var isImage: Bool {
+        ["jpg", "jpeg", "png", "gif", "heic", "heif", "webp"].contains(
+            (path as NSString).pathExtension.lowercased()
+        )
+    }
 }
 
 struct MessageAttachment: Identifiable, Equatable {

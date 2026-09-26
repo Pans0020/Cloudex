@@ -39,6 +39,7 @@ const server = net.createServer((client) => {
     const end = header.indexOf("\r\n\r\n");
     if (end < 0) return;
     clearTimeout(timeout);
+    client.pause();
     client.removeListener("data", onData);
     const firstLine = header.toString("ascii", 0, header.indexOf("\r\n"));
     const candidate = firstLine.match(/^GET \/([A-Za-z0-9_-]+) HTTP\/1\.1$/)?.[1] || "";
@@ -49,11 +50,14 @@ const server = net.createServer((client) => {
       return;
     }
     const upstream = net.createConnection(socketPath);
+    const connectTimeout = setTimeout(() => { upstream.destroy(); client.destroy(); }, 5_000);
     upstream.once("connect", () => {
+      clearTimeout(connectTimeout);
       upstream.write(header);
       client.pipe(upstream).pipe(client);
     });
     upstream.on("error", () => client.destroy());
+    upstream.on("close", () => { clearTimeout(connectTimeout); client.destroy(); });
     client.on("error", () => upstream.destroy());
     client.on("close", () => upstream.destroy());
   };

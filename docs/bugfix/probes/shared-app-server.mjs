@@ -6,12 +6,12 @@ import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 
 const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cloudex-shared-probe-'));
 const binary = process.argv[2] || 'codex';
 const useBridge = process.argv.includes('--unix-bridge');
 const sockets = [];
-const bridgeSockets = new Set();
 let bridge;
 let child;
 let mockRequests = 0;
@@ -36,7 +36,8 @@ reserve.listen(0, '127.0.0.1');
 await once(reserve, 'listening');
 const port = reserve.address().port;
 await new Promise(r => reserve.close(r));
-const url = `ws://127.0.0.1:${port}`;
+const token = crypto.randomBytes(32).toString('base64url');
+const url = `ws://127.0.0.1:${port}/${token}`;
 async function connect(name) {
   const ws = new WebSocket(url);
   await new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = () => reject(new Error('connect')); });
@@ -75,18 +76,14 @@ try {
   });
   let stderr = ''; child.stderr.on('data', d => { stderr += d; }); child.stdout.resume();
   if (useBridge) {
-    // Test-only byte bridge, isolated from the user's actual daemon.
-    bridge = net.createServer(local => {
-      const remote = net.createConnection(unixPath);
-      for (const socket of [local, remote]) {
-        bridgeSockets.add(socket);
-        socket.on('close', () => bridgeSockets.delete(socket));
-        socket.on('error', () => { local.destroy(); remote.destroy(); });
-      }
-      local.pipe(remote).pipe(local);
+    await fs.writeFile(path.join(root, 'desktop-bridge-token'), token, { mode: 0o600 });
+    bridge = spawn(process.execPath, [new URL('../../../apps/server/bin/desktop-bridge.js', import.meta.url).pathname], {
+      env: { ...process.env, CLOUDEX_STATE_DIR: root, CODEX_CONTROL_SOCKET: unixPath,
+        CLOUDEX_DESKTOP_BRIDGE_PORT: String(port), CLOUDEX_BRIDGE_SETENV: '0' },
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
-    bridge.listen(port, '127.0.0.1');
-    await once(bridge, 'listening');
+    bridge.stdout.resume();
+    bridge.stderr.on('data', data => { stderr += data; });
   }
   let a;
   for(let i=0;i<80;i++) { try { a = await connect('probe-desktop'); break; } catch { await new Promise(r=>setTimeout(r,100)); } }
@@ -107,4 +104,4 @@ try {
   assert.equal((await terminal(a, second.turn.id)).status, 'completed');
   console.log(JSON.stringify({ binary, transport: useBridge ? 'loopback-byte-bridge-to-unix' : 'websocket', root, sameThreadResume: true, phoneTurn: bt.status, desktopReceivedPhoneCompletion: true, desktopTurnAfterPhoneUnsubscribe: true, mockRequests }, null, 2));
 } catch(e) { console.error(e); process.exitCode = 1; }
-finally { for(const ws of sockets) ws.close(); for (const socket of bridgeSockets) socket.destroy(); bridge?.close(); child?.kill('SIGTERM'); mock.closeAllConnections(); mock.close(); }
+finally { for(const ws of sockets) ws.close(); bridge?.kill('SIGTERM'); child?.kill('SIGTERM'); mock.closeAllConnections(); mock.close(); }

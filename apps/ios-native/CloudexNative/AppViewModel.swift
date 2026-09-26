@@ -2,6 +2,45 @@ import Foundation
 import SwiftUI
 import UIKit
 import WidgetKit
+import ImageIO
+
+@MainActor
+final class ComposerDraft: ObservableObject {
+    @Published var text = "" {
+        didSet { UserDefaults.standard.set(text, forKey: "cloudex.draft") }
+    }
+}
+
+@MainActor
+enum AttachmentImageCache {
+    private static let images: NSCache<NSString, UIImage> = {
+        let cache = NSCache<NSString, UIImage>()
+        cache.totalCostLimit = 20 * 1024 * 1024
+        return cache
+    }()
+
+    static func image(path: String, server: String) -> UIImage? {
+        images.object(forKey: "\(server)|\(path)" as NSString)
+    }
+
+    static func prepare(_ data: Data, path: String, server: String) async -> UIImage? {
+        let image = await Task.detached(priority: .userInitiated) {
+            guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+                  let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceThumbnailMaxPixelSize: 520,
+                    kCGImageSourceShouldCacheImmediately: true
+                  ] as CFDictionary) else { return nil as UIImage? }
+            return UIImage(cgImage: thumbnail)
+        }.value
+        if let image {
+            images.setObject(image, forKey: "\(server)|\(path)" as NSString,
+                             cost: Int(image.size.width * image.size.height * 4))
+        }
+        return image
+    }
+}
 
 @MainActor
 final class AppViewModel: ObservableObject {
@@ -23,10 +62,10 @@ final class AppViewModel: ObservableObject {
     @Published var selectedProjectCWD: String?
     @Published var selectedThreadID: String?
     @Published var detail: ThreadDetail? { didSet { rebuildRenderedMessages() } }
-    @Published var draft = "" {
-        didSet {
-            UserDefaults.standard.set(draft, forKey: "cloudex.draft")
-        }
+    let composerDraft = ComposerDraft()
+    var draft: String {
+        get { composerDraft.text }
+        set { composerDraft.text = newValue }
     }
     @Published var pendingSteerDraft = "" {
         didSet {
@@ -107,7 +146,6 @@ final class AppViewModel: ObservableObject {
         selectedEffortID = defaults.bool(forKey: "cloudex.effort.userSelected")
             ? (defaults.string(forKey: "cloudex.effort") ?? "")
             : ""
-        draft = defaults.string(forKey: "cloudex.draft") ?? ""
         pendingSteerDraft = defaults.string(forKey: "cloudex.pendingSteerDraft") ?? ""
         codexMode = CodexExecutionMode(
             rawValue: defaults.string(forKey: "cloudex.codexMode") ?? ""
@@ -119,6 +157,7 @@ final class AppViewModel: ObservableObject {
         notifyApprovals = defaults.object(forKey: "cloudex.notifyApprovals") as? Bool ?? true
         notifyTaskSuccess = defaults.object(forKey: "cloudex.notifyTaskSuccess") as? Bool ?? true
         notifyTaskFailure = defaults.object(forKey: "cloudex.notifyTaskFailure") as? Bool ?? true
+        draft = defaults.string(forKey: "cloudex.draft") ?? ""
         defaults.set(lanServerURL, forKey: "cloudex.serverURL")
         defaults.set(lanServerURL, forKey: "cloudex.lanServerURL")
         defaults.set(tailscaleServerURL, forKey: "cloudex.tailscaleServerURL")
@@ -1152,7 +1191,45 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    #if DEBUG && targetEnvironment(simulator)
+    // In-memory UI regression data only; never creates Codex sessions or contacts a server.
+    private func loadUIFixture(thread: CloudexThread? = nil) async {
+        selectedModelID = "gpt-6-sol"
+        codexMode = .fullAccess
+        isServerReachable = true
+        let fixtureThreads = ["CV", "Calcu"].map { name in
+            CloudexThread(id: "ui-\(name)", name: "布局回归 \(name)", preview: "长文本与键盘布局",
+                          cwd: "/ui/\(name)", status: nil, model: nil, createdAt: nil,
+                          updatedAt: nil, usage: nil, provider: "codex")
+        }
+        projects = fixtureThreads.map {
+            CloudexProject(id: $0.id, name: String($0.id.dropFirst(3)), cwd: $0.cwd!, threads: [$0], updatedAt: nil)
+        }
+        guard let thread else { draft = ""; return }
+        selectedThreadID = thread.id
+        selectedProjectCWD = thread.cwd
+        let turns: [[String: Any]] = (0..<6).map { index in
+            ["id": "ui-turn-\(index)", "status": "completed", "items": [
+                ["type": "userMessage", "id": "ui-user-\(index)", "content": [["type": "text", "text": "检查第 \(index + 1) 轮消息"]]],
+                ["type": "agentMessage", "id": "ui-answer-\(index)", "text": "这是用于检查布局的回复。\n\n**重点**：输入框增长时，聊天区域需要跟着缩小，文字不能穿过工具栏。\n\n附件、语音、模型和访问模式在同一行，长输入只在输入框内部滚动。"]
+            ]]
+        }
+        let data = try! JSONSerialization.data(withJSONObject: turns)
+        detail = ThreadDetail(thread: thread, turns: try! JSONDecoder().decode([CloudexTurn].self, from: data))
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 200, height: 130))
+        let image = renderer.image { context in
+            UIColor.systemTeal.setFill(); context.fill(CGRect(x: 0, y: 0, width: 200, height: 130))
+            ("截图缩略图" as NSString).draw(at: CGPoint(x: 20, y: 50), withAttributes: [.foregroundColor: UIColor.white, .font: UIFont.systemFont(ofSize: 24)])
+        }
+        _ = await AttachmentImageCache.prepare(image.pngData()!, path: "/ui-fixture.png", server: serverURL)
+        attachedFiles = [RemoteFileEntry(name: "截图.png", path: "/ui-fixture.png", type: "file", size: nil, modifiedAt: nil, selectable: true)]
+    }
+    #endif
+
     func start() async {
+        #if DEBUG && targetEnvironment(simulator)
+        if ProcessInfo.processInfo.arguments.contains("--ui-fixture") { await loadUIFixture(); return }
+        #endif
         guard !started else { return }
         started = true
         loadSharedInbox()
@@ -1444,6 +1521,9 @@ final class AppViewModel: ObservableObject {
     }
 
     func loadModelsIfNeeded(force: Bool = false) async {
+        #if DEBUG && targetEnvironment(simulator)
+        if ProcessInfo.processInfo.arguments.contains("--ui-fixture") { return }
+        #endif
         if modelsLoading { return }
         if modelsLoaded && !force { return }
         modelsLoading = true
@@ -1596,6 +1676,9 @@ final class AppViewModel: ObservableObject {
     }
 
     func openThread(_ thread: CloudexThread, projectCWD: String?) async {
+        #if DEBUG && targetEnvironment(simulator)
+        if ProcessInfo.processInfo.arguments.contains("--ui-fixture") { await loadUIFixture(thread: thread); return }
+        #endif
         threadOpenGeneration += 1
         let openGeneration = threadOpenGeneration
         isOpeningThread = true
@@ -1955,7 +2038,7 @@ final class AppViewModel: ObservableObject {
                 text: prompt,
                 executionStatus: "sending",
                 createdAt: Date().timeIntervalSince1970,
-                attachments: attachedFiles.map { MessageAttachment(name: $0.name, path: $0.path, kind: .file) }
+                attachments: attachedFiles.map { MessageAttachment(name: $0.name, path: $0.path, kind: $0.isImage ? .image : .file) }
             )
             draft = ""
         }
@@ -2190,8 +2273,14 @@ final class AppViewModel: ObservableObject {
     }
 
     func attachPhoneImage(_ data: Data) async -> Bool {
+        let generation = connectionGeneration
+        let uploadClient = client
+        let uploadServer = serverURL
+        let uploadThread = selectedThreadID
         do {
-            let file = try await client.uploadImage(data)
+            let file = try await uploadClient.uploadImage(data)
+            _ = await AttachmentImageCache.prepare(data, path: file.path, server: uploadServer)
+            guard generation == connectionGeneration, uploadThread == selectedThreadID else { return false }
             attach(file)
             return true
         } catch {

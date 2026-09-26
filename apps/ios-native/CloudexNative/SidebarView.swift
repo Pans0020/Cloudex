@@ -10,7 +10,6 @@ struct CloudexRootView: View {
     @State private var showingSettings = false
     @State private var presentingSharedItem: SharedItem?
     @FocusState private var searchFieldFocused: Bool
-    @State private var keyboardHeight: CGFloat = 0
     @State private var searchMatches: [ConversationSearchMatch] = []
     @State private var searchRequest: Task<Void, Never>?
     @State private var isSearchingMessages = false
@@ -64,13 +63,6 @@ struct CloudexRootView: View {
         }
         .onDisappear {
             searchRequest?.cancel()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { note in
-            guard let value = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue else { return }
-            keyboardHeight = max(0, UIScreen.main.bounds.maxY - value.cgRectValue.minY)
-        }
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
-            keyboardHeight = 0
         }
         .onReceive(NotificationCenter.default.publisher(for: .cloudexOpenNotificationSettings)) { _ in
             showingSettings = true
@@ -130,8 +122,11 @@ struct CloudexRootView: View {
 
                 ForEach(filteredProjects) { project in
                     Section {
+                        projectHeader(project)
+                            .listRowBackground(projectCardBackground(project, first: true, last: isProjectCollapsed(project)))
                         if !isProjectCollapsed(project) {
                             projectNewConversationButton(project)
+                                .listRowBackground(projectCardBackground(project))
 
                             ForEach(project.threads) { thread in
                                 VStack(alignment: .leading, spacing: 0) {
@@ -145,28 +140,10 @@ struct CloudexRootView: View {
                                         )
                                     }
                                 }
+                                .listRowBackground(projectCardBackground(project, last: thread.id == project.threads.last?.id,
+                                                                         selected: thread.id == viewModel.selectedThreadID))
                             }
                         }
-                    } header: {
-                        Button {
-                            withAnimation(.easeInOut(duration: 0.2)) {
-                                toggleProject(project)
-                            }
-                        } label: {
-                            HStack {
-                                Text(project.displayName)
-                                Text(viewModel.serverProfileTitle)
-                                    .font(.caption2)
-                                    .foregroundStyle(.tertiary)
-                                    .lineLimit(1)
-                                Spacer(minLength: 8)
-                                Image(systemName: isProjectCollapsed(project) ? "chevron.right" : "chevron.down")
-                                    .font(.caption.weight(.semibold))
-                            }
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("\(cloudexLocalized(isProjectCollapsed(project) ? "展开" : "折叠"))\(project.displayName)")
                     }
                 }
 
@@ -175,6 +152,10 @@ struct CloudexRootView: View {
                         .listRowBackground(Color.clear)
                 }
             }
+            .listStyle(.insetGrouped)
+            .listSectionSpacing(14)
+            .scrollContentBackground(.hidden)
+            .background(Color(.systemGroupedBackground))
             .refreshable { await viewModel.refresh() }
             .scrollDismissesKeyboard(.interactively)
             .navigationTitle("Cloudex")
@@ -295,13 +276,18 @@ struct CloudexRootView: View {
 
             ForEach(iPadSidebarProjects) { project in
                 Section {
+                    projectHeader(project)
+                        .listRowBackground(projectCardBackground(project, first: true, last: isProjectCollapsed(project)))
                     if !isProjectCollapsed(project) {
                         Button {
                             startNewIPadConversation(in: project)
                         } label: {
                             Label("新对话", systemImage: "square.and.pencil")
-                                .fontWeight(.semibold)
+                                .font(.subheadline.weight(.medium))
+                                .foregroundStyle(.primary)
                         }
+                        .buttonStyle(.plain)
+                        .listRowBackground(projectCardBackground(project))
 
                         ForEach(project.threads) { thread in
                             VStack(alignment: .leading, spacing: 0) {
@@ -311,28 +297,10 @@ struct CloudexRootView: View {
                                     iPadSearchMatchButton(match, thread: thread, project: project)
                                 }
                             }
-                            .listRowBackground(iPadSelectionRowBackground(for: thread.id))
+                            .listRowBackground(projectCardBackground(project, last: thread.id == project.threads.last?.id,
+                                                                     selected: thread.id == viewModel.selectedThreadID))
                         }
                     }
-                } header: {
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            toggleProject(project)
-                        }
-                    } label: {
-                        HStack {
-                            Text(project.displayName)
-                            Text(viewModel.serverProfileTitle)
-                                .font(.caption2)
-                                .foregroundStyle(.tertiary)
-                                .lineLimit(1)
-                            Spacer(minLength: 8)
-                            Image(systemName: isProjectCollapsed(project) ? "chevron.right" : "chevron.down")
-                                .font(.caption.weight(.semibold))
-                        }
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
                 }
             }
 
@@ -341,6 +309,10 @@ struct CloudexRootView: View {
                     .listRowBackground(Color.clear)
             }
         }
+            .listStyle(.insetGrouped)
+            .listSectionSpacing(14)
+            .scrollContentBackground(.hidden)
+            .background(Color(.systemGroupedBackground))
             .refreshable { await viewModel.refresh() }
             .scrollDismissesKeyboard(.interactively)
             .navigationTitle("Cloudex")
@@ -841,11 +813,49 @@ struct CloudexRootView: View {
             navigationPath.append(route)
         } label: {
             Label("新对话", systemImage: "square.and.pencil")
-                .fontWeight(.semibold)
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(.primary)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
         .accessibilityLabel("在\(project.displayName)中新建对话")
+    }
+
+    private func projectCardBackground(_ project: CloudexProject, first: Bool = false, last: Bool = false,
+                                       selected: Bool = false) -> some View {
+        let shape = UnevenRoundedRectangle(topLeadingRadius: first ? 22 : 0, bottomLeadingRadius: last ? 22 : 0,
+                                           bottomTrailingRadius: last ? 22 : 0, topTrailingRadius: first ? 22 : 0)
+        // Native row separators divide conversations; never stroke each row as a box.
+        return shape.fill(.ultraThinMaterial).opacity(0.45)
+            .overlay(shape.fill(Color.primary.opacity(selected ? 0.045 : 0)))
+    }
+
+    private func projectHeader(_ project: CloudexProject) -> some View {
+        let expanded = !isProjectCollapsed(project)
+        return Button {
+            toggleProject(project)
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: expanded ? "folder.fill" : "folder")
+                    .foregroundStyle(expanded ? Color.accentColor : Color.secondary)
+                Text(project.displayName)
+                    .font(.headline)
+                    .foregroundStyle(Color.primary)
+                Spacer(minLength: 8)
+                Text("\(project.threads.count)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Color.secondary)
+            }
+            .padding(.vertical, 8)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(cloudexLocalized(expanded ? "折叠" : "展开"))\(project.displayName)")
+        .accessibilityValue(expanded ? "已展开" : "已收起")
     }
 
     private func conversationButton(_ thread: CloudexThread, projectCWD: String?) -> some View {
@@ -985,8 +995,7 @@ struct CloudexRootView: View {
     }
 
     private func bottomControlPadding(isWindowedIPad: Bool, bottomSafeArea: CGFloat) -> CGFloat {
-        if keyboardHeight > 0 { return 18 }
-        guard UIDevice.current.userInterfaceIdiom == .pad else { return -7 }
+        guard UIDevice.current.userInterfaceIdiom == .pad else { return 8 }
         guard isWindowedIPad else { return 0 }
         return max(0, 24 - bottomSafeArea)
     }
