@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		A40000000000000000000001 = {isa = PBXBuildFile; fileRef = B40000000000000000000001; };
+		A30000000000000000000001 = {isa = PBXBuildFile; fileRef = B30000000000000000000001; };
 		A20000000000000000000001 = {isa = PBXBuildFile; fileRef = B20000000000000000000001; };
 		A10000000000000000000001 = {isa = PBXBuildFile; fileRef = B10000000000000000000001; };
 		A00000000000000000000001 /* CloudexNativeApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000001 /* CloudexNativeApp.swift */; };
@@ -41,6 +43,8 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		B40000000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudexTheme.swift; sourceTree = "<group>"; };
+		B30000000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeChatList.swift; sourceTree = "<group>"; };
 		B20000000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownRendering.swift; sourceTree = "<group>"; };
 		B10000000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudexUITests.swift; sourceTree = "<group>"; };
 		B10000000000000000000002 = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = CloudexUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -131,6 +135,8 @@
 				B00000000000000000000003 /* APIClient.swift */,
 				B00000000000000000000004 /* SSEClient.swift */,
 				B00000000000000000000005 /* AppViewModel.swift */,
+				B30000000000000000000001 /* NativeChatList.swift */,
+				B40000000000000000000001 /* CloudexTheme.swift */,
 				B00000000000000000000006 /* ContentView.swift */,
 				B00000000000000000000007 /* SidebarView.swift */,
 				B00000000000000000000008 /* SettingsView.swift */,
@@ -273,6 +279,8 @@
 				A00000000000000000000003 /* APIClient.swift in Sources */,
 				A00000000000000000000004 /* SSEClient.swift in Sources */,
 				A00000000000000000000005 /* AppViewModel.swift in Sources */,
+				A30000000000000000000001 /* NativeChatList.swift in Sources */,
+				A40000000000000000000001 /* CloudexTheme.swift in Sources */,
 				A00000000000000000000006 /* ContentView.swift in Sources */,
 				A00000000000000000000007 /* SidebarView.swift in Sources */,
 				A00000000000000000000008 /* SettingsView.swift in Sources */,
@@ -290,12 +298,14 @@
 /* End PBXSourcesBuildPhase section */
 
 /* Begin XCBuildConfiguration section */
-		F10000000000000000000001 = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = QFG998HM3T; GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = com.cloudex.native.uitests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_TARGET_NAME = CloudexNative; }; name = Debug; };
-		F10000000000000000000002 = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = QFG998HM3T; GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = com.cloudex.native.uitests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_TARGET_NAME = CloudexNative; }; name = Release; };
+		F10000000000000000000001 = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = QFG998HM3T; GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = "$(CLOUDEX_BUNDLE_PREFIX).uitests"; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_TARGET_NAME = CloudexNative; }; name = Debug; };
+		F10000000000000000000002 = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = QFG998HM3T; GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = "$(CLOUDEX_BUNDLE_PREFIX).uitests"; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_TARGET_NAME = CloudexNative; }; name = Release; };
 		F00000000000000000000001 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLOUDEX_BUNDLE_PREFIX = com.cloudex.native;
+				CLOUDEX_SOURCE_REVISION = development;
 				CLANG_ENABLE_MODULES = YES;
 				CLANG_ENABLE_OBJC_ARC = YES;
 				COPY_PHASE_STRIP = NO;
@@ -315,6 +325,8 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLOUDEX_BUNDLE_PREFIX = com.cloudex.native;
+				CLOUDEX_SOURCE_REVISION = development;
 				CLANG_ENABLE_MODULES = YES;
 				CLANG_ENABLE_OBJC_ARC = YES;
 				COPY_PHASE_STRIP = NO;
@@ -333,7 +345,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = Cloudex;
 				CODE_SIGN_ENTITLEMENTS = CloudexNative/CloudexNative.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 3;
+				CURRENT_PROJECT_VERSION = 4;
 				DEVELOPMENT_ASSET_PATHS = "";
 				DEVELOPMENT_TEAM = QFG998HM3T;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -345,7 +357,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 0.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.cloudex.native;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(CLOUDEX_BUNDLE_PREFIX)";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -360,7 +372,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = Cloudex;
 				CODE_SIGN_ENTITLEMENTS = CloudexNative/CloudexNative.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 3;
+				CURRENT_PROJECT_VERSION = 4;
 				DEVELOPMENT_ASSET_PATHS = "";
 				DEVELOPMENT_TEAM = QFG998HM3T;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -372,7 +384,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 0.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.cloudex.native;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(CLOUDEX_BUNDLE_PREFIX)";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -381,10 +393,10 @@
 			};
 			name = Release;
 		};
-		F00000000000000000000005 /* Share Debug */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_ENTITLEMENTS = CloudexShare/CloudexShare.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 3; DEVELOPMENT_TEAM = QFG998HM3T; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = CloudexShare/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@executable_path/../../Frameworks", ); MARKETING_VERSION = 0.1.0; PRODUCT_BUNDLE_IDENTIFIER = com.cloudex.native.share; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
-		F00000000000000000000006 /* Share Release */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_ENTITLEMENTS = CloudexShare/CloudexShare.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 3; DEVELOPMENT_TEAM = QFG998HM3T; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = CloudexShare/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@executable_path/../../Frameworks", ); MARKETING_VERSION = 0.1.0; PRODUCT_BUNDLE_IDENTIFIER = com.cloudex.native.share; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
-		F00000000000000000000007 /* Widget Debug */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_ENTITLEMENTS = CloudexWidget/CloudexWidget.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 3; DEVELOPMENT_TEAM = QFG998HM3T; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = CloudexWidget/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@executable_path/../../Frameworks", ); MARKETING_VERSION = 0.1.0; PRODUCT_BUNDLE_IDENTIFIER = com.cloudex.native.widget; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
-		F00000000000000000000008 /* Widget Release */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_ENTITLEMENTS = CloudexWidget/CloudexWidget.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 3; DEVELOPMENT_TEAM = QFG998HM3T; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = CloudexWidget/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@executable_path/../../Frameworks", ); MARKETING_VERSION = 0.1.0; PRODUCT_BUNDLE_IDENTIFIER = com.cloudex.native.widget; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
+		F00000000000000000000005 /* Share Debug */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_ENTITLEMENTS = CloudexShare/CloudexShare.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 4; DEVELOPMENT_TEAM = QFG998HM3T; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = CloudexShare/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@executable_path/../../Frameworks", ); MARKETING_VERSION = 0.1.0; PRODUCT_BUNDLE_IDENTIFIER = "$(CLOUDEX_BUNDLE_PREFIX).share"; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
+		F00000000000000000000006 /* Share Release */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_ENTITLEMENTS = CloudexShare/CloudexShare.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 4; DEVELOPMENT_TEAM = QFG998HM3T; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = CloudexShare/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@executable_path/../../Frameworks", ); MARKETING_VERSION = 0.1.0; PRODUCT_BUNDLE_IDENTIFIER = "$(CLOUDEX_BUNDLE_PREFIX).share"; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
+		F00000000000000000000007 /* Widget Debug */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_ENTITLEMENTS = CloudexWidget/CloudexWidget.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 4; DEVELOPMENT_TEAM = QFG998HM3T; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = CloudexWidget/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@executable_path/../../Frameworks", ); MARKETING_VERSION = 0.1.0; PRODUCT_BUNDLE_IDENTIFIER = "$(CLOUDEX_BUNDLE_PREFIX).widget"; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
+		F00000000000000000000008 /* Widget Release */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_ENTITLEMENTS = CloudexWidget/CloudexWidget.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 4; DEVELOPMENT_TEAM = QFG998HM3T; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = CloudexWidget/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@executable_path/../../Frameworks", ); MARKETING_VERSION = 0.1.0; PRODUCT_BUNDLE_IDENTIFIER = "$(CLOUDEX_BUNDLE_PREFIX).widget"; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */

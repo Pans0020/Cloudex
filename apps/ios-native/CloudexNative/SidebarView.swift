@@ -2,8 +2,59 @@ import SwiftUI
 import Combine
 import UIKit
 
+// Home navigation does not subscribe to token-by-token conversation publications.
+@MainActor
+private final class HomeUpdates: ObservableObject {
+    private var subscription: AnyCancellable?
+    private var filterInput: (projects: [CloudexProject], pinned: Set<String>, query: String, matches: Set<String>)?
+    private var filtered: [CloudexProject] = []
+
+    func projects(_ projects: [CloudexProject], pinned: Set<String>, query: String, matches: Set<String>) -> [CloudexProject] {
+        if let old = filterInput, old.projects == projects, old.pinned == pinned, old.query == query, old.matches == matches {
+            return filtered
+        }
+        filterInput = (projects, pinned, query, matches)
+        filtered = projects.compactMap { project in
+            let threads = project.threads.filter { thread in
+                !pinned.contains(thread.id) && (query.isEmpty || matches.contains(thread.id)
+                    || [thread.title, thread.preview ?? "", thread.cwd ?? "", project.displayName]
+                        .contains { $0.localizedCaseInsensitiveContains(query) })
+            }.sorted { ($0.updatedAt ?? 0) > ($1.updatedAt ?? 0) }
+            guard !threads.isEmpty else { return nil }
+            return CloudexProject(id: project.id, name: project.name, cwd: project.cwd,
+                threads: threads, updatedAt: project.updatedAt)
+        }.sorted { lhs, rhs in
+            if lhs.isNoProjectLike != rhs.isNoProjectLike { return !lhs.isNoProjectLike }
+            return (lhs.updatedAt ?? 0) > (rhs.updatedAt ?? 0)
+        }
+        return filtered
+    }
+    init(_ model: AppViewModel) {
+        subscription = Publishers.MergeMany([
+            model.$projects.removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
+            model.$selectedAgentProvider.removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
+            model.$pinnedThreadIDs.removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
+            model.$serverProfiles.removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
+            model.$serverOverviews.removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
+            model.$selectedServerProfileID.removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
+            model.$selectedThreadID.removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
+            model.$selectedProjectCWD.removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
+            model.$isServerReachable.removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
+            model.$pendingShares.map { _ in () }.eraseToAnyPublisher(),
+            model.$threadNavigationRequest.map { _ in () }.eraseToAnyPublisher(),
+            model.$models.map { _ in () }.eraseToAnyPublisher()
+        ]).receive(on: RunLoop.main).sink { [weak self] in self?.objectWillChange.send() }
+    }
+}
+
 struct CloudexRootView: View {
-    @EnvironmentObject private var viewModel: AppViewModel
+    let viewModel: AppViewModel
+    @StateObject private var homeUpdates: HomeUpdates
+
+    init(viewModel: AppViewModel) {
+        self.viewModel = viewModel
+        _homeUpdates = StateObject(wrappedValue: HomeUpdates(viewModel))
+    }
     @AppStorage("cloudex.lastOpenedThreadID") private var lastOpenedThreadID = ""
     @State private var navigationPath: [String] = []
     @State private var searchQuery = ""
@@ -150,14 +201,16 @@ struct CloudexRootView: View {
                 }
 
                 if projects.isEmpty, !isSearchingMessages {
-                    ContentUnavailableView.search(text: searchQuery)
+                    CloudexEmptyState(symbol: searchQuery.isEmpty ? "square.stack.3d.up" : "magnifyingglass",
+                        title: searchQuery.isEmpty ? "工作空间，从这里开始" : "没有找到匹配的对话",
+                        detail: searchQuery.isEmpty ? "在设置中连接一台电脑，即可查看项目和对话。" : "试试项目名、对话标题或消息中的关键词。")
                         .listRowBackground(Color.clear)
                 }
             }
             .listStyle(.insetGrouped)
-            .listSectionSpacing(14)
+            .listSectionSpacing(18)
             .scrollContentBackground(.hidden)
-            .background(Color(.systemGroupedBackground))
+            .background(CloudexTheme.canvas)
             .refreshable { await viewModel.refresh() }
             .scrollDismissesKeyboard(.interactively)
             .navigationTitle("Cloudex")
@@ -309,14 +362,16 @@ struct CloudexRootView: View {
             }
 
             if projects.isEmpty, !isSearchingMessages {
-                ContentUnavailableView.search(text: searchQuery)
+                    CloudexEmptyState(symbol: searchQuery.isEmpty ? "square.stack.3d.up" : "magnifyingglass",
+                        title: searchQuery.isEmpty ? "工作空间，从这里开始" : "没有找到匹配的对话",
+                        detail: searchQuery.isEmpty ? "在设置中连接一台电脑，即可查看项目和对话。" : "试试项目名、对话标题或消息中的关键词。")
                     .listRowBackground(Color.clear)
             }
         }
             .listStyle(.insetGrouped)
             .listSectionSpacing(14)
             .scrollContentBackground(.hidden)
-            .background(Color(.systemGroupedBackground))
+            .background(CloudexTheme.canvas)
             .refreshable { await viewModel.refresh() }
             .scrollDismissesKeyboard(.interactively)
             .navigationTitle("Cloudex")
@@ -333,7 +388,9 @@ struct CloudexRootView: View {
             }
     }
 
+    @ViewBuilder
     private var serverOverviewSection: some View {
+        if !viewModel.serverProfiles.isEmpty || !viewModel.pendingShares.isEmpty {
         Section("主机") {
             if !viewModel.pendingShares.isEmpty {
                 Button {
@@ -381,6 +438,7 @@ struct CloudexRootView: View {
                 .buttonStyle(.plain)
                 .accessibilityLabel("\(profile.name)，\(overview?.isOnline == true ? "在线" : "离线")")
             }
+        }
         }
     }
 
@@ -431,7 +489,7 @@ struct CloudexRootView: View {
         ToolbarItem(placement: .principal) {
             VStack(spacing: 1) {
                 Text("Cloudex")
-                    .font(.headline)
+                    .font(.system(.headline, design: .rounded).weight(.semibold))
                     .lineLimit(1)
                 HStack(spacing: 4) {
                     Circle()
@@ -505,34 +563,8 @@ struct CloudexRootView: View {
     }
 
     private var filteredProjects: [CloudexProject] {
-        let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        let matches = matchesByThreadID
-        let pinned = viewModel.pinnedThreadIDs
-        return viewModel.agentProjects.compactMap { project in
-            let threads = project.threads
-                .filter { thread in
-                    !pinned.contains(thread.id)
-                        && (query.isEmpty
-                        || matches[thread.id]?.isEmpty == false
-                        || [thread.title, thread.preview ?? "", thread.cwd ?? "", project.displayName]
-                            .contains { $0.localizedCaseInsensitiveContains(query) })
-                }
-                .sorted { ($0.updatedAt ?? 0) > ($1.updatedAt ?? 0) }
-            guard !threads.isEmpty else { return nil }
-            return CloudexProject(
-                id: project.id,
-                name: project.name,
-                cwd: project.cwd,
-                threads: threads,
-                updatedAt: project.updatedAt
-            )
-        }
-        .sorted { lhs, rhs in
-            if lhs.isNoProjectLike != rhs.isNoProjectLike {
-                return !lhs.isNoProjectLike
-            }
-            return (lhs.updatedAt ?? 0) > (rhs.updatedAt ?? 0)
-        }
+        homeUpdates.projects(viewModel.agentProjects, pinned: viewModel.pinnedThreadIDs,
+            query: searchQuery.trimmingCharacters(in: .whitespacesAndNewlines), matches: Set(matchesByThreadID.keys))
     }
 
     private var iPadProjects: [CloudexProject] {
@@ -834,8 +866,13 @@ struct CloudexRootView: View {
                                            bottomTrailingRadius: last ? 22 : 0, topTrailingRadius: first ? 22 : 0)
         // Native row separators divide conversations; never stroke each row as a box.
         // A translucent fill does not need a separate live blur for every scrolling row.
-        return shape.fill(Color(.secondarySystemGroupedBackground).opacity(0.55))
-            .overlay(shape.fill(Color.primary.opacity(selected ? 0.045 : 0)))
+        return shape.fill(CloudexTheme.surface.opacity(0.82))
+            .overlay(shape.fill(CloudexTheme.accent.opacity(selected ? 0.09 : 0)))
+            .overlay {
+                if first && last {
+                    shape.strokeBorder(CloudexTheme.line.opacity(0.35), lineWidth: 0.5)
+                }
+            }
     }
 
     private func projectHeader(_ project: CloudexProject) -> some View {
@@ -843,21 +880,37 @@ struct CloudexRootView: View {
         return Button {
             toggleProject(project)
         } label: {
-            HStack(spacing: 10) {
-                Image(systemName: expanded ? "folder.fill" : "folder")
-                    .foregroundStyle(expanded ? Color.accentColor : Color.secondary)
-                Text(project.displayName)
-                    .font(.headline)
-                    .foregroundStyle(Color.primary)
+            HStack(spacing: 12) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 13, style: .continuous)
+                        .fill(CloudexTheme.accent.opacity(expanded ? 0.13 : 0.06))
+                    if project.isNoProjectLike {
+                        Image(systemName: "tray").font(.system(size: 18, weight: .medium))
+                    } else {
+                        Text(String(project.displayName.prefix(2)).uppercased())
+                            .font(.system(.subheadline, design: .rounded).weight(.semibold))
+                    }
+                }
+                .foregroundStyle(expanded ? CloudexTheme.accent : .secondary)
+                .frame(width: 44, height: 44)
+                .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(project.displayName).font(.headline).foregroundStyle(.primary)
+                    Text(expanded ? "浏览项目对话" : "轻点展开对话")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
                 Spacer(minLength: 8)
                 Text("\(project.threads.count)")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .font(.caption.weight(.medium).monospacedDigit())
+                    .foregroundStyle(expanded ? CloudexTheme.accent : .secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(CloudexTheme.accent.opacity(0.055), in: Capsule())
                 Image(systemName: expanded ? "chevron.down" : "chevron.right")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(Color.secondary)
             }
-            .padding(.vertical, 8)
+            .padding(.vertical, 10)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -1575,8 +1628,15 @@ private struct ThreadRow: View, Equatable {
     let thread: CloudexThread
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        HStack(alignment: .top, spacing: 11) {
+            RoundedRectangle(cornerRadius: 2)
+                .fill(thread.isActive ? CloudexTheme.accent : CloudexTheme.line.opacity(0.6))
+                .frame(width: 3, height: 28)
+                .padding(.top, 3)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 6) {
             Text(thread.title)
+                .font(.subheadline.weight(.medium))
                 .foregroundStyle(.primary)
                 .lineLimit(2)
             HStack(spacing: 6) {
@@ -1588,7 +1648,14 @@ private struct ThreadRow: View, Equatable {
             }
             .font(.caption2)
             .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+            Image(systemName: "chevron.right")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.tertiary)
+                .padding(.top, 5)
+                .accessibilityHidden(true)
         }
-        .padding(.vertical, 2)
+        .padding(.vertical, 7)
     }
 }

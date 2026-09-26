@@ -114,14 +114,10 @@ private struct ComposerTextInput: UIViewRepresentable {
     }
 }
 
-private struct OlderHistoryScrollSnapshot {
-    let offset: CGPoint
-    let contentHeight: CGFloat
-}
 
 struct ContentView: View {
     @EnvironmentObject private var viewModel: AppViewModel
-    @StateObject private var chatScrollController = ChatScrollController()
+    @StateObject private var chatListActions = ChatListActions()
     @StateObject private var speechInput = SpeechInputController()
     let expectedThreadID: String?
     let onToggleDirectory: (() -> Void)?
@@ -129,25 +125,10 @@ struct ContentView: View {
     @State private var showingFilePicker = false
     @State private var showingPhotosPicker = false
     @State private var selectedPhoto: PhotosPickerItem?
-    @State private var isAtChatBottom = true
     @State private var isFollowingChatBottom = true
-    @State private var hasLoadedChatContent = false
-    @State private var scrollToBottomRequest = 0
-    @State private var explicitScrollGeneration = 0
-    @State private var isExplicitScrollInProgress = false
-    @State private var initialBottomScrollGeneration = 0
-    @State private var isInitialBottomScrollInProgress = false
-    @State private var isPreparingInitialLayout = true
-    @State private var messagePositioningGeneration = 0
-    @State private var isMessagePositioningInProgress = false
-    @State private var isProcessLayoutChangeInProgress = false
-    @State private var processLayoutGeneration = 0
-    @State private var processExpansionScrollOffset: CGPoint?
-    @State private var isUserScrollingChat = false
     @State private var messageJumpSnapshot: [MessageJumpItem] = []
-    @State private var scrollTargetMessageID: String?
     @State private var messageTextHighlight: MessageTextHighlight?
-    @State private var chatContentSnapshot = ChatScrollContent.empty
+    @State private var loadingJumpID: String?
     @State private var collapseProcessRequest = 0
     @State private var floatingCollapseVisible = false
     @State private var showingTokenUsage = false
@@ -157,7 +138,6 @@ struct ContentView: View {
     @State private var taskTimerCompletedAt: Double?
     @State private var taskTimerHidden = true
     @State private var composerFocused = false
-    @State private var olderHistoryScrollSnapshot: OlderHistoryScrollSnapshot?
 
     init(
         expectedThreadID: String? = nil,
@@ -167,7 +147,6 @@ struct ContentView: View {
         self.expectedThreadID = expectedThreadID
         self.onToggleDirectory = onToggleDirectory
         self.showsDirectoryButton = showsDirectoryButton
-        _isPreparingInitialLayout = State(initialValue: expectedThreadID?.hasPrefix("new-") != true)
     }
 
     var body: some View {
@@ -175,19 +154,6 @@ struct ContentView: View {
         ZStack {
             liquidBackground
             chat
-                // Keep the full message tree in the hierarchy so SwiftUI
-                // can measure it, but reveal text only after the initial
-                // bottom position has been calculated.
-                .opacity(isPreparingInitialLayout ? 0 : 1)
-            if isPreparingInitialLayout {
-                ProgressView()
-                    .controlSize(.small)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(.regularMaterial.opacity(0.72))
-                .allowsHitTesting(false)
-                .transition(.opacity)
-                .zIndex(20)
-            }
             if floatingCollapseVisible {
                 VStack {
                     HStack {
@@ -247,10 +213,10 @@ struct ContentView: View {
             composer
         }
         }
-        .background(Color(.systemBackground))
+        .background(CloudexTheme.canvas)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            #if DEBUG && targetEnvironment(simulator)
+            #if DEBUG
             if ProcessInfo.processInfo.arguments.contains("--ui-stream-fixture") {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button(viewModel.liveRunning ? "流式进行中" : "模拟连续回复") { viewModel.startUIFixtureStream() }
@@ -388,280 +354,101 @@ struct ContentView: View {
             }
         }
         .onChange(of: viewModel.active) { _, active in
-            if active {
-                updateChatContent(force: true)
-            } else if hasLoadedChatContent && !isPreparingInitialLayout {
-                // Prepared Markdown can arrive after completion; equality suppresses no-op updates.
-                updateChatContent(force: true)
-            }
-            guard !active else { return }
-            let snapshot = MessageJumpItem.paired(
-                from: viewModel.messageIndex,
-                turns: viewModel.detail?.turns ?? []
-            )
-            if messageJumpSnapshot != snapshot {
-                messageJumpSnapshot = snapshot
+            if !active {
+                messageJumpSnapshot = MessageJumpItem.paired(from: viewModel.messageIndex, turns: viewModel.detail?.turns ?? [])
             }
         }
-        .onChange(of: viewModel.isOpeningThread, initial: true) { _, opening in
-            if opening {
-                resetChatLayoutForNewThread()
-                return
-            }
-            updateChatContent(force: !hasLoadedChatContent)
-            // During an active task the target message can arrive while the
-            // conversation is still opening. The ScrollView is disabled in
-            // that phase, so keep the request alive and fulfill it only after
-            // opening has completed.
-            fulfillPendingMessageJumpIfPossible()
+        .onChange(of: viewModel.detail, initial: true) { _, _ in syncTaskTimerState() }
+        .onChange(of: viewModel.liveRunning, initial: true) { _, _ in syncTaskTimerState() }
+        .onChange(of: viewModel.renderedMessages) { _, _ in fulfillPendingMessageJumpIfPossible() }
+        .onChange(of: viewModel.isOpeningThread) { _, opening in
+            if !opening { fulfillPendingMessageJumpIfPossible() }
         }
-        .onChange(of: viewModel.detail, initial: true) { _, _ in
-            syncTaskTimerState()
-            if !viewModel.isOpeningThread && !viewModel.active {
-                updateChatContent(force: true)
-            }
-        }
-        .onChange(of: viewModel.liveRunning, initial: true) { _, _ in
-            syncTaskTimerState()
-        }
-        .onChange(of: viewModel.selectedThreadID) { _, _ in
-            taskTimerTurnID = nil
-            taskTimerStartedAt = nil
-            taskTimerCompletedAt = nil
-            taskTimerHidden = true
-            syncTaskTimerState()
-        }
-        .onChange(of: currentChatContent, initial: true) { _, _ in
-            updateChatContent()
-            fulfillPendingMessageJumpIfPossible()
-        }
-        .onChange(of: viewModel.isPreparingInitialMessages) { _, preparing in
-            if !preparing { updateChatContent() }
-        }
-        .onChange(of: viewModel.pendingMessageJump, initial: true) { _, _ in
-            fulfillPendingMessageJumpIfPossible()
-        }
-        .onChange(of: isFollowingChatBottom) { _, following in
-            guard following,
-                  !isPreparingInitialLayout,
-                  !viewModel.isOpeningThread else { return }
-            updateChatContent(force: true)
-        }
-        .onChange(of: expectedThreadID, initial: true) { _, _ in
-            resetChatLayoutForNewThread()
-        }
+        .onChange(of: viewModel.pendingMessageJump) { _, _ in fulfillPendingMessageJumpIfPossible() }
     }
 
     private var liquidBackground: some View {
-        Color(.systemBackground)
+        CloudexTheme.canvas
         .ignoresSafeArea()
     }
 
     private var chat: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                let isNewChat = expectedThreadID?.hasPrefix("new-") == true
-                let isReady = isNewChat
-                    || (expectedThreadID == viewModel.selectedThreadID && !viewModel.isOpeningThread)
-                let content = isReady ? chatContentSnapshot : .empty
-                LazyVStack(alignment: .leading, spacing: 18) {
-                    if !isReady {
-                        ProgressView("正在打开对话…")
-                            .frame(maxWidth: .infinity)
-                            .padding(.top, 120)
-                    }
-                    if isReady && viewModel.selectedThread == nil && content.messages.isEmpty {
-                        VStack(spacing: 10) {
-                            Spacer(minLength: 130)
-                            Text(cloudexLocalized(viewModel.isCreatingNew ? "开始新对话" : "选择一个对话"))
-                                .font(.title2.bold())
-                            Text(viewModel.selectedProject == nil
-                                 ? "点击左上角菜单选择电脑上的项目和历史对话。"
-                                 : "当前项目：\(viewModel.selectedProject?.displayName ?? "")")
-                                .font(.subheadline)
-                                .foregroundStyle(.secondary)
-                                .multilineTextAlignment(.center)
-                            Spacer(minLength: 130)
-                        }
-                        .frame(maxWidth: .infinity)
-                    }
-
-                    ForEach(content.messages) { message in
-                        MessageBubble(
-                            viewModel: viewModel,
-                            client: viewModel.client,
-                            isActive: content.active,
-                            message: message,
-                            highlightQuery: messageTextHighlight?.messageID == message.id
-                                ? messageTextHighlight?.query
-                                : nil,
-                            collapseRequest: $collapseProcessRequest,
-                            onQuickFill: { text in
-                                viewModel.draft = text
-                                composerFocused = true
-                            },
-                            onFork: {
-                                await viewModel.forkAssistantMessage(message)
-                            },
-                            onProcessInteraction: { isExpanding in
-                                beginProcessLayoutChange(expanding: isExpanding, restorePosition: false)
-                            },
-                            onFloatingProcessCollapse: {
-                                beginProcessLayoutChange(expanding: false, restorePosition: true)
-                            },
-                            onFloatingStateChange: { visible in
-                                floatingCollapseVisible = visible
+        let content = currentChatContent
+        let rows = content.messages + [ChatMessage(id: "chat-footer", role: .system,
+            text: "\(viewModel.active)|\(viewModel.isBusy)|\(viewModel.pendingSteerDraft)|\(viewModel.isOpeningThread)|\(viewModel.conversationLoadState)|\(viewModel.visibleApprovals)",
+            processItemCount: collapseProcessRequest)]
+        return NativeChatList(
+            conversationID: "\(viewModel.selectedServerProfileID ?? "")|\(expectedThreadID ?? "")",
+            rows: rows,
+            ready: isExpectedChatReady && viewModel.conversationLoadState != .loading,
+            hasMore: viewModel.hasMoreHistory,
+            loadingOlder: viewModel.isLoadingOlderTurns,
+            presentationKey: "\(viewModel.active)|\(collapseProcessRequest)|\(messageTextHighlight?.messageID ?? "")|\(messageTextHighlight?.query ?? "")|\(viewModel.serverURL)",
+            actions: chatListActions,
+            onFollowingChanged: { isFollowingChatBottom = $0 },
+            onLoadOlder: { Task { await viewModel.loadOlderTurns() } }
+        ) { message in
+            if message.id == "chat-footer" {
+                chatFooter
+            } else {
+                MessageBubble(
+                    viewModel: viewModel, client: viewModel.client, isActive: viewModel.active,
+                    message: message,
+                    highlightQuery: messageTextHighlight?.messageID == message.id ? messageTextHighlight?.query : nil,
+                    collapseRequest: $collapseProcessRequest,
+                    onQuickFill: { text in viewModel.draft = text; composerFocused = true },
+                    onFork: { await viewModel.forkAssistantMessage(message) },
+                    onProcessInteraction: { _ in chatListActions.preserveReadingPosition() },
+                    onFloatingProcessCollapse: { chatListActions.preserveReadingPosition() },
+                    onFloatingStateChange: { floatingCollapseVisible = $0 }
+                )
+                .environmentObject(viewModel)
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier("message-\(message.id)")
+            }
+        }
+        .overlay {
+            if content.messages.isEmpty {
+                if viewModel.conversationLoadState == .loading {
+                    ProgressView("正在打开对话…")
+                } else if case let .failed(error) = viewModel.conversationLoadState {
+                    VStack(spacing: 12) {
+                        Text(error).foregroundStyle(.secondary)
+                        Button("重试") {
+                            if let thread = viewModel.selectedThread {
+                                Task { await viewModel.openThread(thread, projectCWD: viewModel.selectedProjectCWD) }
                             }
-                        )
-                        .equatable()
-                        .id(message.id)
-                        .accessibilityIdentifier("message-\(message.id)")
-                        .onAppear {
-                            guard message.id == content.messages.first?.id,
-                                  viewModel.hasMoreHistory,
-                                  !viewModel.isLoadingOlderTurns,
-                                  let offset = chatScrollController.currentContentOffset() else { return }
-                            olderHistoryScrollSnapshot = OlderHistoryScrollSnapshot(
-                                offset: offset,
-                                contentHeight: chatScrollController.contentSizeHeight()
-                            )
-                            Task { await viewModel.loadOlderTurns() }
                         }
                     }
-
-                    ForEach(content.approvals) { approval in
-                        ApprovalBubble(approval: approval)
-                            .environmentObject(viewModel)
-                            .id("approval-\(approval.id)")
-                            .transition(.opacity.combined(with: .move(edge: .bottom)))
-                    }
-
-                    if !viewModel.pendingSteerDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        PendingSteerBubble(
-                            text: viewModel.pendingSteerDraft,
-                            isSending: viewModel.isBusy,
-                            onEdit: {
-                                viewModel.editPendingSteer()
-                                composerFocused = true
-                            },
-                            onDelete: {
-                                viewModel.deletePendingSteer()
-                            },
-                            onSend: { Task { await viewModel.sendPendingSteer() } }
-                        )
-                        .id("pending-steer")
-                    }
-
-                    if content.active || viewModel.isBusy {
-                        HStack(spacing: 7) {
-                            Image(systemName: "waveform")
-                                .symbolEffect(.variableColor.iterative, options: .repeating)
-                            Text(viewModel.isBusy ? "正在发送…" : "等待回复…")
-                                .font(.caption)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .foregroundStyle(.secondary)
-                        .padding(.vertical, 8)
-                    }
-
-                    Color.clear
-                        .frame(height: 8)
-                        .id("chat-bottom")
+                } else {
+                    CloudexEmptyState(symbol: "bubble.left.and.text.bubble.right",
+                        title: viewModel.isCreatingNew ? "准备好，开始新的想法" : "这段对话还没有消息",
+                        detail: "写下指令，或添加图片和文件。")
                 }
-                .padding(.horizontal, 16)
-                .padding(.top, 16)
-                .background {
-                    ChatScrollViewResolver(controller: chatScrollController)
-                        .frame(width: 0, height: 0)
-                }
-            }
-            .nativeTopScrollEdgeEffect()
-            .accessibilityIdentifier("chat-history")
-            .scrollDisabled(viewModel.isOpeningThread || isPreparingInitialLayout)
-            .scrollDismissesKeyboard(.interactively)
-            .simultaneousGesture(DragGesture(minimumDistance: 16).onChanged { value in
-                if composerFocused && value.translation.height > 24 { composerFocused = false }
-            })
-            .followChatViewportBottom(isFollowingChatBottom)
-            .trackChatScroll(
-                isAtBottom: $isAtChatBottom,
-                isFollowingBottom: $isFollowingChatBottom,
-                isExplicitScrollInProgress: $isExplicitScrollInProgress,
-                isUserScrolling: $isUserScrollingChat,
-                isLayoutChangeInProgress: $isProcessLayoutChangeInProgress,
-                isFollowRestorationDisabled: {
-                    isPreparingInitialLayout || viewModel.isOpeningThread
-                },
-                nativeIsAtBottom: { chatScrollController.isAtBottom() }
-            )
-            .onChange(of: scrollToBottomRequest) { _, _ in
-                guard !isMessagePositioningInProgress,
-                      isFollowingChatBottom || isExplicitScrollInProgress else { return }
-                let generation = explicitScrollGeneration
-                let requestGeneration = scrollToBottomRequest
-                DispatchQueue.main.async {
-                    guard !isMessagePositioningInProgress,
-                          scrollToBottomRequest == requestGeneration,
-                          isFollowingChatBottom
-                            || (isExplicitScrollInProgress && explicitScrollGeneration == generation) else { return }
-
-                    // LazyVStack's contentSize includes estimates for unmeasured rows.
-                    // Let SwiftUI resolve the actual bottom anchor; never overwrite its
-                    // offset with that estimated height or restart native animations.
-                    if isInitialBottomScrollInProgress || isExplicitScrollInProgress {
-                        var transaction = Transaction()
-                        transaction.disablesAnimations = true
-                        withTransaction(transaction) {
-                            proxy.scrollTo("chat-bottom", anchor: .bottom)
-                        }
-                    } else {
-                        withAnimation(.easeOut(duration: 0.28)) {
-                            proxy.scrollTo("chat-bottom", anchor: .bottom)
-                        }
-                    }
-                }
-            }
-            .onChange(of: scrollTargetMessageID) { _, messageID in
-                guard let messageID else { return }
-                let generation = messagePositioningGeneration
-                let positionTarget = {
-                    guard isMessagePositioningInProgress,
-                          messagePositioningGeneration == generation else { return }
-                    proxy.scrollTo(messageID, anchor: .top)
-                }
-                // LazyVStack layout and live message insertion can move the
-                // target during the first few frames. Reassert the explicit
-                // destination until layout has settled instead of allowing a
-                // pending bottom-follow scroll to win the race.
-                DispatchQueue.main.async(execute: positionTarget)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: positionTarget)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) {
-                    positionTarget()
-                    guard messagePositioningGeneration == generation else { return }
-                    scrollTargetMessageID = nil
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.48) {
-                    guard messagePositioningGeneration == generation else { return }
-                    isMessagePositioningInProgress = false
-                }
-            }
-            .onChange(of: viewModel.isLoadingOlderTurns) { _, loading in
-                guard !loading, let snapshot = olderHistoryScrollSnapshot else { return }
-                olderHistoryScrollSnapshot = nil
-                let generation = initialBottomScrollGeneration
-                let restore = {
-                    guard !viewModel.isLoadingOlderTurns, initialBottomScrollGeneration == generation else { return }
-                    let addedHeight = max(0, chatScrollController.contentSizeHeight() - snapshot.contentHeight)
-                    _ = chatScrollController.restoreContentOffset(
-                        CGPoint(x: snapshot.offset.x, y: snapshot.offset.y + addedHeight)
-                    )
-                }
-                DispatchQueue.main.async(execute: restore)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: restore)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.22, execute: restore)
             }
         }
         .frame(maxHeight: .infinity)
+    }
+
+    private var chatFooter: some View {
+        VStack(spacing: 12) {
+            ForEach(viewModel.visibleApprovals) { approval in
+                ApprovalBubble(approval: approval).environmentObject(viewModel)
+            }
+            if !viewModel.pendingSteerDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                PendingSteerBubble(text: viewModel.pendingSteerDraft, isSending: viewModel.isBusy,
+                    onEdit: { viewModel.editPendingSteer(); composerFocused = true },
+                    onDelete: { viewModel.deletePendingSteer() },
+                    onSend: { Task { await viewModel.sendPendingSteer() } })
+            }
+            if viewModel.active || viewModel.isBusy {
+                HStack(spacing: 7) {
+                    Image(systemName: "waveform").symbolEffect(.variableColor.iterative, options: .repeating)
+                    Text(viewModel.isBusy ? "正在发送…" : "等待回复…").font(.caption)
+                }.foregroundStyle(.secondary)
+            }
+            Color.clear.frame(height: 1)
+        }
     }
 
     private var composer: some View {
@@ -689,8 +476,7 @@ struct ContentView: View {
                             .font(.caption)
                             .padding(.horizontal, 9)
                             .padding(.vertical, 6)
-                            .background(.ultraThinMaterial.opacity(0.3), in: RoundedRectangle(cornerRadius: 10))
-                            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.blue.opacity(0.2), lineWidth: 0.7))
+                            .cloudexSurface(radius: 14)
                         }
                     }
                     .padding(.horizontal, 14)
@@ -837,9 +623,9 @@ struct ContentView: View {
 
             composerControls
         }
-        .padding(.top, 6)
-        .background(Color(.systemBackground))
-        .overlay(alignment: .top) { Divider() }
+        .padding(.top, 8)
+        .background(CloudexTheme.canvas)
+        .overlay(alignment: .top) { CloudexTheme.line.opacity(0.35).frame(height: 0.5) }
     }
 
     @ViewBuilder
@@ -902,7 +688,7 @@ struct ContentView: View {
             } label: {
                 Image(systemName: "paperclip")
                     .font(.body.weight(.semibold))
-                    .frame(width: 44, height: 36)
+                    .frame(width: 44, height: 44)
                     .contentShape(Circle())
             }
             .buttonStyle(.plain)
@@ -924,7 +710,7 @@ struct ContentView: View {
                 Image(systemName: speechInput.isRecording ? "stop.circle.fill" : "mic")
                     .font(.body.weight(.semibold))
                     .foregroundStyle(speechInput.isRecording ? Color.red : Color.primary)
-                    .frame(width: 44, height: 36)
+                    .frame(width: 44, height: 44)
                     .contentShape(Circle())
             }
             .buttonStyle(.plain)
@@ -988,12 +774,12 @@ struct ContentView: View {
                         Button { Task { await viewModel.stop() } } label: {
                             Image(systemName: "stop.fill")
                                 .font(.caption.weight(.semibold))
-                                .foregroundStyle(.white)
-                                .frame(width: 40, height: 40)
+                                .foregroundStyle(CloudexTheme.onAction)
+                                .frame(width: 44, height: 44)
                                 .contentShape(Circle())
                         }
                         .buttonStyle(.plain)
-                        .background(Color.black, in: Circle())
+                        .background(Color.primary, in: Circle())
                         .disabled(viewModel.isBusy)
                         .accessibilityLabel("停止任务")
                     } else {
@@ -1002,12 +788,12 @@ struct ContentView: View {
                         } label: {
                             Image(systemName: "arrow.up")
                                 .font(.body.bold())
-                                .foregroundStyle(.white)
-                                .frame(width: 40, height: 40)
+                                .foregroundStyle(CloudexTheme.onAction)
+                                .frame(width: 44, height: 44)
                                 .contentShape(Circle())
                         }
                         .buttonStyle(.plain)
-                        .background(Color.black, in: Circle())
+                        .background(Color.primary, in: Circle())
                         .accessibilityLabel(cloudexLocalized("等待发送"))
                     }
                 } else {
@@ -1015,13 +801,13 @@ struct ContentView: View {
                         Group {
                             Image(systemName: "arrow.up")
                                 .font(.body.bold())
-                                .foregroundStyle(.white)
+                                .foregroundStyle(CloudexTheme.onAction)
                         }
-                        .frame(width: 40, height: 40)
+                        .frame(width: 44, height: 44)
                         .contentShape(Circle())
                     }
                     .buttonStyle(.plain)
-                    .background(Color.black, in: Circle())
+                    .background(Color.primary, in: Circle())
                     .opacity(isSendButtonDisabled ? 0.45 : 1)
                     .disabled(isSendButtonDisabled)
                     .accessibilityLabel("发送消息")
@@ -1030,8 +816,7 @@ struct ContentView: View {
             .padding(.vertical, 4)
             .padding(.trailing, 6)
             .padding(.leading, 3)
-            .background(.ultraThinMaterial.opacity(0.3), in: RoundedRectangle(cornerRadius: 14))
-            .overlay { RoundedRectangle(cornerRadius: 14).stroke(Color.blue.opacity(composerFocused ? 0.55 : 0.24), lineWidth: composerFocused ? 1.1 : 0.7) }
+            .cloudexSurface(radius: 23, selected: composerFocused)
             .overlay(alignment: .bottomLeading) {
                 if !slashSuggestions.isEmpty {
                     VStack(alignment: .leading, spacing: 0) {
@@ -1099,12 +884,10 @@ struct ContentView: View {
             projectCWD: isNoProjectRoute ? nil : viewModel.selectedProjectCWD,
             clearProject: isNoProjectRoute
         )
-        resetChatLayoutForNewThread()
-        updateChatContent(force: true)
     }
 
     private var currentChatContent: ChatScrollContent {
-        guard isExpectedChatReady else { return .empty }
+        guard isExpectedChatReady, viewModel.conversationLoadState != .loading else { return .empty }
         return ChatScrollContent(
             messages: viewModel.renderedMessages,
             approvals: viewModel.visibleApprovals,
@@ -1112,219 +895,44 @@ struct ContentView: View {
         )
     }
 
-    private func updateChatContent(force: Bool = false) {
-        guard isExpectedChatReady, !viewModel.isOpeningThread else { return }
-        let latest = currentChatContent
-        if !hasLoadedChatContent {
-            guard !viewModel.isPreparingInitialMessages else { return }
-            beginInitialBottomPositioning()
-            chatContentSnapshot = latest
-            hasLoadedChatContent = true
-            return
-        }
-        // Returning to the bottom must not re-layout identical messages or restart scrolling.
-        guard latest != chatContentSnapshot || isExplicitScrollInProgress else { return }
-
-        if isPreparingInitialLayout {
-            // Keep the hidden initial snapshot current while the first layout
-            // settles. Do not enqueue another scroll for every streamed delta.
-            chatContentSnapshot = latest
-            return
-        }
-
-        if viewModel.isLoadingOlderTurns {
-            // Prepending history updates the rows without entering bottom
-            // follow mode. The native offset is restored after layout.
-            chatContentSnapshot = latest
-            return
-        }
-
-        if force || isFollowingChatBottom {
-            chatContentSnapshot = latest
-            if isFollowingChatBottom {
-                let requestGeneration = scrollToBottomRequest + 1
-                DispatchQueue.main.async {
-                    guard isFollowingChatBottom,
-                          !isPreparingInitialLayout,
-                          !isUserScrollingChat else { return }
-                    scrollToBottomRequest = requestGeneration
-                }
-            }
-        } else {
-            // Leaving follow mode must freeze only the viewport, not the
-            // conversation data. Keep replacing rows that are still being
-            // streamed and append newly arrived rows without requesting a
-            // scroll, so messages and execution commands remain live while
-            // the user reads older content.
-            if shouldReplaceForCompletedProcess(with: latest) {
-                // Completion changes the timeline's structure: fine-grained
-                // live rows are replaced by one process-summary row plus the
-                // final answer. An append-only merge would retain all of the
-                // obsolete live rows. Apply the final snapshot atomically but
-                // deliberately do not request any scroll positioning.
-                chatContentSnapshot = latest
-                return
-            }
-            mergeLiveChatContent(from: latest)
-        }
-    }
-
-    private func beginInitialBottomPositioning() {
-        // A new conversation has no history to measure or scroll. Revealing
-        // the empty composer immediately also avoids waiting on a ScrollView
-        // layout pass that may never report a usable bottom offset.
-        if expectedThreadID?.hasPrefix("new-") == true {
-            isInitialBottomScrollInProgress = false
-            isPreparingInitialLayout = false
-            return
-        }
-        initialBottomScrollGeneration += 1
-        let generation = initialBottomScrollGeneration
-        isInitialBottomScrollInProgress = true
-        isPreparingInitialLayout = true
-        DispatchQueue.main.async {
-            guard initialBottomScrollGeneration == generation,
-                  isFollowingChatBottom else { return }
-            scrollToBottomRequest += 1
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-            guard initialBottomScrollGeneration == generation else { return }
-            isInitialBottomScrollInProgress = false
-            isPreparingInitialLayout = false
-        }
-    }
-
-    private func resetChatLayoutForNewThread() {
-        chatScrollController.cancelCurrentScroll()
-        initialBottomScrollGeneration += 1
-        explicitScrollGeneration += 1
-        messagePositioningGeneration += 1
-        processLayoutGeneration += 1
-        scrollTargetMessageID = nil
-        chatContentSnapshot = .empty
-        hasLoadedChatContent = false
-        isPreparingInitialLayout = expectedThreadID?.hasPrefix("new-") != true
-        isInitialBottomScrollInProgress = false
-        isMessagePositioningInProgress = false
-        isProcessLayoutChangeInProgress = false
-        processExpansionScrollOffset = nil
-        olderHistoryScrollSnapshot = nil
-        isAtChatBottom = true
-        isFollowingChatBottom = true
-        isUserScrollingChat = false
-    }
-
-    private func shouldReplaceForCompletedProcess(with latest: ChatScrollContent) -> Bool {
-        let currentIDs = Set(chatContentSnapshot.messages.map(\.id))
-        let latestIDs = Set(latest.messages.map(\.id))
-        let introducedProcessSummary = latest.messages.contains {
-            $0.role == .processSummary && !currentIDs.contains($0.id)
-        }
-        let removesLiveRows = chatContentSnapshot.messages.contains {
-            !latestIDs.contains($0.id)
-        }
-        return introducedProcessSummary && removesLiveRows
-    }
-
-    private func mergeLiveChatContent(from latest: ChatScrollContent) {
-        let existingIDs = Set(chatContentSnapshot.messages.map(\.id))
-        let latestIDs = Set(latest.messages.map(\.id))
-        // Keep the server's canonical order. Only retain rows that are still
-        // live and have not reached the persisted snapshot yet; preserving
-        // removed rows in the old order caused jumps and blank sections.
-        var messages = latest.messages
-        messages.append(contentsOf: chatContentSnapshot.messages.filter {
-            existingIDs.contains($0.id) && !latestIDs.contains($0.id)
-                && !$0.id.hasPrefix("outgoing-")
-        })
-
-        chatContentSnapshot = ChatScrollContent(
-            messages: messages,
-            approvals: latest.approvals,
-            active: latest.active
-        )
-    }
-
     private func showLatestChatContent() {
-        beginExplicitScroll()
-        if isFollowingChatBottom {
-            updateChatContent(force: true)
-            return
-        }
-        isFollowingChatBottom = true
-    }
-
-    private func beginExplicitScroll() {
-        explicitScrollGeneration += 1
-        let generation = explicitScrollGeneration
-        isExplicitScrollInProgress = true
-        // A button tap can arrive while UIScrollView is still decelerating.
-        // Cancel that native motion before changing follow state; otherwise
-        // the scroll-phase callback can leave isUserScrollingChat=true and
-        // the bottom request will be rejected until the deceleration ends.
-        chatScrollController.cancelCurrentScroll()
-        isUserScrollingChat = false
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) {
-            guard explicitScrollGeneration == generation else { return }
-            isExplicitScrollInProgress = false
-        }
-    }
-
-    private func beginProcessLayoutChange(expanding: Bool, restorePosition: Bool) {
-        processLayoutGeneration += 1
-        let generation = processLayoutGeneration
-        chatScrollController.cancelCurrentScroll()
-        isFollowingChatBottom = false
-        isProcessLayoutChangeInProgress = true
-
-        if expanding {
-            processExpansionScrollOffset = chatScrollController.currentContentOffset()
-        } else if restorePosition, let offset = processExpansionScrollOffset {
-            processExpansionScrollOffset = nil
-            let restoreSavedPosition = {
-                guard processLayoutGeneration == generation else { return }
-                _ = chatScrollController.restoreContentOffset(offset)
-            }
-            DispatchQueue.main.async(execute: restoreSavedPosition)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: restoreSavedPosition)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.22, execute: restoreSavedPosition)
-        } else {
-            processExpansionScrollOffset = nil
-        }
-
-        // Long histories need several LazyVStack layout passes. During that
-        // window, do not interpret content-height changes as a reason to
-        // resume bottom following.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
-            guard processLayoutGeneration == generation else { return }
-            isProcessLayoutChangeInProgress = false
-            isAtChatBottom = chatScrollController.isAtBottom()
+        let thread = viewModel.selectedThreadID
+        Task {
+            await viewModel.restoreLatestWindow()
+            guard viewModel.selectedThreadID == thread else { return }
+            isFollowingChatBottom = true
+            chatListActions.showLatest()
         }
     }
 
     private func showMessage(_ messageID: String, highlightQuery: String? = nil) {
-        messagePositioningGeneration += 1
-        isMessagePositioningInProgress = true
-        beginExplicitScroll()
-        chatScrollController.cancelCurrentScroll()
-        isFollowingChatBottom = false
-        isAtChatBottom = false
-        messageTextHighlight = highlightQuery.flatMap { query in
-            let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : MessageTextHighlight(messageID: messageID, query: trimmed)
+        if !viewModel.renderedMessages.contains(where: { $0.id == messageID }),
+           let threadID = viewModel.selectedThreadID,
+           let item = viewModel.messageIndex.first(where: { $0.id == messageID }) {
+            viewModel.requestMessageJump(threadID: threadID, messageID: messageID, turnID: item.turnId, query: highlightQuery ?? "")
+            return
         }
-        chatContentSnapshot = currentChatContent
-        hasLoadedChatContent = true
-        DispatchQueue.main.async {
-            scrollTargetMessageID = messageID
-        }
+        messageTextHighlight = highlightQuery.map { MessageTextHighlight(messageID: messageID, query: $0) }
+        chatListActions.showMessage(messageID)
     }
 
     private func fulfillPendingMessageJumpIfPossible() {
         guard !viewModel.isOpeningThread,
               let request = viewModel.pendingMessageJump,
-              request.threadID == viewModel.selectedThreadID,
-              viewModel.renderedMessages.contains(where: { $0.id == request.messageID }) else { return }
+              request.threadID == viewModel.selectedThreadID else { return }
+        if !viewModel.renderedMessages.contains(where: { $0.id == request.messageID }) {
+            guard loadingJumpID != request.messageID else { return }
+            loadingJumpID = request.messageID
+            Task {
+                let loaded = await viewModel.loadMessageFromIndex(messageID: request.messageID, turnID: request.turnID)
+                loadingJumpID = nil
+                guard viewModel.pendingMessageJump == request else { return }
+                viewModel.clearMessageJumpRequest()
+                if loaded { showMessage(request.messageID, highlightQuery: request.query) }
+                else { viewModel.status = "没有找到目标消息，请重试" }
+            }
+            return
+        }
         viewModel.clearMessageJumpRequest()
         showMessage(request.messageID, highlightQuery: request.query)
     }
@@ -1451,208 +1059,7 @@ private struct AgentBuiltInCommand: Identifiable {
     var id: String { command }
 }
 
-private final class ChatScrollController: ObservableObject {
-    private weak var scrollView: UIScrollView?
 
-    func attach(_ scrollView: UIScrollView) {
-        self.scrollView = scrollView
-    }
-
-    func detach() {
-        scrollView = nil
-    }
-
-    func isAtBottom(tolerance: CGFloat = 24) -> Bool {
-        guard let scrollView, scrollView.window != nil else { return false }
-        let minimumY = -scrollView.adjustedContentInset.top
-        let maximumY = max(
-            minimumY,
-            scrollView.contentSize.height
-                - scrollView.bounds.height
-                + scrollView.adjustedContentInset.bottom
-        )
-        return maximumY - scrollView.contentOffset.y <= tolerance
-    }
-
-    func currentContentOffset() -> CGPoint? {
-        guard let scrollView, scrollView.window != nil else { return nil }
-        return scrollView.contentOffset
-    }
-
-    func contentSizeHeight() -> CGFloat {
-        scrollView?.layoutIfNeeded()
-        return scrollView?.contentSize.height ?? 0
-    }
-
-    @discardableResult
-    func restoreContentOffset(_ offset: CGPoint) -> Bool {
-        guard let scrollView, scrollView.window != nil else { return false }
-        scrollView.layoutIfNeeded()
-        let minimumY = -scrollView.adjustedContentInset.top
-        let maximumY = max(
-            minimumY,
-            scrollView.contentSize.height
-                - scrollView.bounds.height
-                + scrollView.adjustedContentInset.bottom
-        )
-        let targetY = min(max(offset.y, minimumY), maximumY)
-        scrollView.setContentOffset(CGPoint(x: offset.x, y: targetY), animated: false)
-        return true
-    }
-
-    func cancelCurrentScroll() {
-        guard let scrollView, scrollView.window != nil else { return }
-        let currentOffset = scrollView.contentOffset
-        scrollView.layer.removeAllAnimations()
-        scrollView.setContentOffset(currentOffset, animated: false)
-        // Cancel both a finger-owned gesture and UIKit deceleration. The
-        // search positioning transaction takes ownership immediately after.
-        scrollView.panGestureRecognizer.isEnabled = false
-        scrollView.panGestureRecognizer.isEnabled = true
-    }
-}
-
-private struct ChatScrollViewResolver: UIViewRepresentable {
-    let controller: ChatScrollController
-
-    func makeUIView(context: Context) -> ResolverView {
-        ResolverView(controller: controller)
-    }
-
-    func updateUIView(_ uiView: ResolverView, context: Context) {
-        uiView.controller = controller
-        uiView.resolveScrollView()
-    }
-
-    static func dismantleUIView(_ uiView: ResolverView, coordinator: ()) {
-        uiView.controller.detach()
-    }
-
-    final class ResolverView: UIView {
-        var controller: ChatScrollController
-
-        init(controller: ChatScrollController) {
-            self.controller = controller
-            super.init(frame: .zero)
-            isUserInteractionEnabled = false
-        }
-
-        @available(*, unavailable)
-        required init?(coder: NSCoder) {
-            fatalError("init(coder:) has not been implemented")
-        }
-
-        override func didMoveToSuperview() {
-            super.didMoveToSuperview()
-            resolveScrollView()
-        }
-
-        override func didMoveToWindow() {
-            super.didMoveToWindow()
-            resolveScrollView()
-        }
-
-        func resolveScrollView() {
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                var ancestor = self.superview
-                while let view = ancestor {
-                    if let scrollView = view as? UIScrollView {
-                        self.controller.attach(scrollView)
-                        return
-                    }
-                    ancestor = view.superview
-                }
-            }
-        }
-    }
-}
-
-private extension View {
-    @ViewBuilder
-    func trackChatScroll(
-        isAtBottom: Binding<Bool>,
-        isFollowingBottom: Binding<Bool>,
-        isExplicitScrollInProgress: Binding<Bool>,
-        isUserScrolling: Binding<Bool>,
-        isLayoutChangeInProgress: Binding<Bool>,
-        isFollowRestorationDisabled: @escaping () -> Bool,
-        nativeIsAtBottom: @escaping () -> Bool
-    ) -> some View {
-        if #available(iOS 18.0, *) {
-            self.onScrollGeometryChange(for: Bool.self) { geometry in
-                let visibleBottom = geometry.contentOffset.y + geometry.containerSize.height
-                let distanceToBottom = geometry.contentSize.height - visibleBottom
-                return geometry.contentSize.height <= geometry.containerSize.height || distanceToBottom <= 24
-            } action: { _, atBottom in
-                isAtBottom.wrappedValue = atBottom
-                // Scroll geometry can deliver its final bottom value just
-                // after the phase changes to idle. Restore follow mode here
-                // as well so that event ordering cannot leave a stale button.
-                if atBottom
-                    && !isUserScrolling.wrappedValue
-                    && !isLayoutChangeInProgress.wrappedValue
-                    && !isExplicitScrollInProgress.wrappedValue
-                    && !isFollowRestorationDisabled() {
-                    isFollowingBottom.wrappedValue = true
-                }
-            }
-            .onScrollPhaseChange { _, phase in
-                switch phase {
-                case .tracking, .interacting, .decelerating:
-                    guard !isExplicitScrollInProgress.wrappedValue else { break }
-                    isUserScrolling.wrappedValue = true
-                    // Any user-initiated scroll leaves follow mode. Do not
-                    // automatically restore it when scrolling becomes idle:
-                    // an upward drag that starts at the bottom can still be
-                    // reported as "at bottom" for a moment, which previously
-                    // caused the next content update to jump back down.
-                    // Follow mode is restored only after the gesture really
-                    // settles at the bottom (see the idle case below), or by
-                    // showLatestChatContent().
-                    isFollowingBottom.wrappedValue = false
-                case .idle:
-                    isUserScrolling.wrappedValue = false
-                    // SwiftUI's geometry can lag behind the final rubber-band
-                    // position. Reconcile against the underlying UIScrollView
-                    // now and once more on the next run loop after layout.
-                    let reconcileBottom = {
-                        let atBottom = nativeIsAtBottom()
-                        isAtBottom.wrappedValue = atBottom
-                        if atBottom
-                            && !isLayoutChangeInProgress.wrappedValue
-                            && !isExplicitScrollInProgress.wrappedValue
-                            && !isFollowRestorationDisabled() {
-                            isFollowingBottom.wrappedValue = true
-                        }
-                    }
-                    reconcileBottom()
-                    DispatchQueue.main.async(execute: reconcileBottom)
-                default:
-                    break
-                }
-            }
-        } else {
-            self.simultaneousGesture(
-                DragGesture(minimumDistance: 2)
-                    .onChanged { _ in
-                        guard !isExplicitScrollInProgress.wrappedValue else { return }
-                        isUserScrolling.wrappedValue = true
-                        isAtBottom.wrappedValue = false
-                        isFollowingBottom.wrappedValue = false
-                    }
-                    .onEnded { _ in
-                        isUserScrolling.wrappedValue = false
-                        if isAtBottom.wrappedValue
-                            && !isExplicitScrollInProgress.wrappedValue
-                            && !isFollowRestorationDisabled() {
-                            isFollowingBottom.wrappedValue = true
-                        }
-                    }
-            )
-        }
-    }
-}
 
 private struct TokenUsageSheet: View {
     let usage: CloudexUsage?
@@ -1764,7 +1171,7 @@ private struct PendingSteerBubble: View {
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 11)
-            .background(Color.blue.opacity(0.14), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .cloudexSurface(radius: 18, selected: true)
         }
     }
 }
@@ -1861,12 +1268,13 @@ private struct MessageBubble: View, Equatable {
     }
 
     private var messageContent: some View {
-        VStack(alignment: .leading, spacing: 5) {
+        VStack(alignment: .leading, spacing: 9) {
             HStack(spacing: 6) {
                 if message.role == .user || message.role == .assistant {
-                    Circle()
-                        .fill(message.role == .user ? Color.teal : Color.orange)
-                        .frame(width: 6, height: 6)
+                    Image(systemName: message.role == .user ? "person.crop.circle" : "sparkle")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(CloudexTheme.accent)
+                        .accessibilityHidden(true)
                 }
                 Text(roleTitle)
                     .font(.caption2.weight(.semibold))
@@ -1899,14 +1307,15 @@ private struct MessageBubble: View, Equatable {
                                 }
                                 if attachment.kind == .image, let path = attachment.path {
                                     AttachmentThumbnail(path: path, server: client.serverURL, client: client)
-                                        .frame(maxWidth: 260, maxHeight: 220)
-                                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                                    .frame(maxWidth: 230)
+                                    .frame(height: 160)
+                                        .clipShape(RoundedRectangle(cornerRadius: 12))
                                         .accessibilityLabel(attachment.name)
                                 }
                             }
                             .padding(.horizontal, 9)
                             .padding(.vertical, 7)
-                            .background(Color(.systemGray6), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                            .cloudexSurface(radius: 15)
                         }
                     }
                     .padding(.bottom, message.text.isEmpty ? 0 : 3)
@@ -1935,21 +1344,21 @@ private struct MessageBubble: View, Equatable {
 
             messageFooter
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 13)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 15)
         .frame(minWidth: 0)
         .frame(
             maxWidth: message.role == .assistant || message.role == .error ? .infinity : nil,
             alignment: .leading
         )
         .background(messageBackground,
-                    in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    in: RoundedRectangle(cornerRadius: 20, style: .continuous))
         .overlay {
             if message.role == .error {
-                RoundedRectangle(cornerRadius: 10).stroke(Color.red.opacity(0.3))
+                RoundedRectangle(cornerRadius: 20).stroke(Color.red.opacity(0.3))
             } else if message.role == .assistant || message.role == .user {
-                RoundedRectangle(cornerRadius: 10)
-                    .stroke(Color(.separator).opacity(0.25), lineWidth: 0.6)
+                RoundedRectangle(cornerRadius: 20)
+                    .stroke(CloudexTheme.line.opacity(0.4), lineWidth: 0.6)
             }
         }
     }
@@ -2051,8 +1460,8 @@ private struct MessageBubble: View, Equatable {
 
     private var messageBackground: Color {
         switch message.role {
-        case .user: return Color.teal.opacity(0.13)
-        case .assistant: return Color(.secondarySystemBackground)
+        case .user: return CloudexTheme.userBubble.opacity(0.88)
+        case .assistant: return CloudexTheme.surface.opacity(0.78)
         default: return .clear
         }
     }
@@ -2070,7 +1479,7 @@ private struct MessageBubble: View, Equatable {
                     .foregroundStyle(.secondary)
             }
             if message.id.hasPrefix("outgoing-") {
-                Text(message.executionStatus == "sent" ? "已发送" : "发送中…")
+                Text(message.executionStatus == "unconfirmed" ? "发送结果待确认" : (message.executionStatus == "sent" ? "已发送" : "发送中…"))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
@@ -2158,12 +1567,16 @@ private struct ProcessSummaryBubble: View {
     let onInteraction: (Bool) -> Void
     let onFloatingCollapse: () -> Void
     let onFloatingStateChange: (Bool) -> Void
-    @State private var expanded = false
+    private var expanded: Bool {
+        get { viewModel.expandedProcessIDs.contains(message.id) }
+        nonmutating set { viewModel.setProcessExpanded(message.id, expanded: newValue) }
+    }
     @State private var expansionGeneration = 0
     @State private var expandedContentHeight: CGFloat = 0
     @State private var collapseButtonVisible = true
     @State private var bubbleVisible = true
     @State private var loadingDetails = false
+    @State private var detailsError: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -2180,7 +1593,9 @@ private struct ProcessSummaryBubble: View {
                             expanded = true
                         }
                     } else if let turnID = message.sourceTurnID, !loadingDetails {
+                        onInteraction(true)
                         loadingDetails = true
+                        detailsError = nil
                         Task {
                             let loaded = await viewModel.loadTurnDetails(turnID: turnID)
                             loadingDetails = false
@@ -2189,24 +1604,29 @@ private struct ProcessSummaryBubble: View {
                                 withAnimation(.easeInOut(duration: 0.3)) {
                                     expanded = true
                                 }
+                            } else {
+                                detailsError = "过程详情加载失败，点击重试"
                             }
                         }
                     }
                 } label: {
                     HStack(spacing: 8) {
-                        Image(systemName: "chevron.right.circle.fill")
-                            .foregroundStyle(.secondary)
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(CloudexTheme.accent)
                             .rotationEffect(.degrees(expanded ? 90 : 0))
                         MarkdownText(document: message.markdown, fallbackText: message.text)
-                            .font(.body.weight(.semibold))
+                            .font(.subheadline.weight(.medium))
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.leading)
                         Spacer(minLength: 0)
                     }
+                    .frame(minHeight: 24)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityIdentifier("process-toggle-\(message.sourceTurnID ?? message.id)")
                 .modifier(ScrollVisibilityModifier { visible in
                     collapseButtonVisible = visible
                     updateFloatingState()
@@ -2214,6 +1634,9 @@ private struct ProcessSummaryBubble: View {
 
                 if expanded {
                     VStack(alignment: .leading, spacing: 8) {
+                        if (message.processItems ?? []).isEmpty {
+                            Text("暂无过程详情").foregroundStyle(.secondary)
+                        }
                         ForEach(message.processItems ?? []) { item in
                             if item.role == .execution {
                                 ExecutionStepRow(message: item)
@@ -2249,9 +1672,12 @@ private struct ProcessSummaryBubble: View {
                         }
                     }
                 }
+                if loadingDetails { ProgressView("正在读取过程…") }
+                if let detailsError { Text(detailsError).font(.caption).foregroundStyle(.red) }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
+            .cloudexSurface(radius: 16)
             // Keep the expanded process content constrained to the same
             // bubble width as its header. Without an explicit finite width,
             // long shell commands and diff rows can make the VStack choose
@@ -2259,7 +1685,6 @@ private struct ProcessSummaryBubble: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         .frame(maxWidth: .infinity, alignment: .leading)
         .onChange(of: message.id) { _, _ in
-            expanded = false
             expansionGeneration += 1
             expandedContentHeight = 0
             collapseButtonVisible = true
@@ -3514,6 +2939,7 @@ private struct MessageJumpListView: View {
     var showsNavigationChrome = true
     @State private var pendingSelection: MessageJumpItem?
     @State private var selectedSubpage = ConversationSubpage.conversation
+    @State private var visitedSubpages: Set<ConversationSubpage> = [.conversation]
 
     var body: some View {
         VStack(spacing: 0) {
@@ -3537,21 +2963,25 @@ private struct MessageJumpListView: View {
                     .allowsHitTesting(selectedSubpage == .conversation)
                     .accessibilityHidden(selectedSubpage != .conversation)
 
-                WorkspaceFilesView(rootPath: workspaceRoot)
+                if visitedSubpages.contains(.files) { WorkspaceFilesView(rootPath: workspaceRoot)
                     .environmentObject(viewModel)
                     .id(workspaceRoot)
                     .opacity(selectedSubpage == .files ? 1 : 0)
                     .allowsHitTesting(selectedSubpage == .files)
                     .accessibilityHidden(selectedSubpage != .files)
+                }
 
-                ProjectReviewView(rootPath: workspaceRoot)
+                if visitedSubpages.contains(.review) { ProjectReviewView(rootPath: workspaceRoot)
                     .environmentObject(viewModel)
                     .id(workspaceRoot)
                     .opacity(selectedSubpage == .review ? 1 : 0)
                     .allowsHitTesting(selectedSubpage == .review)
                     .accessibilityHidden(selectedSubpage != .review)
+                }
             }
         }
+        .onChange(of: selectedSubpage) { _, page in visitedSubpages.insert(page) }
+        .onChange(of: workspaceRoot) { _, _ in visitedSubpages = [.conversation, selectedSubpage] }
         .modifier(DirectoryNavigationChromeModifier(
             isVisible: showsNavigationChrome,
             onExpand: onExpand
@@ -3667,28 +3097,11 @@ extension View {
     }
 
     @ViewBuilder
-    func followChatViewportBottom(_ following: Bool) -> some View {
-        if #available(iOS 18.0, *) {
-            self.defaultScrollAnchor(following ? .bottom : nil, for: .sizeChanges)
-        } else {
-            self.defaultScrollAnchor(following ? .bottom : nil)
-        }
-    }
-
-    @ViewBuilder
     func liquidGlass<S: Shape>(
         in shape: S,
         interactive: Bool = false,
         tint: Color? = nil
     ) -> some View {
-        if #available(iOS 26.0, *) {
-            let glass = Glass.regular.tint(tint).interactive(interactive)
-            self.glassEffect(glass, in: shape)
-        } else {
-            self
-                .background(.ultraThinMaterial, in: shape)
-                .background((tint ?? .clear), in: shape)
-                .overlay(shape.stroke(Color.white.opacity(0.3), lineWidth: 0.7))
-        }
+        modifier(CloudexGlassModifier(shape: shape, interactive: interactive, tint: tint))
     }
 }

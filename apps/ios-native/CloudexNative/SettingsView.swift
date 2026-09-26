@@ -29,13 +29,27 @@ struct SettingsView: View {
                         scannerErrorMessage = ""
                         showingQRCodeScanner = true
                     } label: {
-                        Label("扫描服务器二维码", systemImage: "qrcode.viewfinder")
+                        HStack(spacing: 12) {
+                            settingsIcon("qrcode.viewfinder")
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("扫描服务器二维码").font(.subheadline.weight(.semibold))
+                                Text("将电脑连接到 Cloudex").font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+                        }
+                        .padding(.vertical, 4)
                     }
+                    .buttonStyle(.plain)
                     Button {
                         showingNewProfile = true
                     } label: {
-                        Label("新建服务器", systemImage: "plus.circle.fill")
+                        HStack(spacing: 12) {
+                            settingsIcon("plus")
+                            Text("新建服务器").font(.subheadline.weight(.medium))
+                        }
                     }
+                    .buttonStyle(.plain)
                     if viewModel.serverProfiles.isEmpty {
                         Text("添加一个局域网或 Tailscale 服务器")
                             .font(.footnote)
@@ -46,8 +60,7 @@ struct SettingsView: View {
                                 editingProfile = profile
                             } label: {
                                 HStack(spacing: 10) {
-                                    Image(systemName: "server.rack")
-                                        .foregroundStyle(.secondary)
+                                    settingsIcon("server.rack")
                                     VStack(alignment: .leading, spacing: 2) {
                                         Text(profile.name)
                                             .fontWeight(.medium)
@@ -72,9 +85,14 @@ struct SettingsView: View {
                             .buttonStyle(.plain)
                         }
                     }
+                } header: {
+                    Text("连接与服务器")
                 }
+                .listRowBackground(CloudexTheme.surface.opacity(0.85))
 
                 Section("当前连接") {
+                    LabeledContent("App 构建", value: "\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""))")
+                    LabeledContent("代码版本", value: Bundle.main.object(forInfoDictionaryKey: "CloudexSourceRevision") as? String ?? "development")
                     LabeledContent("服务器", value: viewModel.serverProfileTitle)
                     LabeledContent("地址", value: viewModel.serverURL)
                     LabeledContent("状态", value: viewModel.status)
@@ -93,8 +111,17 @@ struct SettingsView: View {
                 }
 
             }
+            .scrollContentBackground(.hidden)
+            .background(CloudexTheme.canvas)
+            .listRowBackground(CloudexTheme.surface.opacity(0.85))
+            .tint(CloudexTheme.accent)
             .navigationTitle("设置")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("完成") { isPresented = false }
+                        .fontWeight(.semibold)
+                }
                 ToolbarItem(placement: .topBarLeading) {
                     Button {
                         Task {
@@ -148,6 +175,15 @@ struct SettingsView: View {
                 Text(scannerErrorMessage)
             }
         }
+    }
+
+    private func settingsIcon(_ name: String) -> some View {
+        Image(systemName: name)
+            .font(.system(size: 17, weight: .medium))
+            .foregroundStyle(CloudexTheme.accent)
+            .frame(width: 36, height: 36)
+            .background(CloudexTheme.accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 11))
+            .accessibilityHidden(true)
     }
 
     private func connect(using code: String) {

@@ -13,7 +13,11 @@ struct CloudexNativeApp: App {
 
     var body: some Scene {
         WindowGroup {
-            CloudexRootView()
+            CloudexRootView(viewModel: viewModel)
+                .tint(CloudexTheme.accent)
+                #if DEBUG
+                .preferredColorScheme(ProcessInfo.processInfo.arguments.contains("--ui-dark-fixture") ? .dark : nil)
+                #endif
                 .environmentObject(viewModel)
                 .onAppear {
                     CloudexAppDelegate.notifications.attach(viewModel: viewModel)
@@ -56,7 +60,7 @@ final class CloudexNotificationManager: NSObject, UNUserNotificationCenterDelega
     private var appIsInForeground = true
 
     func configure() {
-        #if DEBUG && targetEnvironment(simulator)
+        #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("--ui-fixture") { return }
         #endif
         let center = UNUserNotificationCenter.current()

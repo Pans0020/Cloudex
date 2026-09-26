@@ -1,6 +1,6 @@
 import Foundation
 
-struct CachedThreadDetail: Codable {
+struct CachedThreadDetail: Codable, Equatable {
     let threadID: String
     let detail: ThreadDetail
     let savedAt: Double
@@ -45,7 +45,7 @@ final class LocalConversationCache {
     func saveThread(_ snapshot: CachedThreadDetail, profileID: String) {
         queue.async {
             let compact = CachedThreadDetail(threadID: snapshot.threadID, detail: self.compactDetail(snapshot.detail),
-                savedAt: snapshot.savedAt, liveMessages: snapshot.liveMessages,
+                savedAt: Date().timeIntervalSince1970, liveMessages: snapshot.liveMessages,
                 liveMessageTurnIDs: snapshot.liveMessageTurnIDs, pendingOutgoing: snapshot.pendingOutgoing,
                 liveRunning: snapshot.liveRunning)
             self.write(compact, to: self.threadFileURL(snapshot.threadID, profileID: profileID))

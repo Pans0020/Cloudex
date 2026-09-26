@@ -38,8 +38,9 @@ struct WorkspaceFilesView: View {
                         } label: {
                             HStack(spacing: 12) {
                                 Image(systemName: iconName(for: entry))
-                                    .foregroundStyle(entry.isDirectory ? .blue : .secondary)
-                                    .frame(width: 24)
+                                    .foregroundStyle(entry.isDirectory ? CloudexTheme.accent : .secondary)
+                                    .frame(width: 36, height: 36)
+                                    .background(CloudexTheme.accent.opacity(0.055), in: RoundedRectangle(cornerRadius: 10))
                                 VStack(alignment: .leading, spacing: 3) {
                                     Text(entry.name)
                                         .foregroundStyle(.primary)
@@ -68,7 +69,9 @@ struct WorkspaceFilesView: View {
                         .buttonStyle(.plain)
                         .disabled(previewLoadingPath != nil)
                     }
-                    .listStyle(.plain)
+                    .listStyle(.insetGrouped)
+                    .scrollContentBackground(.hidden)
+                    .background(CloudexTheme.canvas)
                     .refreshable { await load() }
                 }
             }
@@ -651,7 +654,7 @@ struct WorkspacePathBar: View {
                                     HStack(spacing: 5) {
                                         Image(systemName: isCurrent ? "folder.fill" : "folder")
                                             .font(.caption)
-                                            .foregroundStyle(isCurrent ? .blue : .secondary)
+                                            .foregroundStyle(isCurrent ? CloudexTheme.accent : .secondary)
                                         Text(item.name)
                                             .font(.caption.weight(isCurrent ? .semibold : .regular))
                                             .lineLimit(1)

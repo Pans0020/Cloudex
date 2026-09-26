@@ -1,6 +1,80 @@
 import XCTest
 
 final class CloudexUITests: XCTestCase {
+    func testGlassAppearanceInLightAndDark() {
+        continueAfterFailure = false
+        for dark in [false, true] {
+            let app = XCUIApplication()
+            app.launchArguments = ["--ui-fixture", "-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN"]
+            if dark { app.launchArguments.append("--ui-dark-fixture") }
+            app.launch()
+            XCTAssertTrue(app.buttons["展开CV"].waitForExistence(timeout: 10))
+            let mode = dark ? "dark" : "light"
+            snapshot("glass-\(mode)-home-collapsed")
+            app.buttons["展开CV"].tap()
+            snapshot("glass-\(mode)-home-expanded")
+            app.buttons["打开设置"].tap()
+            XCTAssertTrue(app.staticTexts["扫描服务器二维码"].waitForExistence(timeout: 5))
+            snapshot("glass-\(mode)-settings")
+            app.buttons["完成"].tap()
+            app.buttons.containing(.staticText, identifier: "布局回归 CV").firstMatch.tap()
+            let chat = app.collectionViews["chat-history"]
+            XCTAssertTrue(chat.waitForExistence(timeout: 10))
+            XCTAssertTrue(app.buttons["发送消息"].exists)
+            snapshot("glass-\(mode)-conversation")
+            XCTAssertTrue(chat.staticTexts.allElementsBoundByIndex.contains { $0.isHittable })
+            app.terminate()
+        }
+    }
+
+    func testProcessPositionSurvivesLoadingFailureAndExpansion() {
+        verifyProcessPosition(empty: false)
+    }
+
+    func testEmptyProcessDetailsKeepTheirHeader() {
+        verifyProcessPosition(empty: true)
+    }
+
+    private func verifyProcessPosition(empty: Bool) {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--ui-fixture", "--ui-process-fixture", "-AppleLanguages", "(zh-Hans)"]
+        if empty { app.launchArguments.append("--ui-process-empty-fixture") }
+        app.launch()
+        XCTAssertTrue(app.buttons["展开CV"].waitForExistence(timeout: 10))
+        app.buttons["展开CV"].tap()
+        app.buttons.containing(.staticText, identifier: "布局回归 CV").firstMatch.tap()
+        let process = app.buttons["process-toggle-ui-turn-5"]
+        XCTAssertTrue(process.waitForExistence(timeout: 10))
+        let answer = app.descendants(matching: .any)["message-ui-answer-5"].firstMatch
+        XCTAssertLessThan(process.frame.minY, answer.frame.minY)
+        process.tap()
+        XCTAssertTrue(app.staticTexts["过程详情加载失败，点击重试"].waitForExistence(timeout: 5))
+        XCTAssertTrue(process.isHittable, "Failed load must not remove the header")
+        let y = process.frame.minY
+        process.tap()
+        XCTAssertTrue(app.staticTexts[empty ? "暂无过程详情" : "过程详情加载成功"].waitForExistence(timeout: 5))
+        XCTAssertTrue(process.isHittable)
+        XCTAssertEqual(process.frame.minY, y, accuracy: 10, "Loading details must not move the process header")
+        snapshot(empty ? "empty-process-header-retained" : "process-order-after-load")
+    }
+
+    func testFastScrollingNeverNeedsARecoveryGesture() {
+        let app = scrollingApp(extraArguments: ["--ui-uneven-fixture"])
+        app.buttons["展开CV"].tap()
+        app.buttons.containing(.staticText, identifier: "滚动回归 0").firstMatch.tap()
+        let chat = app.collectionViews["chat-history"]
+        XCTAssertTrue(chat.waitForExistence(timeout: 10))
+        for index in 0..<12 {
+            if index % 4 < 2 { chat.swipeDown(velocity: .fast) } else { chat.swipeUp(velocity: .fast) }
+            // Check BEFORE any recovery gesture; a blank viewport is a failure.
+            snapshot("immediate-scroll-\(index)")
+            XCTAssertTrue(chat.staticTexts.allElementsBoundByIndex.contains { $0.isHittable && !$0.label.isEmpty })
+            XCTAssertTrue(app.navigationBars.firstMatch.isHittable)
+            XCTAssertTrue(app.descendants(matching: .any)["message-input"].firstMatch.isHittable)
+        }
+    }
+
     func testConversationCacheSurvivesReopenAndStaleSnapshots() {
         let app = XCUIApplication()
         app.launchArguments = ["--ui-cache-regression", "-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN"]
@@ -16,7 +90,7 @@ final class CloudexUITests: XCTestCase {
         XCTAssertTrue(app.buttons["展开CV"].waitForExistence(timeout: 10))
         app.buttons["展开CV"].tap()
         app.buttons.containing(.staticText, identifier: "布局回归 CV").firstMatch.tap()
-        let chat = app.scrollViews["chat-history"]
+        let chat = app.collectionViews["chat-history"]
         let first = app.staticTexts["检查第 1 轮消息"]
         for _ in 0..<8 {
             if first.isHittable { break }
@@ -49,7 +123,7 @@ final class CloudexUITests: XCTestCase {
         app.buttons["展开Calcu"].tap()
         app.buttons.containing(.staticText, identifier: "布局回归 Calcu").firstMatch.tap()
         XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "message-input").firstMatch.waitForExistence(timeout: 5))
-        XCTAssertTrue(app.scrollViews["chat-history"].isHittable, "An empty conversation must finish initial positioning")
+        XCTAssertTrue(app.collectionViews["chat-history"].isHittable, "An empty conversation must finish initial positioning")
         let stale = app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "流式输出：")).firstMatch
         let leaked = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == true"), object: stale)
         leaked.isInverted = true
@@ -77,7 +151,7 @@ final class CloudexUITests: XCTestCase {
         let app = scrollingApp(extraArguments: ["--ui-uneven-fixture"])
         app.buttons["展开CV"].tap()
         app.buttons.containing(.staticText, identifier: "滚动回归 0").firstMatch.tap()
-        let chat = app.scrollViews["chat-history"]
+        let chat = app.collectionViews["chat-history"]
         let last = app.staticTexts["这是实际的最后一条回复。"]
         XCTAssertTrue(last.waitForExistence(timeout: 10))
         for iteration in 0..<3 {
@@ -97,7 +171,7 @@ final class CloudexUITests: XCTestCase {
         let app = scrollingApp()
         app.buttons["展开CV"].tap()
         app.buttons.containing(.staticText, identifier: "滚动回归 0").firstMatch.tap()
-        let chat = app.scrollViews["chat-history"]
+        let chat = app.collectionViews["chat-history"]
         XCTAssertTrue(chat.waitForExistence(timeout: 10))
         let latestCode = app.staticTexts["let count = 35\nprint(count)"]
         XCTAssertTrue(latestCode.waitForExistence(timeout: 5))
@@ -124,7 +198,7 @@ final class CloudexUITests: XCTestCase {
         let app = scrollingApp()
         app.buttons["展开CV"].tap()
         app.buttons.containing(.staticText, identifier: "滚动回归 0").firstMatch.tap()
-        let chat = app.scrollViews["chat-history"]
+        let chat = app.collectionViews["chat-history"]
         XCTAssertTrue(chat.waitForExistence(timeout: 10))
         XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "message-input").firstMatch.waitForExistence(timeout: 10))
         measureScrolling(app, element: chat)
@@ -173,7 +247,7 @@ final class CloudexUITests: XCTestCase {
         XCTAssertEqual(attachment.frame.midY, voice.frame.midY, accuracy: 3)
         XCTAssertEqual(attachment.frame.midY, model.frame.midY, accuracy: 3)
         XCTAssertLessThan(attachment.frame.maxY, input.frame.minY + 2)
-        XCTAssertLessThanOrEqual(app.scrollViews["chat-history"].frame.maxY, attachment.frame.minY)
+        XCTAssertLessThanOrEqual(app.collectionViews["chat-history"].frame.maxY, attachment.frame.minY)
         XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "attachment-thumbnail").firstMatch.exists)
         snapshot("chat-attachment")
 
@@ -186,10 +260,10 @@ final class CloudexUITests: XCTestCase {
         XCTAssertLessThan(input.frame.height, 170)
         XCTAssertLessThanOrEqual(input.frame.maxY, app.keyboards.firstMatch.frame.minY + 2)
         XCTAssertLessThan(attachment.frame.maxY, input.frame.minY + 2)
-        XCTAssertLessThanOrEqual(app.scrollViews["chat-history"].frame.maxY, attachment.frame.minY)
+        XCTAssertLessThanOrEqual(app.collectionViews["chat-history"].frame.maxY, attachment.frame.minY)
         snapshot("chat-long-input-keyboard")
 
-        let chat = app.scrollViews["chat-history"]
+        let chat = app.collectionViews["chat-history"]
         print("UI_GEOMETRY chat=\(chat.frame) input=\(input.frame) toolbar=\(attachment.frame) app=\(app.frame)")
         app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.2))
             .press(forDuration: 0.05, thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.95)))
