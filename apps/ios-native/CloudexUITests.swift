@@ -1,6 +1,13 @@
 import XCTest
 
 final class CloudexUITests: XCTestCase {
+    func testConversationCacheSurvivesReopenAndStaleSnapshots() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--ui-cache-regression", "-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN"]
+        app.launch()
+        XCTAssertTrue(app.buttons["展开缓存回归通过"].waitForExistence(timeout: 20))
+    }
+
     func testLoadingOlderMarkdownKeepsReadingPosition() {
         continueAfterFailure = false
         let app = XCUIApplication()

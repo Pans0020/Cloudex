@@ -4,27 +4,32 @@ struct CachedThreadDetail: Codable {
     let threadID: String
     let detail: ThreadDetail
     let savedAt: Double
+    var liveMessages: [ChatMessage]? = nil
+    var liveMessageTurnIDs: [String: String]? = nil
+    var pendingOutgoing: ChatMessage? = nil
+    var liveRunning: Bool? = nil
 }
 
 final class LocalConversationCache {
     static let shared = LocalConversationCache()
 
     private let rootURL: URL
+    private let queue = DispatchQueue(label: "cloudex.conversation-cache", qos: .utility)
 
-    private init() {
+    init(rootURL: URL? = nil) {
         let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-        rootURL = base.appendingPathComponent("CloudexNative", isDirectory: true)
+        self.rootURL = rootURL ?? base.appendingPathComponent("CloudexNative", isDirectory: true)
             .appendingPathComponent("ConversationCache", isDirectory: true)
-        try? FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: self.rootURL, withIntermediateDirectories: true)
     }
 
     func loadProjects(profileID: String) -> [CloudexProject]? {
-        read([CloudexProject].self, from: projectsFileURL(profileID: profileID))
+        queue.sync { read([CloudexProject].self, from: projectsFileURL(profileID: profileID)) }
     }
 
     func saveProjects(_ projects: [CloudexProject], profileID: String) {
-        write(projects, to: projectsFileURL(profileID: profileID))
+        queue.async { self.write(projects, to: self.projectsFileURL(profileID: profileID)) }
     }
 
     private func projectsFileURL(profileID: String) -> URL {
@@ -32,21 +37,25 @@ final class LocalConversationCache {
         return rootURL.appendingPathComponent("projects-\(safeID).json")
     }
 
-    func loadThreadDetail(threadID: String) -> ThreadDetail? {
-        read(CachedThreadDetail.self, from: threadFileURL(threadID)).map { compactDetail($0.detail) }
+    func loadThread(threadID: String, profileID: String) -> CachedThreadDetail? {
+        queue.sync { read(CachedThreadDetail.self, from: threadFileURL(threadID, profileID: profileID)) }
     }
 
-    func saveThreadDetail(_ detail: ThreadDetail, threadID: String) {
-        write(CachedThreadDetail(threadID: threadID, detail: compactDetail(detail), savedAt: Date().timeIntervalSince1970),
-              to: threadFileURL(threadID))
+    // Enqueue directly in presentation order; detached Tasks would reorder writes.
+    func saveThread(_ snapshot: CachedThreadDetail, profileID: String) {
+        queue.async {
+            let compact = CachedThreadDetail(threadID: snapshot.threadID, detail: self.compactDetail(snapshot.detail),
+                savedAt: snapshot.savedAt, liveMessages: snapshot.liveMessages,
+                liveMessageTurnIDs: snapshot.liveMessageTurnIDs, pendingOutgoing: snapshot.pendingOutgoing,
+                liveRunning: snapshot.liveRunning)
+            self.write(compact, to: self.threadFileURL(snapshot.threadID, profileID: profileID))
+        }
     }
 
-    func loadMessageIndex(threadID: String) -> [MessageIndexItem]? {
-        read([MessageIndexItem].self, from: messageIndexFileURL(threadID))
-    }
-
-    func saveMessageIndex(_ items: [MessageIndexItem], threadID: String) {
-        write(items, to: messageIndexFileURL(threadID))
+    func flush() async {
+        await withCheckedContinuation { continuation in
+            queue.async { continuation.resume() }
+        }
     }
 
     private func compactDetail(_ detail: ThreadDetail) -> ThreadDetail {
@@ -55,7 +64,7 @@ final class LocalConversationCache {
             // Running turns must remain lossless across app suspension or a
             // cold relaunch. There is no final assistant item yet, so reducing
             // them to a compact snapshot would retain only the latest bubble.
-            if turn.status == "inProgress" {
+            if ["inprogress", "in_progress", "active", "running"].contains(turn.status?.lowercased() ?? "") {
                 return CloudexTurn(
                     id: turn.id,
                     items: items,
@@ -98,14 +107,11 @@ final class LocalConversationCache {
         )
     }
 
-    private func threadFileURL(_ threadID: String) -> URL {
-        let safeID = threadID.replacingOccurrences(of: "/", with: "_")
-        return rootURL.appendingPathComponent("thread-\(safeID).json")
-    }
-
-    private func messageIndexFileURL(_ threadID: String) -> URL {
-        let safeID = threadID.replacingOccurrences(of: "/", with: "_")
-        return rootURL.appendingPathComponent("message-index-\(safeID).json")
+    private func threadFileURL(_ threadID: String, profileID: String) -> URL {
+        // Encode the pair, avoiding collisions from replacing slashes with underscores.
+        let key = Data("\(profileID.utf8.count):\(profileID)\(threadID)".utf8).base64EncodedString()
+            .replacingOccurrences(of: "/", with: "_")
+        return rootURL.appendingPathComponent("thread-v2-\(key).json")
     }
 
     private func read<T: Decodable>(_ type: T.Type, from url: URL) -> T? {
@@ -115,7 +121,6 @@ final class LocalConversationCache {
 
     private func write<T: Encodable>(_ value: T, to url: URL) {
         let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
         guard let data = try? encoder.encode(value) else { return }
         try? data.write(to: url, options: [.atomic])
     }

@@ -104,7 +104,10 @@ final class AppViewModel: ObservableObject {
 
     private let globalSSE = SSEClient()
     private let threadSSE = SSEClient()
-    private let conversationCache = LocalConversationCache.shared
+    private let conversationCache: LocalConversationCache
+    private var cacheCheckpointTask: Task<Void, Never>?
+    private var replayedMessageText: [String: String] = [:]
+    private var replayNeedsRefresh = false
     private var pollTask: Task<Void, Never>?
     private var healthTask: Task<Void, Never>?
     private var overviewGeneration = 0
@@ -131,7 +134,8 @@ final class AppViewModel: ObservableObject {
     private var pendingRender: (epoch: Int, id: Int, messages: [ChatMessage])?
     private var renderPreparationTask: Task<Void, Never>?
 
-    init() {
+    init(conversationCache: LocalConversationCache = .shared) {
+        self.conversationCache = conversationCache
         let defaults = UserDefaults.standard
         let savedLANURL = defaults.string(forKey: "cloudex.lanServerURL") ?? ""
         let savedTailscaleURL = defaults.string(forKey: "cloudex.tailscaleServerURL") ?? ""
@@ -277,6 +281,7 @@ final class AppViewModel: ObservableObject {
 
     private func buildMessages() -> [ChatMessage] {
         var result: [ChatMessage] = []
+        let liveByID = Dictionary(liveMessages.map { ($0.id, $0) }, uniquingKeysWith: { _, new in new })
         let liveMessagesByTurn = Dictionary(grouping: liveMessages) { message in
             liveMessageTurnIDs[message.id] ?? ""
         }
@@ -292,7 +297,8 @@ final class AppViewModel: ObservableObject {
                 var finalMessage: ChatMessage?
 
                 for (index, item) in items.enumerated() {
-                    guard let message = timelineMessage(from: item, turnID: turn.id, fallbackIndex: index) else { continue }
+                    guard let persisted = timelineMessage(from: item, turnID: turn.id, fallbackIndex: index) else { continue }
+                    let message = liveByID[persisted.id] ?? persisted
                     if item.type == "userMessage" {
                         result.append(message)
                     } else if index == finalAgentIndex {
@@ -304,8 +310,11 @@ final class AppViewModel: ObservableObject {
                 // Keep the fine-grained execution rows captured from the live
                 // event stream even when the persisted session omits them.
                 let existingProcessIDs = Set(processItems.map(\.id))
+                let itemIDs = Set(items.compactMap(\.id))
+                let hasFinalAnswer = items.contains { $0.type == "agentMessage" && $0.phase == "final_answer" }
                 processItems.append(contentsOf: (liveMessagesByTurn[turn.id] ?? []).filter {
-                    $0.role == .execution && !existingProcessIDs.contains($0.id)
+                    ($0.role == .execution && !existingProcessIDs.contains($0.id)) ||
+                    ($0.role == .assistant && $0.phase != "final_answer" && hasFinalAnswer && !itemIDs.contains($0.id))
                 })
                 if let compressedMessage { processItems.append(compressedMessage) }
                 processItems = mergeSemanticExecutionItems(processItems)
@@ -327,10 +336,14 @@ final class AppViewModel: ObservableObject {
                     finalMessage.editDiff = editDiff.isEmpty ? nil : editDiff
                     result.append(finalMessage)
                 }
+                // A terminal page can arrive before its last agent item is persisted.
+                result.append(contentsOf: (liveMessagesByTurn[turn.id] ?? []).filter {
+                    $0.role == .assistant && ($0.phase == "final_answer" || !hasFinalAnswer) && !itemIDs.contains($0.id)
+                })
             } else {
                 for (index, item) in items.enumerated() {
                     if let message = timelineMessage(from: item, turnID: turn.id, fallbackIndex: index) {
-                        result.append(message)
+                        result.append(liveByID[message.id] ?? message)
                     }
                 }
                 // Keep the original live presentation for an active turn:
@@ -375,11 +388,9 @@ final class AppViewModel: ObservableObject {
             if !persisted { result.append(pendingOutgoing) }
         }
         result.append(contentsOf: systemMessages.filter { $0.threadID == nil || $0.threadID == selectedThreadID })
-        // A new chat has no turn yet, so retain live messages until its first
-        // server snapshot arrives. Existing turns render live items above.
-        if detail?.turns.isEmpty == true {
-            result.append(contentsOf: liveMessages)
-        }
+        // New turns can be absent even when older turns are already loaded.
+        let turnIDs = Set((detail?.turns ?? []).map(\.id))
+        result.append(contentsOf: liveMessages.filter { !turnIDs.contains(liveMessageTurnIDs[$0.id] ?? "") })
         let ordered = mergeSemanticExecutionItems(result).enumerated().sorted { lhs, rhs in
             switch (lhs.element.createdAt, rhs.element.createdAt) {
             case let (left?, right?):
@@ -414,6 +425,7 @@ final class AppViewModel: ObservableObject {
     }
 
     private func rebuildRenderedMessages(invalidateInFlight: Bool = true) {
+        scheduleCacheCheckpoint()
         renderedMessagesRebuildTask?.cancel()
         renderedMessagesRebuildTask = nil
         if invalidateInFlight { renderEpoch += 1 }
@@ -1043,7 +1055,8 @@ final class AppViewModel: ObservableObject {
         ))
     }
 
-    private func beginLiveMessage(id: String, turnID: String?, text: String = "") {
+    private func beginLiveMessage(id: String, turnID: String?, text: String = "", phase: String? = nil) {
+        if threadStreamReplaying { replayedMessageText[id] = text }
         if isCompactionSummary(text) {
             suppressedCompactionMessageIDs.insert(id)
             liveMessages.removeAll { $0.id == id }
@@ -1054,15 +1067,33 @@ final class AppViewModel: ObservableObject {
         liveMessageTurnIDs[id] = turnID
         if let index = liveMessages.firstIndex(where: { $0.id == id }) {
             let previous = liveMessages[index]
-            liveMessages[index] = ChatMessage(id: id, role: .assistant, text: text, createdAt: previous.createdAt, sourceTurnID: turnID)
+            // Replaying from item/started must not blank a restored partial reply.
+            if threadStreamReplaying && previous.text.hasPrefix(text) {
+                if let phase { liveMessages[index].phase = phase }
+                return
+            }
+            liveMessages[index] = ChatMessage(id: id, role: .assistant, text: text, createdAt: previous.createdAt,
+                sourceTurnID: turnID, phase: phase ?? previous.phase)
         } else {
-            liveMessages.append(ChatMessage(id: id, role: .assistant, text: text, createdAt: nextLiveCreatedAt(), sourceTurnID: turnID))
+            if threadStreamReplaying,
+               let persisted = detail?.turns.flatMap({ $0.items ?? [] }).first(where: { $0.id == id }),
+               persisted.renderedText.hasPrefix(text) { return }
+            liveMessages.append(ChatMessage(id: id, role: .assistant, text: text, createdAt: nextLiveCreatedAt(), sourceTurnID: turnID, phase: phase))
         }
     }
 
     private func appendLiveDelta(id: String, turnID: String?, delta: String) {
         guard !suppressedCompactionMessageIDs.contains(id) else { return }
-        let combinedText = (liveMessages.first(where: { $0.id == id })?.text ?? "") + delta
+        if threadStreamReplaying {
+            // The server retains only 250 events: a replay may start midway
+            // through an item. A suffix is not a replacement for its full text.
+            guard let previous = replayedMessageText[id] else { replayNeedsRefresh = true; return }
+            let text = previous + delta
+            beginLiveMessage(id: id, turnID: turnID, text: text)
+            return
+        }
+        let persistedText = detail?.turns.flatMap { $0.items ?? [] }.first { $0.id == id }?.renderedText ?? ""
+        let combinedText = (liveMessages.first(where: { $0.id == id })?.text ?? persistedText) + delta
         if isCompactionSummary(combinedText) {
             suppressedCompactionMessageIDs.insert(id)
             liveMessages.removeAll { $0.id == id }
@@ -1072,9 +1103,10 @@ final class AppViewModel: ObservableObject {
         liveMessageTurnIDs[id] = turnID
         if let index = liveMessages.firstIndex(where: { $0.id == id }) {
             let previous = liveMessages[index]
-            liveMessages[index] = ChatMessage(id: id, role: .assistant, text: previous.text + delta, createdAt: previous.createdAt, sourceTurnID: turnID)
+            liveMessages[index] = ChatMessage(id: id, role: .assistant, text: previous.text + delta, createdAt: previous.createdAt,
+                sourceTurnID: turnID, phase: previous.phase)
         } else {
-            liveMessages.append(ChatMessage(id: id, role: .assistant, text: delta, createdAt: nextLiveCreatedAt(), sourceTurnID: turnID))
+            liveMessages.append(ChatMessage(id: id, role: .assistant, text: combinedText, createdAt: nextLiveCreatedAt(), sourceTurnID: turnID))
         }
     }
 
@@ -1241,25 +1273,21 @@ final class AppViewModel: ObservableObject {
         liveMessageTurnIDs = [:]
         suppressedCompactionMessageIDs = []
         liveOrderingClock = 0
+        replayedMessageText = [:]
+        replayNeedsRefresh = false
         rebuildRenderedMessages()
     }
 
     private func removePersistedLiveMessages(from result: ThreadDetail) {
-        let persistedIDs = Set(result.turns.flatMap { turn in
-            (turn.items ?? []).compactMap { $0.type == "agentMessage" ? $0.id : nil }
-        })
-        let completedTurnIDs = Set<String>(result.turns.compactMap { turn in
-            guard turn.status != nil && turn.status != "inProgress" else { return nil }
-            return turn.id
-        })
-        guard !persistedIDs.isEmpty || !completedTurnIDs.isEmpty else { return }
         liveMessages.removeAll { message in
-            if persistedIDs.contains(message.id) {
-                liveMessageTurnIDs.removeValue(forKey: message.id)
-                return true
-            }
-            if message.role == .assistant,
-               let turnID = liveMessageTurnIDs[message.id], completedTurnIDs.contains(turnID) {
+            guard message.role == .assistant,
+                  let turn = result.turns.first(where: { $0.id == liveMessageTurnIDs[message.id] }),
+                  let item = (turn.items ?? []).first(where: { $0.type == "agentMessage" && $0.id == message.id }) else { return false }
+            let incoming = normalizedMessageText(item.renderedText)
+            let displayed = normalizedMessageText(message.text)
+            // Same ID or terminal status alone does not acknowledge the displayed text.
+            // Accept extensions and genuine edits; reject a stale, shorter prefix.
+            if incoming == displayed || !displayed.hasPrefix(incoming) {
                 liveMessageTurnIDs.removeValue(forKey: message.id)
                 return true
             }
@@ -1267,8 +1295,154 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    private func scheduleCacheCheckpoint() {
+        guard cacheCheckpointTask == nil else { return }
+        cacheCheckpointTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(1))
+            guard !Task.isCancelled, let self else { return }
+            self.checkpointConversation()
+        }
+    }
+
+    private func checkpointConversation() {
+        cacheCheckpointTask?.cancel()
+        cacheCheckpointTask = nil
+        guard let threadID = selectedThreadID, let detail, detail.thread.id == threadID,
+              !detail.turns.isEmpty || !liveMessages.isEmpty || pendingOutgoing?.executionStatus == "sent" else { return }
+        conversationCache.saveThread(CachedThreadDetail(
+            threadID: threadID, detail: detail, savedAt: Date().timeIntervalSince1970,
+            liveMessages: liveMessages, liveMessageTurnIDs: liveMessageTurnIDs,
+            pendingOutgoing: pendingOutgoing?.executionStatus == "sent" ? pendingOutgoing : nil,
+            liveRunning: liveRunning
+        ), profileID: selectedServerProfileID ?? "default")
+    }
+
+    private func restoreConversation(_ snapshot: CachedThreadDetail) {
+        liveMessageTurnIDs = snapshot.liveMessageTurnIDs ?? [:]
+        liveMessages = snapshot.liveMessages ?? []
+        pendingOutgoing = snapshot.pendingOutgoing
+        liveRunning = snapshot.liveRunning ?? snapshot.detail.thread.isActive
+        detail = snapshot.detail
+        rebuildMessageIndex(from: snapshot.detail, threadID: snapshot.threadID)
+    }
+
     #if DEBUG && targetEnvironment(simulator)
     private var uiFixtureStreamTask: Task<Void, Never>?
+    private var uiCachePage: ThreadDetail?
+
+    // Runs the real disk queue, navigation/restore, reconciliation and render paths.
+    // Only the HTTP page is substituted; no Codex sessions or real host connections.
+    private func runCacheRegression() async {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("cloudex-cache-check-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let cache = LocalConversationCache(rootURL: root)
+        let model = AppViewModel(conversationCache: cache)
+        model.selectedServerProfileID = "cache-test-host"
+        func page(_ text: String, revision: Int = 1, state: String = "completed", turnID: String = "t1") -> ThreadDetail {
+            let object: [String: Any] = [
+                "thread": ["id": "cache-test", "name": "缓存回归", "updatedAt": revision],
+                "turns": [["id": turnID, "status": state, "items": [
+                    ["id": "answer-\(turnID)", "type": "agentMessage", "text": text, "phase": "final_answer"]
+                ]]], "hasMoreBefore": true, "nextBefore": "older-cursor"
+            ]
+            return try! JSONDecoder().decode(ThreadDetail.self, from: JSONSerialization.data(withJSONObject: object))
+        }
+        let old = page("旧回复")
+        model.uiCachePage = old
+        await model.openThread(old.thread, projectCWD: nil)
+        model.beginLiveMessage(id: "answer-t2", turnID: "t2", text: "最新回复：已经显示")
+        model.pendingOutgoing = ChatMessage(id: "outgoing-test", role: .user, text: "刚刚发出的提问",
+            executionStatus: "sent", sourceTurnID: "t2",
+            attachments: [MessageAttachment(name: "图.png", path: "/image.png", kind: .image)])
+        model.rebuildRenderedMessages()
+        await model.renderPreparationTask?.value
+        precondition(model.messages.contains { $0.text == "最新回复：已经显示" }, "Missing turn must display live content")
+
+        // Leave before the terminal HTTP reload, reopen offline, then read with a new cache instance.
+        model.startNewChat()
+        model.uiCachePage = nil
+        await model.openThread(old.thread, projectCWD: nil)
+        await model.renderPreparationTask?.value
+        precondition(model.messages.contains { $0.text == "最新回复：已经显示" }, "Immediate reopen regressed")
+        precondition(model.pendingOutgoing?.attachments.count == 1)
+        await cache.flush()
+        let coldCache = LocalConversationCache(rootURL: root)
+        let cold = AppViewModel(conversationCache: coldCache)
+        cold.selectedServerProfileID = "cache-test-host"
+        await cold.openThread(old.thread, projectCWD: nil)
+        await cold.renderPreparationTask?.value
+        precondition(cold.messages.contains { $0.text == "最新回复：已经显示" }, "Cold disk restore regressed")
+        precondition(cold.pendingOutgoing?.executionStatus == "sent")
+        precondition(coldCache.loadThread(threadID: old.thread.id, profileID: "different-host") == nil)
+
+        cold.uiCachePage = page("最新回复：", state: "inProgress", turnID: "t2")
+        await cold.loadThread(old.thread.id, force: true)
+        await cold.renderPreparationTask?.value
+        precondition(cold.messages.contains { $0.text == "最新回复：已经显示" }, "Short HTTP snapshot erased live text")
+        cold.threadStreamReplaying = true
+        cold.beginLiveMessage(id: "answer-t2", turnID: "t2")
+        cold.appendLiveDelta(id: "answer-t2", turnID: "t2", delta: "最新回复：")
+        cold.rebuildRenderedMessages()
+        await cold.renderPreparationTask?.value
+        precondition(cold.messages.contains { $0.text == "最新回复：已经显示" }, "SSE replay regressed restored text")
+        cold.appendLiveDelta(id: "answer-t2", turnID: "t2", delta: "已经显示")
+        cold.replayedMessageText = [:]
+        cold.appendLiveDelta(id: "answer-t2", turnID: "t2", delta: "不完整的重放尾部")
+        precondition(cold.liveMessages.last?.text == "最新回复：已经显示", "Truncated replay replaced the full message")
+        cold.threadStreamReplaying = false
+        cold.uiCachePage = page("最新回复：已经显示", revision: 2, turnID: "t2")
+        await cold.loadThread(old.thread.id, force: true)
+        await cold.renderPreparationTask?.value
+        precondition(cold.liveMessages.isEmpty, "Matching snapshot must acknowledge overlay")
+        precondition(cold.messages.filter { $0.id == "answer-t2" }.count == 1, "Duplicate final reply")
+        cold.appendLiveDelta(id: "answer-t2", turnID: "t2", delta: "，继续")
+        precondition(cold.liveMessages.last?.text == "最新回复：已经显示，继续", "Delta must use acknowledged baseline")
+        cold.uiCachePage = page("修改后的最终回复", revision: 3, turnID: "t2")
+        await cold.loadThread(old.thread.id, force: true)
+        await cold.renderPreparationTask?.value
+        precondition(cold.messages.contains { $0.text == "修改后的最终回复" }, "Completed correction ignored")
+        cold.uiCachePage = old
+        await cold.loadThread(old.thread.id, force: true)
+        precondition(cold.detail?.thread.updatedAt == 3, "Old HTTP revision replaced newer snapshot")
+        cold.started = true
+        cold.uiCachePage = page("前台恢复后的最新回复", revision: 4, turnID: "t2")
+        await cold.resumeFromForeground()
+        precondition(cold.detail?.turns.last?.items?.last?.renderedText == "前台恢复后的最新回复",
+                     "Foreground must revalidate completed conversations")
+        let lagging = page("旧回复", revision: 4)
+        let retained = cold.mergingLatestPage(lagging, into: cold.detail)
+        precondition(retained.turns.map(\.id) == ["t1", "t2"], "Missing latest turn must not reorder history")
+        cold.beginLiveMessage(id: "commentary-t2", turnID: "t2", text: "中间分析", phase: "commentary")
+        cold.rebuildRenderedMessages()
+        await cold.renderPreparationTask?.value
+        precondition(!cold.messages.contains { $0.text == "中间分析" }, "Restored commentary must stay folded")
+        precondition(cold.messages.contains { $0.processItems?.contains { $0.text == "中间分析" } == true })
+
+        // Acknowledged-only persistence; incomplete sends must not reappear as sent.
+        cold.pendingOutgoing = ChatMessage(id: "unacknowledged", role: .user, text: "发送中", executionStatus: "sending")
+        cold.suspendForBackground()
+        await coldCache.flush()
+        let saved = coldCache.loadThread(threadID: old.thread.id, profileID: "cache-test-host")!
+        precondition(saved.pendingOutgoing == nil)
+        precondition(saved.detail.turns.count == 2, "Latest-page save discarded loaded history")
+        precondition(saved.detail.nextBefore == "older-cursor")
+        precondition(saved.liveMessages?.first?.phase == "commentary")
+
+        // Serial writes must retain the newest enqueue even after large earlier snapshots.
+        for revision in 0..<30 {
+            let value = page(String(repeating: "缓存", count: revision == 0 ? 100_000 : revision + 1), revision: revision)
+            coldCache.saveThread(CachedThreadDetail(threadID: old.thread.id, detail: value, savedAt: Double(revision)),
+                                profileID: "queue-check")
+        }
+        await coldCache.flush()
+        let disk = LocalConversationCache(rootURL: root)
+        precondition(disk.loadThread(threadID: old.thread.id, profileID: "queue-check")?.detail.thread.updatedAt == 29)
+        model.cacheCheckpointTask?.cancel()
+        cold.cacheCheckpointTask?.cancel()
+        await cache.flush()
+        await coldCache.flush()
+        projects = [CloudexProject(id: "cache-check", name: "缓存回归通过", cwd: "/cache-check", threads: [old.thread], updatedAt: nil)]
+    }
 
     func startUIFixtureStream() {
         guard ProcessInfo.processInfo.arguments.contains("--ui-stream-fixture") else { return }
@@ -1360,6 +1534,7 @@ final class AppViewModel: ObservableObject {
 
     func start() async {
         #if DEBUG && targetEnvironment(simulator)
+        if ProcessInfo.processInfo.arguments.contains("--ui-cache-regression") { await runCacheRegression(); return }
         if ProcessInfo.processInfo.arguments.contains("--ui-fixture") { await loadUIFixture(); return }
         #endif
         guard !started else { return }
@@ -1377,9 +1552,10 @@ final class AppViewModel: ObservableObject {
         await refresh()
         if streamsStarted { connectGlobalStream() }
         guard let threadID = selectedThreadID else { return }
+        // A completed task can have changed on Desktop while this app was suspended.
+        await loadThread(threadID, force: true)
+        guard selectedThreadID == threadID else { return }
         guard active else {
-            // Completed conversations are immutable from the chat viewport's
-            // perspective; avoid replacing their snapshot on foregrounding.
             threadSSE.stop()
             pollTask?.cancel()
             pollTask = nil
@@ -1388,12 +1564,27 @@ final class AppViewModel: ObservableObject {
         // URLSession can be suspended while the app is in the background.
         // Restore an authoritative active-turn snapshot before replaying live
         // events so missed commands and intermediate messages are not lost.
-        await loadThread(threadID, force: true)
         connectThreadStream(threadID: threadID)
         startPolling(threadID: threadID)
     }
 
     func suspendForBackground() {
+        checkpointConversation()
+        // Let the serial disk queue finish before iOS suspends the process.
+        var backgroundTask = UIBackgroundTaskIdentifier.invalid
+        backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "Save conversation") {
+            if backgroundTask != .invalid {
+                UIApplication.shared.endBackgroundTask(backgroundTask)
+                backgroundTask = .invalid
+            }
+        }
+        Task {
+            await conversationCache.flush()
+            if backgroundTask != .invalid {
+                UIApplication.shared.endBackgroundTask(backgroundTask)
+                backgroundTask = .invalid
+            }
+        }
         globalSSE.stop()
         threadSSE.stop()
         pollTask?.cancel()
@@ -1467,6 +1658,7 @@ final class AppViewModel: ObservableObject {
     func switchToServerProfile(_ profile: ServerProfile) async {
         let switching = selectedServerProfileID != profile.id
         if switching {
+            checkpointConversation()
             if let previousID = selectedServerProfileID {
                 UserDefaults.standard.set(draft, forKey: "cloudex.draft.\(previousID)")
                 UserDefaults.standard.set(pendingSteerDraft, forKey: "cloudex.pendingSteerDraft.\(previousID)")
@@ -1476,6 +1668,8 @@ final class AppViewModel: ObservableObject {
             selectedThreadID = nil
             selectedProjectCWD = nil
             detail = nil
+            pendingOutgoing = nil
+            clearLiveMessages()
             projects = conversationCache.loadProjects(profileID: profile.id) ?? []
             liveRunning = false
             isCreatingNew = false
@@ -1600,6 +1794,9 @@ final class AppViewModel: ObservableObject {
     }
 
     func refresh() async {
+        #if DEBUG && targetEnvironment(simulator)
+        if ProcessInfo.processInfo.arguments.contains("--ui-cache-regression") { return }
+        #endif
         let generation = connectionGeneration
         isBusy = true
         defer { isBusy = false }
@@ -1654,7 +1851,7 @@ final class AppViewModel: ObservableObject {
 
     func loadModelsIfNeeded(force: Bool = false) async {
         #if DEBUG && targetEnvironment(simulator)
-        if ProcessInfo.processInfo.arguments.contains("--ui-fixture") { return }
+        if ProcessInfo.processInfo.arguments.contains("--ui-fixture") || ProcessInfo.processInfo.arguments.contains("--ui-cache-regression") { return }
         #endif
         if modelsLoading { return }
         if modelsLoaded && !force { return }
@@ -1811,6 +2008,12 @@ final class AppViewModel: ObservableObject {
         #if DEBUG && targetEnvironment(simulator)
         if ProcessInfo.processInfo.arguments.contains("--ui-fixture") { await loadUIFixture(thread: thread); return }
         #endif
+        checkpointConversation()
+        detailLoadGeneration += 1
+        olderTurnsLoadGeneration += 1
+        isLoadingOlderTurns = false
+        threadSSE.stop()
+        pollTask?.cancel()
         threadOpenGeneration += 1
         let openGeneration = threadOpenGeneration
         isOpeningThread = true
@@ -1843,22 +2046,17 @@ final class AppViewModel: ObservableObject {
         liveRunning = thread.isActive
         messageIndex = []
         let cache = conversationCache
-        let cachedDetail = await Task.detached(priority: .userInitiated) {
-            cache.loadThreadDetail(threadID: thread.id)
+        let profileID = selectedServerProfileID ?? "default"
+        let cachedSnapshot = await Task.detached(priority: .userInitiated) {
+            cache.loadThread(threadID: thread.id, profileID: profileID)
         }.value
         guard selectedThreadID == thread.id, threadOpenGeneration == openGeneration else { return }
-        if let cachedDetail {
-            detail = cachedDetail
-            applyConversationModel(cachedDetail.thread.model)
-            liveRunning = cachedDetail.thread.isActive
+        if let cachedSnapshot {
+            restoreConversation(cachedSnapshot)
+            applyConversationModel(cachedSnapshot.detail.thread.model)
         }
-        let cachedIndex = await Task.detached(priority: .utility) {
-            cache.loadMessageIndex(threadID: thread.id)
-        }.value
-        guard selectedThreadID == thread.id, threadOpenGeneration == openGeneration else { return }
-        if let cachedIndex { messageIndex = cachedIndex }
-        if cachedDetail != nil { isOpeningThread = false }
-        await loadThread(thread.id, force: true, replacingHistory: true)
+        if cachedSnapshot != nil { isOpeningThread = false }
+        await loadThread(thread.id, force: true)
         guard selectedThreadID == thread.id, threadOpenGeneration == openGeneration else { return }
         connectThreadStream(threadID: thread.id)
         if liveRunning {
@@ -1870,6 +2068,9 @@ final class AppViewModel: ObservableObject {
     }
 
     private func refreshModelsForConversation() async {
+        #if DEBUG && targetEnvironment(simulator)
+        if ProcessInfo.processInfo.arguments.contains("--ui-cache-regression") { return }
+        #endif
         while modelsLoading {
             try? await Task.sleep(for: .milliseconds(20))
             if Task.isCancelled { return }
@@ -1894,6 +2095,7 @@ final class AppViewModel: ObservableObject {
     }
 
     func startNewChat(projectCWD: String? = nil, clearProject: Bool = false) {
+        checkpointConversation()
         // Invalidate any in-flight history/model load before switching to the
         // empty composer. Otherwise the old task can keep the new page in its
         // opening state or restore the previous conversation after navigation.
@@ -1915,28 +2117,23 @@ final class AppViewModel: ObservableObject {
         pollTask?.cancel()
     }
 
-    func loadThread(_ threadID: String, force: Bool = false, replacingHistory: Bool = false) async {
+    func loadThread(_ threadID: String, force: Bool = false) async {
+        guard selectedThreadID == threadID else { return }
         if liveRunning && !force { return }
         detailLoadGeneration += 1
         let generation = detailLoadGeneration
         let wasActive = active
         do {
-            let result: ThreadDetail = try await client.get(
-                client.threadPath(threadID),
-                queryItems: [URLQueryItem(name: "limit", value: "12")]
-            )
+            let result = try await latestThreadPage(threadID)
             guard selectedThreadID == threadID, generation == detailLoadGeneration else { return }
-            let updatedDetail = replacingHistory ? result : mergingLatestPage(result, into: detail)
+            let updatedDetail = mergingLatestPage(result, into: detail)
+            removePersistedLiveMessages(from: updatedDetail)
             if detail != updatedDetail {
                 detail = updatedDetail
-                let cache = conversationCache
-                Task.detached(priority: .utility) {
-                    cache.saveThreadDetail(result, threadID: threadID)
-                }
             }
             rebuildMessageIndex(from: updatedDetail, threadID: threadID)
-            removePersistedLiveMessages(from: result)
-            liveRunning = result.thread.isActive
+            liveRunning = updatedDetail.thread.isActive
+            checkpointConversation()
             if let error = result.turns.last(where: { $0.error != nil })?.error {
                 status = cloudexLocalized("任务失败：%@", error.displayText)
             }
@@ -1950,6 +2147,16 @@ final class AppViewModel: ObservableObject {
 
     var hasMoreHistory: Bool { detail?.hasMoreBefore == true }
 
+    private func latestThreadPage(_ threadID: String) async throws -> ThreadDetail {
+        #if DEBUG && targetEnvironment(simulator)
+        if ProcessInfo.processInfo.arguments.contains("--ui-cache-regression") {
+            guard let uiCachePage else { throw URLError(.notConnectedToInternet) }
+            return uiCachePage
+        }
+        #endif
+        return try await client.get(client.threadPath(threadID), queryItems: [URLQueryItem(name: "limit", value: "12")])
+    }
+
     func loadOlderTurns() async {
         guard let threadID = selectedThreadID,
               let current = detail,
@@ -1959,6 +2166,7 @@ final class AppViewModel: ObservableObject {
 
         olderTurnsLoadGeneration += 1
         let generation = olderTurnsLoadGeneration
+        let openGeneration = threadOpenGeneration
         isLoadingOlderTurns = true
         defer {
             if olderTurnsLoadGeneration == generation { isLoadingOlderTurns = false }
@@ -1967,22 +2175,20 @@ final class AppViewModel: ObservableObject {
         do {
             let result = try await olderTurnsPage(threadID: threadID, before: before)
             guard selectedThreadID == threadID,
+                  threadOpenGeneration == openGeneration,
                   olderTurnsLoadGeneration == generation,
                   let latest = detail else { return }
             let existingIDs = Set(latest.turns.map(\.id))
             let older = result.turns.filter { !existingIDs.contains($0.id) }
             let updated = ThreadDetail(
-                thread: result.thread,
+                thread: latest.thread,
                 turns: older + latest.turns,
                 hasMoreBefore: result.hasMoreBefore,
                 nextBefore: result.nextBefore
             )
             detail = updated
             rebuildMessageIndex(from: updated, threadID: threadID)
-            let cache = conversationCache
-            Task.detached(priority: .utility) {
-                cache.saveThreadDetail(updated, threadID: threadID)
-            }
+            checkpointConversation()
             // Keep the loading boundary aligned with publication, not just the HTTP response.
             await renderPreparationTask?.value
         } catch {
@@ -2017,9 +2223,10 @@ final class AppViewModel: ObservableObject {
               let current = detail,
               let index = current.turns.firstIndex(where: { $0.id == turnID }) else { return false }
         if current.turns[index].processDetailsAreLoaded { return true }
+        let openGeneration = threadOpenGeneration
         do {
             let result: TurnDetailResponse = try await client.get(client.threadTurnPath(threadID, turnID: turnID))
-            guard selectedThreadID == threadID, let latest = detail,
+            guard selectedThreadID == threadID, threadOpenGeneration == openGeneration, let latest = detail,
                   let latestIndex = latest.turns.firstIndex(where: { $0.id == turnID }) else { return false }
             var turns = latest.turns
             turns[latestIndex] = result.turn
@@ -2029,6 +2236,7 @@ final class AppViewModel: ObservableObject {
                 hasMoreBefore: latest.hasMoreBefore,
                 nextBefore: latest.nextBefore
             )
+            checkpointConversation()
             await renderPreparationTask?.value
             return selectedThreadID == threadID
         } catch {
@@ -2039,9 +2247,30 @@ final class AppViewModel: ObservableObject {
 
     private func mergingLatestPage(_ latest: ThreadDetail, into current: ThreadDetail?) -> ThreadDetail {
         guard let current, !current.turns.isEmpty else { return latest }
+        if let incoming = latest.thread.updatedAt, let known = current.thread.updatedAt, incoming < known {
+            return current
+        }
         let currentByID = Dictionary(current.turns.map { ($0.id, $0) }, uniquingKeysWith: { _, newer in newer })
-        let turns = latest.turns.map { compactTurn in
-            guard let existing = currentByID[compactTurn.id], existing.processDetailsAreLoaded else { return compactTurn }
+        let turns = latest.turns.map { incomingTurn in
+            guard let existing = currentByID[incomingTurn.id] else { return incomingTurn }
+            var compactTurn = incomingTurn
+            if (latest.thread.updatedAt ?? 0) <= (current.thread.updatedAt ?? 0) {
+                if !isTurnInProgress(existing) && isTurnInProgress(incomingTurn) { return existing }
+                let knownItems = Dictionary((existing.items ?? []).compactMap { item in
+                    item.id.map { ($0, item) }
+                }, uniquingKeysWith: { _, new in new })
+                let items = (incomingTurn.items ?? []).map { item in
+                    guard item.type == "agentMessage", let id = item.id, let known = knownItems[id],
+                          known.renderedText.hasPrefix(item.renderedText) else { return item }
+                    return known
+                }
+                compactTurn = CloudexTurn(id: incomingTurn.id, items: items, status: incomingTurn.status,
+                    error: incomingTurn.error, startedAt: incomingTurn.startedAt, completedAt: incomingTurn.completedAt,
+                    durationMs: incomingTurn.durationMs, compressed: incomingTurn.compressed,
+                    itemsView: incomingTurn.itemsView, processItemCount: incomingTurn.processItemCount,
+                    detailsLoaded: incomingTurn.detailsLoaded)
+            }
+            guard existing.processDetailsAreLoaded else { return compactTurn }
             // Active compact responses intentionally contain the complete,
             // growing timeline and are marked detailsLoaded. Reusing the
             // first loaded object here would discard every later desktop
@@ -2049,17 +2278,32 @@ final class AppViewModel: ObservableObject {
             if isTurnInProgress(compactTurn) || isTurnInProgress(existing) {
                 return compactTurn
             }
-            // Preserve an explicitly loaded full timeline only after the turn
-            // is stable; completed compact snapshots omit process details.
-            return existing
+            guard !compactTurn.processDetailsAreLoaded else { return compactTurn }
+            // Keep loaded process rows, but replace visible user/final items with
+            // the current server version (completed replies can still be corrected).
+            let incomingIDs = Set((compactTurn.items ?? []).compactMap(\.id))
+            let existingItems = existing.items ?? []
+            let oldFinalIndex = existingItems.lastIndex { $0.type == "agentMessage" && $0.phase == "final_answer" }
+                ?? existingItems.lastIndex { $0.type == "agentMessage" }
+            let process = existingItems.enumerated().compactMap { index, item -> TurnItem? in
+                guard item.type != "userMessage", index != oldFinalIndex, !incomingIDs.contains(item.id ?? "") else { return nil }
+                return item
+            }
+            return CloudexTurn(id: compactTurn.id, items: process + (compactTurn.items ?? []),
+                status: compactTurn.status, error: compactTurn.error, startedAt: compactTurn.startedAt,
+                completedAt: compactTurn.completedAt, durationMs: compactTurn.durationMs,
+                compressed: compactTurn.compressed, itemsView: "full", processItemCount: compactTurn.processItemCount,
+                detailsLoaded: true)
         }
         let latestIDs = Set(turns.map(\.id))
-        let preservedOlderTurns = current.turns.filter { !latestIDs.contains($0.id) }
+        let latestByID = Dictionary(turns.map { ($0.id, $0) }, uniquingKeysWith: { _, new in new })
+        let merged = current.turns.map { latestByID[$0.id] ?? $0 } + turns.filter { currentByID[$0.id] == nil }
+        let hasOlderLoadedTurns = current.turns.first.map { !latestIDs.contains($0.id) } ?? false
         return ThreadDetail(
             thread: latest.thread,
-            turns: preservedOlderTurns + turns,
-            hasMoreBefore: latest.hasMoreBefore,
-            nextBefore: latest.nextBefore
+            turns: merged,
+            hasMoreBefore: hasOlderLoadedTurns ? current.hasMoreBefore : latest.hasMoreBefore,
+            nextBefore: hasOlderLoadedTurns ? current.nextBefore : latest.nextBefore
         )
     }
 
@@ -2086,10 +2330,6 @@ final class AppViewModel: ObservableObject {
         }
         guard items != messageIndex else { return }
         messageIndex = items
-        let cache = conversationCache
-        Task.detached(priority: .utility) {
-            cache.saveMessageIndex(items, threadID: threadID)
-        }
     }
 
     func send() async {
@@ -2176,7 +2416,6 @@ final class AppViewModel: ObservableObject {
         let wasRunning = active
         isBusy = true
         liveRunning = true
-        clearLiveMessages()
         localError = nil
         if !steering {
             pendingOutgoing = ChatMessage(
@@ -2332,7 +2571,6 @@ final class AppViewModel: ObservableObject {
         guard let selectedThreadID else { return }
         isBusy = true
         liveRunning = false
-        clearLiveMessages()
         do {
             let _: EmptyResponse = try await client.post(client.threadPath(selectedThreadID, action: "stop"))
             status = "已请求停止当前任务"
@@ -2648,31 +2886,39 @@ final class AppViewModel: ObservableObject {
     }
 
     private func connectThreadStream(threadID: String) {
+        #if DEBUG && targetEnvironment(simulator)
+        if ProcessInfo.processInfo.arguments.contains("--ui-cache-regression") { return }
+        #endif
         threadSSE.stop()
         lastThreadEventID = 0
         threadStreamReplaying = true
+        replayedMessageText = [:]
         do {
             let generation = connectionGeneration
+            let openGeneration = threadOpenGeneration
             let url = try client.makeURL(
                 path: client.threadPath(threadID, action: "stream"),
                 queryItems: [URLQueryItem(name: "lease", value: "1")]
             )
             threadSSE.onEvent = { [weak self] event in
                 Task { @MainActor in
-                    guard self?.connectionGeneration == generation else { return }
+                    guard self?.connectionGeneration == generation, self?.threadOpenGeneration == openGeneration else { return }
                     self?.handleThreadEvent(event, expectedThreadID: threadID)
                 }
             }
             threadSSE.onOpen = { [weak self] in
                 Task { @MainActor in
-                    guard self?.connectionGeneration == generation else { return }
+                    guard self?.connectionGeneration == generation, self?.threadOpenGeneration == openGeneration else { return }
                     self?.lastThreadEventID = 0
                     self?.threadStreamReplaying = true
+                    self?.replayedMessageText = [:]
+                    self?.replayNeedsRefresh = false
                 }
             }
             threadSSE.onDisconnect = { [weak self] message in
                 Task { @MainActor in
                     guard self?.connectionGeneration == generation,
+                          self?.threadOpenGeneration == openGeneration,
                           self?.selectedThreadID == threadID else { return }
                     self?.status = message.contains("401") ? "实时订阅认证失败：请确认 Token" : "实时连接断开：\(message)"
                 }
@@ -2840,6 +3086,9 @@ final class AppViewModel: ObservableObject {
         }
         if event.name == "replay-complete" {
             threadStreamReplaying = false
+            if let detail { removePersistedLiveMessages(from: detail) }
+            rebuildRenderedMessages()
+            if replayNeedsRefresh { reloadAfterEvent(expectedThreadID) }
             return
         }
         if event.name == "error" {
@@ -2857,11 +3106,9 @@ final class AppViewModel: ObservableObject {
             let turnID = params["turnId"] as? String
                 ?? (params["turn"] as? [String: Any])?["id"] as? String
                 ?? UUID().uuidString
-            let previousTurnID = activeTurnNotificationKeys[expectedThreadID]
             activeTurnNotificationKeys[expectedThreadID] = turnID
             // Compaction resumes the same logical turn and can emit another
             // turn/started. Preserve everything already shown for that turn.
-            if previousTurnID != turnID { clearLiveMessages() }
             localError = nil
         } else if method == "item/started" {
             let item = params["item"] as? [String: Any]
@@ -2886,7 +3133,8 @@ final class AppViewModel: ObservableObject {
             beginLiveMessage(
                 id: itemID,
                 turnID: turnID,
-                text: liveText(from: item)
+                text: liveText(from: item),
+                phase: item?["phase"] as? String
             )
         } else if method == "item/agentMessage/delta" {
             liveRunning = true
@@ -2915,7 +3163,7 @@ final class AppViewModel: ObservableObject {
             guard item?["type"] as? String == "agentMessage" else { return }
             let text = liveText(from: item)
             if let completedID = item?["id"] as? String, !text.isEmpty {
-                beginLiveMessage(id: completedID, turnID: turnID, text: text)
+                beginLiveMessage(id: completedID, turnID: turnID, text: text, phase: item?["phase"] as? String)
             }
         } else if method.lowercased().contains("compact") || method.lowercased().contains("compress") {
             recordLiveCompaction(turnID: liveTurnID(from: params, threadID: expectedThreadID))
@@ -2985,15 +3233,18 @@ final class AppViewModel: ObservableObject {
     }
 
     private func reloadAfterEvent(_ threadID: String, waitForTerminalSnapshot: Bool = false) {
+        checkpointConversation()
+        let openGeneration = threadOpenGeneration
+        let terminalTurnID = activeTurnNotificationKeys[threadID]
         Task { [weak self] in
             let delays: [Duration] = waitForTerminalSnapshot
                 ? [.milliseconds(250), .milliseconds(500), .seconds(1), .seconds(2)]
                 : [.milliseconds(250)]
             for delay in delays {
                 try? await Task.sleep(for: delay)
-                guard let self, self.selectedThreadID == threadID else { return }
+                guard let self, self.selectedThreadID == threadID, self.threadOpenGeneration == openGeneration else { return }
                 await self.loadThread(threadID, force: true)
-                if !waitForTerminalSnapshot || self.hasTerminalSnapshot(for: threadID) {
+                if !waitForTerminalSnapshot || self.hasTerminalSnapshot(for: threadID, turnID: terminalTurnID) {
                     break
                 }
             }
@@ -3002,13 +3253,14 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    private func hasTerminalSnapshot(for threadID: String) -> Bool {
+    private func hasTerminalSnapshot(for threadID: String, turnID: String?) -> Bool {
         guard selectedThreadID == threadID,
               !liveRunning,
               selectedThread?.isActive != true,
               let lastTurn = detail?.turns.last,
               lastTurn.status != nil else { return false }
-        return !isTurnInProgress(lastTurn)
+        return (turnID == nil || lastTurn.id == turnID) && !isTurnInProgress(lastTurn)
+            && !liveMessages.contains { $0.role == .assistant && $0.phase != "commentary" && liveMessageTurnIDs[$0.id] == lastTurn.id }
     }
 
     private func startPolling(threadID: String) {
@@ -3016,7 +3268,7 @@ final class AppViewModel: ObservableObject {
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(4))
-                guard let self, self.selectedThreadID == threadID else { return }
+                guard !Task.isCancelled, let self, self.selectedThreadID == threadID else { return }
                 guard self.active else { return }
                 // Desktop-started turns can update the persisted session
                 // without emitting notifications on this app-server stream.
@@ -3029,6 +3281,7 @@ final class AppViewModel: ObservableObject {
     }
 
     deinit {
+        cacheCheckpointTask?.cancel()
         pollTask?.cancel()
         globalSSE.stop()
         threadSSE.stop()

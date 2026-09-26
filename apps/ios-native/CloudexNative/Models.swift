@@ -914,8 +914,8 @@ struct RemoteFileEntry: Codable, Identifiable, Hashable {
     }
 }
 
-struct MessageAttachment: Identifiable, Equatable {
-    enum Kind: String, Equatable {
+struct MessageAttachment: Identifiable, Equatable, Codable {
+    enum Kind: String, Equatable, Codable {
         case image
         case file
     }
@@ -928,8 +928,8 @@ struct MessageAttachment: Identifiable, Equatable {
     var systemImage: String { kind == .image ? "photo" : "doc" }
 }
 
-struct ChatMessage: Identifiable, Equatable {
-    enum Role: String {
+struct ChatMessage: Identifiable, Equatable, Codable {
+    enum Role: String, Codable {
         case user
         case assistant
         case error
@@ -953,10 +953,18 @@ struct ChatMessage: Identifiable, Equatable {
     var isCompressed: Bool = false
     var threadID: String? = nil
     var sourceTurnID: String? = nil
+    var phase: String? = nil
     var processItemCount: Int? = nil
     var processDetailsLoaded: Bool = true
     var attachments: [MessageAttachment] = []
     var markdown: PreparedMarkdown? = nil
+
+    // Persist content, never the in-memory Markdown rendering cache.
+    private enum CodingKeys: String, CodingKey {
+        case id, role, text, executionStatus, executionDuration, executionExitCode, executionKind
+        case editDiff, processItems, createdAt, isCompressed, threadID, sourceTurnID
+        case phase, processItemCount, processDetailsLoaded, attachments
+    }
 }
 
 struct SSEEvent {
