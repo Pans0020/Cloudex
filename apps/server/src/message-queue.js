@@ -74,6 +74,7 @@ export class MessageQueue {
         return;
       }
       if (!item) throw fail("Queued message not found", 404);
+      if (data.action === "cancel" && item.status === "cancelled") return;
       if (["running", "dispatching", "completed", "cancelled"].includes(item.status)) throw fail("This message is no longer editable");
       if (data.action === "cancel") { item.status = "cancelled"; return; }
       if (item.status === "failed") throw fail("失败消息只能移除；需要重试时请新建消息");

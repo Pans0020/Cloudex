@@ -1,8 +1,102 @@
 import XCTest
 
 final class CloudexUITests: XCTestCase {
+    @discardableResult
+    private func previewFixture(_ options: [String: Any]? = nil) -> [String: Any] {
+        let finished = expectation(description: "fixture control")
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:18089/fixture-control")!)
+        request.timeoutInterval = 5
+        if let options { request.httpMethod = "POST"; request.httpBody = try! JSONSerialization.data(withJSONObject: options) }
+        var value: [String: Any] = [:]
+        URLSession.shared.dataTask(with: request) { data, _, error in
+            XCTAssertNil(error)
+            if let data { value = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:] }
+            finished.fulfill()
+        }.resume()
+        wait(for: [finished], timeout: 7)
+        return value
+    }
+    func testLostQueueResponseCanRetryOrCancelWithoutDuplicateDelivery() {
+        continueAfterFailure = false
+        for cancel in [false, true] {
+            previewFixture(["reset": true, "dropQueueReplies": true])
+            let app = XCUIApplication()
+            app.launchArguments = ["--ui-fixture", "--ui-queue-fixture", "-AppleLanguages", "(zh-Hans)"]
+            app.launch()
+            XCTAssertTrue(app.buttons["展开CV"].waitForExistence(timeout: 10))
+            app.buttons["展开CV"].tap()
+            app.buttons.containing(.staticText, identifier: "布局回归 CV").firstMatch.tap()
+            let input = app.textViews["message-input"]
+            XCTAssertTrue(input.waitForExistence(timeout: 10)); input.tap(); input.typeText("lost-response")
+            app.buttons["等待发送"].tap()
+            XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", "尚未确认入队")).firstMatch.waitForExistence(timeout: 10))
+            XCTAssertEqual((previewFixture()["items"] as? [[String: Any]])?.count, 1)
+            let menu = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "queue-actions-")).firstMatch
+            if cancel {
+                menu.tap(); app.buttons["取消入队"].tap()
+                XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", "尚未确认取消")).firstMatch.waitForExistence(timeout: 10))
+            }
+            previewFixture(["dropQueueReplies": false])
+            menu.tap(); app.buttons[cancel ? "取消入队" : "重试入队"].tap()
+            let state = NSPredicate { _, _ in
+                let items = self.previewFixture()["items"] as? [[String: Any]] ?? []
+                return items.count == 1 && items[0]["status"] as? String == (cancel ? "cancelled" : "pending")
+            }
+            // Server state is already durable; allow UI response to settle independently.
+            XCTAssertTrue(state.evaluate(with: nil))
+            if cancel {
+                let removed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: app.staticTexts["lost-response"])
+                wait(for: [removed], timeout: 5)
+            } else { XCTAssertTrue(app.staticTexts["排队中"].waitForExistence(timeout: 5)) }
+            snapshot(cancel ? "lost-cancel-response-recovered" : "lost-enqueue-response-recovered")
+            app.terminate()
+        }
+    }
+    func testSlowFirstEnqueueKeepsTapOrder() {
+        continueAfterFailure = false
+        previewFixture(["reset": true, "delayFirstEnqueue": true])
+        let app = XCUIApplication()
+        app.launchArguments = ["--ui-fixture", "--ui-queue-fixture", "-AppleLanguages", "(zh-Hans)"]
+        app.launch()
+        XCTAssertTrue(app.buttons["展开CV"].waitForExistence(timeout: 10))
+        app.buttons["展开CV"].tap()
+        app.buttons.containing(.staticText, identifier: "布局回归 CV").firstMatch.tap()
+        let input = app.textViews["message-input"]
+        XCTAssertTrue(input.waitForExistence(timeout: 10))
+        for text in ["first", "second"] { input.tap(); input.typeText(text); app.buttons["等待发送"].tap() }
+        let settled = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in app.staticTexts.matching(identifier: "排队中").count == 2 }, object: nil)
+        wait(for: [settled], timeout: 10)
+        XCTAssertEqual((previewFixture()["items"] as? [[String: Any]])?.compactMap { ($0["body"] as? [String: Any])?["message"] as? String }, ["first", "second"])
+        snapshot("slow-first-enqueue-keeps-order")
+    }
+    func testPreviewFailureRetryAndHTMLIsolation() {
+        continueAfterFailure = false
+        previewFixture(["reset": true, "failHTMLResource": true])
+        let app = XCUIApplication()
+        app.launchArguments = ["--ui-fixture", "--ui-preview-fixture", "-AppleLanguages", "(zh-Hans)"]
+        app.launch()
+        XCTAssertTrue(app.buttons["展开CV"].waitForExistence(timeout: 10))
+        app.buttons["展开CV"].tap()
+        app.buttons.containing(.staticText, identifier: "布局回归 CV").firstMatch.tap()
+        let processImage = app.buttons["过程图片"]
+        XCTAssertTrue(processImage.waitForExistence(timeout: 10)); processImage.tap()
+        XCTAssertTrue(app.navigationBars["picture.png"].waitForExistence(timeout: 10))
+        app.buttons["完成"].firstMatch.tap()
+        app.links["查看实际界面截图"].tap()
+        XCTAssertTrue(app.links["预览失败后重试"].waitForExistence(timeout: 10)); app.links["预览失败后重试"].tap()
+        XCTAssertTrue(app.staticTexts["无法预览文件"].waitForExistence(timeout: 10))
+        snapshot("preview-request-failure")
+        app.buttons["重试"].tap()
+        XCTAssertTrue(app.webViews.staticTexts["重试预览成功"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.webViews.staticTexts["尚未执行脚本"].exists)
+        app.switches["交互脚本"].tap()
+        XCTAssertTrue(app.webViews.staticTexts["网络已隔离"].waitForExistence(timeout: 10))
+        XCTAssertEqual(previewFixture()["forbiddenRequests"] as? Int, 0)
+        snapshot("html-scripts-with-network-blocked")
+    }
     func testQueuedMessagesStaySeparateAfterRelaunch() {
         continueAfterFailure = false
+        previewFixture(["reset": true])
         let app = XCUIApplication()
         app.launchArguments = ["--ui-fixture", "--ui-queue-fixture", "-AppleLanguages", "(zh-Hans)"]
         app.launch()
@@ -30,6 +124,7 @@ final class CloudexUITests: XCTestCase {
     }
     func testFilePreviewAndPlanMode() {
         continueAfterFailure = false
+        previewFixture(["reset": true])
         let app = XCUIApplication()
         app.launchArguments = ["--ui-fixture", "--ui-preview-fixture", "-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN"]
         app.launch()
@@ -55,6 +150,25 @@ final class CloudexUITests: XCTestCase {
         app.buttons["完成"].firstMatch.tap()
         app.links["播放 GIF"].tap()
         XCTAssertTrue(app.buttons["暂停"].waitForExistence(timeout: 10))
+        var frames = Set<String>()
+        for _ in 0..<8 {
+            let screenshot = app.webViews.firstMatch.screenshot()
+            var pixel = [UInt8](repeating: 0, count: 4)
+            if let sample = screenshot.image.cgImage?.cropping(to: CGRect(x: 20, y: 20, width: 1, height: 1)) {
+                pixel.withUnsafeMutableBytes { bytes in
+                    let context = CGContext(data: bytes.baseAddress, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+                                            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+                    context.draw(sample, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+                }
+                if abs(Int(pixel[0]) - 18) < 12 && abs(Int(pixel[2]) - 84) < 12 { frames.insert("A") }
+                if abs(Int(pixel[0]) - 55) < 12 && abs(Int(pixel[2]) - 148) < 12 { frames.insert("B") }
+            }
+            let attachment = XCTAttachment(screenshot: screenshot)
+            attachment.name = "gif-animation-frame-\(frames.count)"; attachment.lifetime = .keepAlways; add(attachment)
+            if frames.count > 1 { break }
+            Thread.sleep(forTimeInterval: 0.17)
+        }
+        XCTAssertEqual(frames, ["A", "B"], "Both GIF frame colors must render, not just a loading transition")
         app.buttons["暂停"].tap()
         XCTAssertTrue(app.buttons["播放"].exists)
         snapshot("gif-preview")

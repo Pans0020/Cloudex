@@ -521,6 +521,7 @@ struct ContentView: View {
                                     }
                                 }
                             } label: { Image(systemName: "ellipsis").frame(width: 44, height: 32) }
+                            .accessibilityIdentifier("queue-actions-\(item.id)")
                         }
                         Text(item.body.message).font(.body).frame(maxWidth: .infinity, alignment: .leading)
                         if let files = item.body.files, !files.isEmpty {

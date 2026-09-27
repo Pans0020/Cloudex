@@ -1398,6 +1398,12 @@ final class AppViewModel: ObservableObject {
         outbox.selectedThreadID = "queue-a"
         let queueKey = outbox.queueStorageKey
         defer { UserDefaults.standard.removeObject(forKey: queueKey) }
+        let recoverPayload = try! JSONSerialization.data(withJSONObject: ["message": "recover text", "files": [["path": "/recovered.png"]]])
+        UserDefaults.standard.set(try! JSONEncoder().encode([LocalQueueDraft(id: "recover-local", payload: recoverPayload)]), forKey: queueKey)
+        outbox.recoverLocalQueueDraft(id: "recover-local")
+        outbox.recoverLocalQueueDraft(id: "recover-local")
+        precondition(outbox.attachedFiles.map(\.path) == ["/recovered.png"], "Recovering an outbox draft must restore attachments once")
+        UserDefaults.standard.removeObject(forKey: queueKey)
         let queued = QueuedMessage(id: "queue-1", body: .init(message: "one", collaborationMode: "plan"), status: "pending")
         outbox.acceptQueue(.init(paused: true, items: [queued], revision: 2), key: queueKey)
         outbox.acceptQueue(.init(paused: false, items: [], revision: 1), key: queueKey)
@@ -1666,6 +1672,7 @@ final class AppViewModel: ObservableObject {
         if ProcessInfo.processInfo.arguments.contains("--ui-preview-fixture") {
             serverURL = "http://127.0.0.1:18089"
             turns = [["id": "preview-turn", "status": "completed", "items": [
+                ["type": "imageArtifact", "id": "process-image", "attachments": [["name": "过程图片", "path": "/ui/picture.png", "kind": "image"]]],
                 ["type": "agentMessage", "id": "preview-answer", "text": "[查看实际界面截图](/ui/guide.md)\n\n![生成图片](/ui/picture.png)\n\n[HTML](/ui/page.html) · [GIF](/ui/animation.gif)"]
             ]]]
         }
@@ -2753,19 +2760,24 @@ final class AppViewModel: ObservableObject {
     }
     func uploadQueueDraft(id: String) async {
         let key = queueStorageKey
-        guard let threadID = selectedThreadID, let item = localQueueDrafts(key).first(where: { $0.id == id }),
-              let body = (try? JSONSerialization.jsonObject(with: item.payload)) as? [String: Any],
-              queueUploads.insert("\(key)|\(id)").inserted else { return }
+        guard let threadID = selectedThreadID, localQueueDrafts(key).contains(where: { $0.id == id }),
+              queueUploads.insert(key).inserted else { return }
         let sourceClient = client
-        defer { queueUploads.remove("\(key)|\(id)") }
-        do {
-            let snapshot: MessageQueueSnapshot = try await sourceClient.post(sourceClient.threadPath(threadID, action: "queue"), json: body)
-            let drafts = localQueueDrafts(key).filter { $0.id != id }
-            UserDefaults.standard.set(try? JSONEncoder().encode(drafts), forKey: key)
-            acceptQueue(snapshot, key: key)
-            if key == queueStorageKey { queueError = nil }
-        } catch {
-            if key == queueStorageKey { queueError = "尚未确认入队，可用同一消息重试：\(error.localizedDescription)" }
+        defer { queueUploads.remove(key) }
+        // A slow first POST must not let a later tap overtake it on the server.
+        // Bind the entire drain to its original host/thread, even after navigation.
+        while let item = localQueueDrafts(key).first {
+            guard let body = (try? JSONSerialization.jsonObject(with: item.payload)) as? [String: Any] else { return }
+            do {
+                let snapshot: MessageQueueSnapshot = try await sourceClient.post(sourceClient.threadPath(threadID, action: "queue"), json: body)
+                let drafts = localQueueDrafts(key).filter { $0.id != item.id }
+                UserDefaults.standard.set(try? JSONEncoder().encode(drafts), forKey: key)
+                acceptQueue(snapshot, key: key)
+                if key == queueStorageKey { queueError = nil }
+            } catch {
+                if key == queueStorageKey { queueError = "尚未确认入队，可用同一消息重试：\(error.localizedDescription)" }
+                return
+            }
         }
     }
     func changeQueue(_ action: String, id: String? = nil, message: String? = nil) async {
@@ -2794,10 +2806,15 @@ final class AppViewModel: ObservableObject {
 
     func recoverLocalQueueDraft(id: String) {
         let key = queueStorageKey
-        guard !queueUploads.contains("\(key)|\(id)"), let item = localQueueDrafts(key).first(where: { $0.id == id }),
+        guard !queueUploads.contains(key), let item = localQueueDrafts(key).first(where: { $0.id == id }),
               let body = (try? JSONSerialization.jsonObject(with: item.payload)) as? [String: Any] else { return }
         // Restore for inspection only; the server may have accepted a timed-out enqueue.
         draft = [draft, body["message"] as? String ?? ""].filter { !$0.isEmpty }.joined(separator: "\n\n")
+        for file in body["files"] as? [[String: Any]] ?? [] {
+            guard let path = file["path"] as? String, !attachedFiles.contains(where: { $0.path == path }) else { continue }
+            attachedFiles.append(RemoteFileEntry(name: (path as NSString).lastPathComponent, path: path, type: "file",
+                                                size: nil, modifiedAt: nil, selectable: true))
+        }
         localError = "已恢复草稿。请先同步队列核对是否已接收，避免重复发送。"
     }
 

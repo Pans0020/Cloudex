@@ -113,3 +113,54 @@ test("image artifacts use documented paths and typed MCP blocks only", () => {
   assert.equal(mediaAttachments({ type: "mcpToolCall", result: { content: [{ type: "image", mimeType: "image/png", data: "aGVsbG8=" }] } })[0].kind, "image");
   assert.deepEqual(mediaAttachments({ result: { content: [{ type: "text", text: "/private/secret.png" }] } }), []);
 });
+
+test("concurrent enqueue and workers never dispatch the same message twice", async t => {
+  const f = await fixture(t);
+  await Promise.all(Array.from({ length: 30 }, (_, i) => f.queue.add("a", { id: `concurrent-${i}`, message: `message ${i}` })));
+  assert.equal((await f.queue.list("a")).items.length, 30);
+  f.idle();
+  await Promise.all(Array.from({ length: 20 }, () => f.queue.tick()));
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls[0][1].message, "message 0");
+  assert.equal((await fs.stat(f.options.file)).mode & 0o777, 0o600);
+});
+
+test("terminal notification before send reply and restart while running reconcile without replay", async t => {
+  const f = await fixture(t, async (thread, body) => {
+    await f.queue.finish(thread, body.id, "completed");
+    f.turns([{ id: body.id, status: "completed" }]);
+    return { turn: { id: body.id, status: "inProgress" } };
+  });
+  await f.queue.add("a", { id: "early-terminal", message: "one" });
+  f.idle(); await f.queue.tick();
+  const restarted = new MessageQueue(f.options);
+  await restarted.tick(); await restarted.tick();
+  assert.equal((await restarted.list("a")).items[0].status, "completed");
+  assert.equal(f.calls.length, 1);
+});
+
+test("pause during slow inspection prevents dispatch and failed persistence keeps message unsent", async t => {
+  const f = await fixture(t);
+  let release;
+  const inspected = new Promise(resolve => { release = resolve; });
+  f.queue.inspect = () => inspected;
+  await f.queue.add("a", { id: "slow-inspect", message: "one" });
+  await f.queue.update("a", { action: "pause" });
+  release({ busy: false }); await f.queue.tick();
+  assert.equal(f.calls.length, 0);
+  assert.equal((await f.queue.list("a")).items[0].status, "pending");
+  f.queue.file = path.join(path.dirname(f.options.file), "blocked");
+  await fs.mkdir(f.queue.file); // rename onto a directory must fail.
+  await assert.rejects(f.queue.add("a", { id: "disk-failure", message: "two" }));
+  assert.equal((await f.queue.list("a")).items.length, 1);
+  assert.equal(f.calls.length, 0);
+});
+
+test("retrying cancellation after a lost response remains idempotent", async t => {
+  const f = await fixture(t);
+  await f.queue.add("a", { id: "cancel-retry", message: "one" });
+  await f.queue.update("a", { action: "cancel", id: "cancel-retry" });
+  const retry = await f.queue.update("a", { action: "cancel", id: "cancel-retry" });
+  assert.equal(retry.items[0].status, "cancelled");
+  f.idle(); await f.queue.tick(); assert.equal(f.calls.length, 0);
+});
