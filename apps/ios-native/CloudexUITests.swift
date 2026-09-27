@@ -18,6 +18,7 @@ final class CloudexUITests: XCTestCase {
             XCTAssertTrue(app.staticTexts["queue-\(token)-\(index)"].waitForExistence(timeout: 5))
         }
         snapshot("three-independent-queued-messages")
+        XCTAssertFalse(app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", "无法同步队列")).firstMatch.exists)
         app.terminate(); app.launch()
         XCTAssertTrue(app.buttons["展开CV"].waitForExistence(timeout: 10))
         app.buttons["展开CV"].tap()
@@ -25,6 +26,7 @@ final class CloudexUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["queue-\(token)-3"].waitForExistence(timeout: 10))
         XCTAssertFalse(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@ AND label CONTAINS %@", "queue-\(token)-1", "queue-\(token)-2")).firstMatch.exists)
         snapshot("queue-restored-after-relaunch")
+        XCTAssertFalse(app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", "无法同步队列")).firstMatch.exists)
     }
     func testFilePreviewAndPlanMode() {
         continueAfterFailure = false

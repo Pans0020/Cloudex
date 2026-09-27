@@ -2748,7 +2748,7 @@ final class AppViewModel: ObservableObject {
             let snapshot: MessageQueueSnapshot = try await client.get(client.threadPath(threadID, action: "queue"))
             acceptQueue(snapshot, key: key)
         } catch {
-            if key == queueStorageKey { queueError = "无法同步队列：\(error.localizedDescription)" }
+            if !Task.isCancelled && key == queueStorageKey { queueError = "无法同步队列：\(error.localizedDescription)" }
         }
     }
     func uploadQueueDraft(id: String) async {
@@ -2763,6 +2763,7 @@ final class AppViewModel: ObservableObject {
             let drafts = localQueueDrafts(key).filter { $0.id != id }
             UserDefaults.standard.set(try? JSONEncoder().encode(drafts), forKey: key)
             acceptQueue(snapshot, key: key)
+            if key == queueStorageKey { queueError = nil }
         } catch {
             if key == queueStorageKey { queueError = "尚未确认入队，可用同一消息重试：\(error.localizedDescription)" }
         }
@@ -3242,7 +3243,7 @@ final class AppViewModel: ObservableObject {
             collaborationModes = result.data.compactMap(\.mode).filter { ["default", "plan"].contains($0) }
             if collaborationModes.isEmpty { collaborationModeError = "此主机不支持工作模式切换" }
         } catch {
-            guard key == collaborationPreferenceKey else { return }
+            guard !Task.isCancelled, key == collaborationPreferenceKey else { return }
             collaborationModeError = "无法读取工作模式，请检查主机版本或连接"
         }
     }
