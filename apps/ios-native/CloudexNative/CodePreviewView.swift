@@ -53,6 +53,8 @@ final class NativeCodePreviewView: UIView, UIScrollViewDelegate {
     private var source = ""
     private var fileName = ""
     private var lastAppearance: UIUserInterfaceStyle = .unspecified
+    private var measuredLineCount = 1
+    private var measuredLineWidth: CGFloat = 0
 
     private let font = UIFont.monospacedSystemFont(ofSize: 13, weight: .regular)
     private let lineHeight: CGFloat = 19
@@ -106,6 +108,8 @@ final class NativeCodePreviewView: UIView, UIScrollViewDelegate {
         self.source = source
         self.fileName = fileName
         lastAppearance = appearance
+        measuredLineCount = max(source.components(separatedBy: "\n").count, 1)
+        measuredLineWidth = widestLineWidth(in: source)
 
         let palette = CodeHighlightPalette(dark: appearance == .dark)
         backgroundColor = palette.background
@@ -135,16 +139,14 @@ final class NativeCodePreviewView: UIView, UIScrollViewDelegate {
         guard bounds.width > 0, bounds.height > 0 else { return }
         verticalScrollView.frame = bounds
 
-        let lineCount = max(source.components(separatedBy: "\n").count, 1)
         let contentHeight = max(
             bounds.height + 1,
-            CGFloat(lineCount) * lineHeight + codeView.textContainerInset.top + codeView.textContainerInset.bottom
+            CGFloat(measuredLineCount) * lineHeight + codeView.textContainerInset.top + codeView.textContainerInset.bottom
         )
         gutterView.frame = CGRect(x: verticalScrollView.contentOffset.x, y: 0, width: gutterWidth, height: contentHeight)
 
         let viewportWidth = max(bounds.width - gutterWidth, 1)
-        let measuredWidth = widestLineWidth(in: source)
-        let codeWidth = max(viewportWidth, measuredWidth + horizontalPadding * 2)
+        let codeWidth = max(viewportWidth, measuredLineWidth + horizontalPadding * 2)
         codeView.frame = CGRect(x: gutterWidth, y: 0, width: codeWidth, height: contentHeight)
         verticalScrollView.contentSize = CGSize(width: gutterWidth + codeWidth, height: contentHeight)
         verticalScrollView.bringSubviewToFront(gutterView)

@@ -87,6 +87,21 @@ struct APIClient {
         return data
     }
 
+    func uploadImage(_ data: Data) async throws -> RemoteFileEntry {
+        var request = URLRequest(url: try makeURL(path: "/api/uploads/image"))
+        request.httpMethod = "POST"
+        request.timeoutInterval = 30
+        request.setValue("image/jpeg", forHTTPHeaderField: "Content-Type")
+        if !token.isEmpty { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        let (responseData, response) = try await URLSession.shared.upload(for: request, from: data)
+        guard let http = response as? HTTPURLResponse else { throw APIClientError.invalidResponse }
+        guard http.statusCode == 201 else {
+            let object = (try? JSONSerialization.jsonObject(with: responseData)) as? [String: Any]
+            throw APIClientError.server(status: http.statusCode, message: object?["error"] as? String ?? "上传失败")
+        }
+        return try JSONDecoder().decode(RemoteFileEntry.self, from: responseData)
+    }
+
     private func send<T: Decodable>(_ requestValue: URLRequest) async throws -> T {
         var request = requestValue
         request.timeoutInterval = 6

@@ -14,7 +14,7 @@ struct WorkspaceFilesView: View {
     @State private var entries: [RemoteFileEntry] = []
     @State private var isLoading = false
     @State private var previewLoadingPath: String?
-    @State private var previewItem: WorkspacePreviewItem?
+    @State private var previewItem: FilePreviewRequest?
     @State private var errorText: String?
 
     init(rootPath: String) {
@@ -38,8 +38,9 @@ struct WorkspaceFilesView: View {
                         } label: {
                             HStack(spacing: 12) {
                                 Image(systemName: iconName(for: entry))
-                                    .foregroundStyle(entry.isDirectory ? .blue : .secondary)
-                                    .frame(width: 24)
+                                    .foregroundStyle(entry.isDirectory ? CloudexTheme.accent : .secondary)
+                                    .frame(width: 36, height: 36)
+                                    .background(CloudexTheme.accent.opacity(0.055), in: RoundedRectangle(cornerRadius: 10))
                                 VStack(alignment: .leading, spacing: 3) {
                                     Text(entry.name)
                                         .foregroundStyle(.primary)
@@ -68,7 +69,9 @@ struct WorkspaceFilesView: View {
                         .buttonStyle(.plain)
                         .disabled(previewLoadingPath != nil)
                     }
-                    .listStyle(.plain)
+                    .listStyle(.insetGrouped)
+                    .scrollContentBackground(.hidden)
+                    .background(CloudexTheme.canvas)
                     .refreshable { await load() }
                 }
             }
@@ -90,23 +93,7 @@ struct WorkspaceFilesView: View {
         }
         .task(id: currentPath) { await load() }
         .sheet(item: $previewItem) { item in
-            NavigationStack {
-                Group {
-                    if let code = item.code {
-                        CodePreviewView(source: code, fileName: item.name)
-                    } else {
-                        QuickLookPreview(url: item.url)
-                    }
-                }
-                    .navigationTitle(item.name)
-                    .navigationBarTitleDisplayMode(.inline)
-                    .toolbar {
-                        ToolbarItem(placement: .confirmationAction) {
-                            Button("完成") { previewItem = nil }
-                        }
-                    }
-            }
-            .presentationDragIndicator(.visible)
+            FilePreviewSheet(request: item)
         }
         .alert("无法预览文件", isPresented: Binding(
             get: { errorText != nil && !entries.isEmpty },
@@ -142,26 +129,7 @@ struct WorkspaceFilesView: View {
             currentPath = entry.path
             return
         }
-        previewLoadingPath = entry.path
-        Task {
-            do {
-                let data = try await viewModel.previewFile(path: entry.path)
-                let directory = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("CloudexPreviews", isDirectory: true)
-                    .appendingPathComponent(UUID().uuidString, isDirectory: true)
-                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                let localURL = directory.appendingPathComponent(entry.name)
-                try data.write(to: localURL, options: .atomic)
-                previewItem = WorkspacePreviewItem(
-                    name: entry.name,
-                    url: localURL,
-                    code: CodePreviewFile.supports(fileName: entry.name) ? CodePreviewFile.decode(data) : nil
-                )
-            } catch {
-                errorText = error.localizedDescription
-            }
-            previewLoadingPath = nil
-        }
+        previewItem = FilePreviewRequest(path: entry.path, client: viewModel.client, root: rootPath)
     }
 
     private func load() async {
@@ -651,7 +619,7 @@ struct WorkspacePathBar: View {
                                     HStack(spacing: 5) {
                                         Image(systemName: isCurrent ? "folder.fill" : "folder")
                                             .font(.caption)
-                                            .foregroundStyle(isCurrent ? .blue : .secondary)
+                                            .foregroundStyle(isCurrent ? CloudexTheme.accent : .secondary)
                                         Text(item.name)
                                             .font(.caption.weight(isCurrent ? .semibold : .regular))
                                             .lineLimit(1)
@@ -824,41 +792,6 @@ private struct WorkspacePathBarSurface: ViewModifier {
     }
 }
 
-private struct WorkspacePreviewItem: Identifiable {
-    let id = UUID()
-    let name: String
-    let url: URL
-    let code: String?
-}
-
-private struct QuickLookPreview: UIViewControllerRepresentable {
-    let url: URL
-
-    func makeCoordinator() -> Coordinator { Coordinator(url: url) }
-
-    func makeUIViewController(context: Context) -> QLPreviewController {
-        let controller = QLPreviewController()
-        controller.dataSource = context.coordinator
-        return controller
-    }
-
-    func updateUIViewController(_ controller: QLPreviewController, context: Context) {
-        context.coordinator.url = url
-        controller.reloadData()
-    }
-
-    final class Coordinator: NSObject, QLPreviewControllerDataSource {
-        var url: URL
-
-        init(url: URL) { self.url = url }
-
-        func numberOfPreviewItems(in controller: QLPreviewController) -> Int { 1 }
-
-        func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> QLPreviewItem {
-            url as NSURL
-        }
-    }
-}
 
 struct WorkspaceBrowserView: View {
     @StateObject private var model = WorkspaceBrowserModel()

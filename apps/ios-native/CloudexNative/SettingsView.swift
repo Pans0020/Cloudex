@@ -10,6 +10,9 @@ struct SettingsView: View {
     @State private var notifyTaskFailure: Bool
     @State private var editingProfile: ServerProfile?
     @State private var showingNewProfile = false
+    @State private var showingQRCodeScanner = false
+    @State private var showingScannerError = false
+    @State private var scannerErrorMessage = ""
 
     init(isPresented: Binding<Bool>, viewModel: AppViewModel? = nil) {
         _isPresented = isPresented
@@ -23,10 +26,30 @@ struct SettingsView: View {
             Form {
                 Section {
                     Button {
+                        scannerErrorMessage = ""
+                        showingQRCodeScanner = true
+                    } label: {
+                        HStack(spacing: 12) {
+                            settingsIcon("qrcode.viewfinder")
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("扫描服务器二维码").font(.subheadline.weight(.semibold))
+                                Text("将电脑连接到 Cloudex").font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+                        }
+                        .padding(.vertical, 4)
+                    }
+                    .buttonStyle(.plain)
+                    Button {
                         showingNewProfile = true
                     } label: {
-                        Label("新建服务器", systemImage: "plus.circle.fill")
+                        HStack(spacing: 12) {
+                            settingsIcon("plus")
+                            Text("新建服务器").font(.subheadline.weight(.medium))
+                        }
                     }
+                    .buttonStyle(.plain)
                     if viewModel.serverProfiles.isEmpty {
                         Text("添加一个局域网或 Tailscale 服务器")
                             .font(.footnote)
@@ -37,8 +60,7 @@ struct SettingsView: View {
                                 editingProfile = profile
                             } label: {
                                 HStack(spacing: 10) {
-                                    Image(systemName: "server.rack")
-                                        .foregroundStyle(.secondary)
+                                    settingsIcon("server.rack")
                                     VStack(alignment: .leading, spacing: 2) {
                                         Text(profile.name)
                                             .fontWeight(.medium)
@@ -56,14 +78,33 @@ struct SettingsView: View {
                                         Image(systemName: "checkmark")
                                             .foregroundStyle(.tint)
                                     }
+                                    Image(systemName: "pencil")
+                                        .foregroundStyle(.secondary)
                                 }
                             }
                             .buttonStyle(.plain)
                         }
                     }
+                } header: {
+                    Text("连接与服务器")
+                }
+                .listRowBackground(CloudexTheme.surface.opacity(0.85))
+
+                Section {
+                    Toggle("显示历史过程入口", isOn: $viewModel.chatDetails.process)
+                    Toggle("显示思考摘要", isOn: $viewModel.chatDetails.thinking)
+                    Toggle("显示工具调用与文件改动", isOn: $viewModel.chatDetails.tools)
+                    Toggle("显示中间进展", isOn: $viewModel.chatDetails.progress)
+                    Toggle("显示时间与 Token 用量", isOn: $viewModel.chatDetails.statistics)
+                } header: {
+                    Text("对话显示")
+                } footer: {
+                    Text("即时生效并保存在此设备。仅控制已有过程信息的显示，不改变模型回答。最终回答、图片文件、错误和确认请求始终保留。")
                 }
 
                 Section("当前连接") {
+                    LabeledContent("App 构建", value: "\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""))")
+                    LabeledContent("代码版本", value: Bundle.main.object(forInfoDictionaryKey: "CloudexSourceRevision") as? String ?? "development")
                     LabeledContent("服务器", value: viewModel.serverProfileTitle)
                     LabeledContent("地址", value: viewModel.serverURL)
                     LabeledContent("状态", value: viewModel.status)
@@ -82,8 +123,17 @@ struct SettingsView: View {
                 }
 
             }
+            .scrollContentBackground(.hidden)
+            .background(CloudexTheme.canvas)
+            .listRowBackground(CloudexTheme.surface.opacity(0.85))
+            .tint(CloudexTheme.accent)
             .navigationTitle("设置")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("完成") { isPresented = false }
+                        .fontWeight(.semibold)
+                }
                 ToolbarItem(placement: .topBarLeading) {
                     Button {
                         Task {
@@ -111,6 +161,61 @@ struct SettingsView: View {
                 ServerProfileEditorView(profile: nil, isNew: true)
                     .environmentObject(viewModel)
             }
+            .sheet(isPresented: $showingQRCodeScanner, onDismiss: {
+                showingScannerError = !scannerErrorMessage.isEmpty
+            }) {
+                NavigationStack {
+                    QRCodeScannerView { code in
+                        connect(using: code)
+                    } onFailure: { message in
+                        showingQRCodeScanner = false
+                        scannerErrorMessage = message
+                    }
+                    .ignoresSafeArea(edges: .bottom)
+                    .navigationTitle("扫描连接二维码")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("取消") { showingQRCodeScanner = false }
+                        }
+                    }
+                }
+            }
+            .alert("无法扫描二维码", isPresented: $showingScannerError) {
+                Button("好", role: .cancel) {}
+            } message: {
+                Text(scannerErrorMessage)
+            }
+        }
+    }
+
+    private func settingsIcon(_ name: String) -> some View {
+        Image(systemName: name)
+            .font(.system(size: 17, weight: .medium))
+            .foregroundStyle(CloudexTheme.accent)
+            .frame(width: 36, height: 36)
+            .background(CloudexTheme.accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 11))
+            .accessibilityHidden(true)
+    }
+
+    private func connect(using code: String) {
+        guard let payload = CloudexConnectionPayload(code: code) else {
+            showingQRCodeScanner = false
+            scannerErrorMessage = "这不是有效的 Cloudex 服务器连接二维码。"
+            return
+        }
+
+        showingQRCodeScanner = false
+        Task {
+            let mode = payload.preferredConnectionMode
+            await viewModel.saveServerProfile(
+                id: nil,
+                name: "",
+                lanURL: mode == .lan ? payload.serverURL : "",
+                tailscaleURL: mode == .tailscale ? payload.serverURL : "",
+                connectionMode: mode,
+                token: payload.token
+            )
         }
     }
 }
@@ -131,7 +236,7 @@ private struct ServerProfileEditorView: View {
         NavigationStack {
             Form {
                 Section("服务器") {
-                    TextField("名称", text: $name)
+                    TextField("主机名称", text: $name)
                     Picker("默认连接方式", selection: $mode) {
                         ForEach(ConnectionMode.allCases) { Text($0.title).tag($0) }
                     }

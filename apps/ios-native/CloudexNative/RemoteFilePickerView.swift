@@ -34,8 +34,9 @@ struct RemoteFilePickerView: View {
                             } label: {
                                 HStack(spacing: 12) {
                                     Image(systemName: iconName(for: entry))
-                                        .foregroundStyle(entry.isDirectory ? .blue : .secondary)
-                                        .frame(width: 24)
+                                        .foregroundStyle(entry.isDirectory ? CloudexTheme.accent : .secondary)
+                                        .frame(width: 36, height: 36)
+                                        .background(CloudexTheme.accent.opacity(0.055), in: RoundedRectangle(cornerRadius: 10))
                                     VStack(alignment: .leading, spacing: 3) {
                                         Text(entry.name)
                                             .foregroundStyle(.primary)
@@ -55,7 +56,9 @@ struct RemoteFilePickerView: View {
                             }
                             .buttonStyle(.plain)
                         }
-                        .listStyle(.plain)
+                        .listStyle(.insetGrouped)
+                        .scrollContentBackground(.hidden)
+                        .background(CloudexTheme.canvas)
                         .refreshable { await load() }
                     }
                 }

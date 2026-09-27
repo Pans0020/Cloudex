@@ -1,12 +1,18 @@
 import os from "node:os";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { mediaAttachments } from "./media-attachments.js";
+import crypto from "node:crypto";
 import { config } from "./config.js";
 
-const SESSION_FILE_RE = /rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
+const UUID_RE = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const SESSION_FILE_RE = new RegExp(`^rollout-.*-(${UUID_RE})(?:_(${UUID_RE}))?\\.jsonl$`, "i");
 const ARCHIVE_FILE = path.join(config.stateDir, "archived-cli-threads.json");
 const SESSION_INDEX_FILE = path.join(os.homedir(), ".codex", "session_index.jsonl");
 const threadSummaryCache = new Map();
+let detailCache = null;
+let detailReadQueue = Promise.resolve();
+let archiveWrite = Promise.resolve();
 let sessionIndexSignature = "";
 let sessionIndexNames = new Map();
 
@@ -323,10 +329,18 @@ function itemPlainText(item) {
 }
 
 function addUniqueItem(turn, item) {
-  if (!item?.text && item.type !== "userMessage" && item.type !== "commandExecution") return;
+  if (!item?.text && !item?.attachments?.length && item.type !== "userMessage" && item.type !== "commandExecution") return;
   if (turn.items.some((existing) => existing.id === item.id)) return;
   const text = itemPlainText(item).trim();
-  if (text && turn.items.some((existing) => existing.type === item.type && itemPlainText(existing).trim() === text)) return;
+  const duplicate = text && item.type !== "commandExecution"
+    ? turn.items.find((existing) => existing.type === item.type && itemPlainText(existing).trim() === text)
+    : null;
+  if (duplicate) {
+    if (item.type === "userMessage" && item.content?.some((part) => part.type === "image")) {
+      duplicate.content = item.content;
+    }
+    return;
+  }
   turn.items.push(item);
 }
 
@@ -447,6 +461,11 @@ function parseSessionLine(state, record) {
   }
 
   if (record.type === "response_item") {
+    const attachments = mediaAttachments(payload);
+    if (attachments.length) {
+      const turn = getOrCreateTurn(state, state.currentTurnId || payload.internal_chat_message_metadata_passthrough?.turn_id, timestamp);
+      addUniqueItem(turn, { type: "imageArtifact", id: `${payload.call_id || payload.id || turn.id}-images`, attachments, createdAt });
+    }
     const metadataTurnId = payload.internal_chat_message_metadata_passthrough?.turn_id;
     // Model response metadata may carry an internal ID, not an app-server
     // turn ID. Keep those items in the task established by lifecycle events.
@@ -547,16 +566,23 @@ function parseSessionLine(state, record) {
       return;
     }
     if (payload.type === "message" && payload.role === "user") {
-      // New rollouts store user input as response items, alongside injected
-      // instructions. Only explicitly tagged user text belongs in the chat.
+      // New rollouts store user input alongside injected instructions.
+      // Only explicitly tagged user text and images belong in the chat.
       const kinds = payload.internal_chat_message_metadata_passthrough?.content_item_kinds || [];
-      const text = textFromContent((payload.content || []).filter((_, index) => kinds[index] === "user.text"));
-      if (!text) return;
+      const content = (payload.content || []).flatMap((part, index) => {
+        if (kinds[index] === "user.text") return [{ type: "text", text: part.text || "" }];
+        if (kinds[index] === "user.image") return [{
+          type: "image", name: `图片 ${index + 1}`, path: part.path || null,
+          url: part.image_url || null,
+        }];
+        return [];
+      });
+      if (!content.some((part) => part.type === "image" || part.text?.trim())) return;
       const turn = getOrCreateTurn(state, turnId, timestamp);
       addUniqueItem(turn, {
         type: "userMessage",
         id: payload.id || `${turn.id}-user-${turn.items.length}`,
-        content: [{ type: "text", text }],
+        content,
         createdAt,
       });
       return;
@@ -577,6 +603,45 @@ function parseSessionLine(state, record) {
 
   if (record.type !== "event_msg") return;
   state.name = threadNameFromPayload(payload) || state.name;
+  if (payload.type === "item_completed") {
+    const completed = payload.item || {};
+    const attachments = mediaAttachments(completed);
+    if (attachments.length) {
+      const turn = getOrCreateTurn(state, payload.turn_id, timestamp);
+      addUniqueItem(turn, { type: "imageArtifact", id: `${completed.id || turn.id}-images`, attachments, createdAt });
+    }
+    if (!["McpToolCall", "FileChange"].includes(completed.type)) return;
+    const turn = getOrCreateTurn(state, payload.turn_id, timestamp);
+    if (completed.type === "McpToolCall") {
+      addUniqueItem(turn, {
+        type: "commandExecution",
+        id: completed.id || `${turn.id}-mcp-${turn.items.length}`,
+        command: `${completed.server || "MCP"}.${completed.tool || "tool"}`,
+        activity: "ran",
+        status: completed.status || "completed",
+        createdAt,
+      });
+    } else {
+      const files = Object.keys(completed.changes || {});
+      if (!files.length) return;
+      const existingEdit = turn.items.findLast((item) => item.activity === "edited"
+        && files.some((file) => item.command?.includes(path.basename(file)))
+        && (item.status === "inProgress" || Math.abs((item.createdAt || 0) - createdAt) < 10));
+      if (existingEdit) {
+        existingEdit.status = completed.status || "completed";
+        return;
+      }
+      addUniqueItem(turn, {
+        type: "commandExecution",
+        id: completed.id || `${turn.id}-edit-${turn.items.length}`,
+        command: files.map((file) => path.basename(file)).join(", "),
+        activity: "edited",
+        status: completed.status || "completed",
+        createdAt,
+      });
+    }
+    return;
+  }
   if (payload.type === "token_count") {
     state.usage = usageFromPayload(payload, timestamp);
     return;
@@ -648,6 +713,10 @@ export function threadIdFromPath(filePath) {
   return match?.[1] || null;
 }
 
+export function isContinuationPath(filePath) {
+  return Boolean(path.basename(filePath).match(SESSION_FILE_RE)?.[2]);
+}
+
 export async function findSessionFiles(root = config.codexSessionsDir) {
   const results = [];
   async function walk(dir) {
@@ -664,14 +733,63 @@ export async function findSessionFiles(root = config.codexSessionsDir) {
 }
 
 export async function readCliThread(filePath, { includeTurns = true } = {}) {
-  const idFromPath = threadIdFromPath(filePath);
-  const stat = await fs.stat(filePath);
-  const cacheKey = `${filePath}:${stat.mtimeMs}:${stat.size}`;
+  const files = (Array.isArray(filePath) ? filePath : [filePath]).sort();
+  if (!includeTurns) return readCliThreadUnqueued(files, false);
+  const reading = detailReadQueue.then(() => readCliThreadUnqueued(files, true));
+  detailReadQueue = reading.catch(() => {});
+  return reading;
+}
+
+async function parseSessionFile(state, filePath, stat, start) {
+  const bytes = Buffer.allocUnsafe(stat.size - start);
+  const handle = await fs.open(filePath, "r");
+  try {
+    let read = 0;
+    while (read < bytes.length) {
+      const result = await handle.read(bytes, read, bytes.length - read, start + read);
+      if (result.bytesRead === 0) break;
+      read += result.bytesRead;
+    }
+    let offset = start;
+    for (const line of bytes.subarray(0, read).toString("utf8").split(/(?<=\n)/)) {
+      if (!line) continue;
+      const record = safeJson(line);
+      if (record) {
+        parseSessionLine(state, record);
+        offset += Buffer.byteLength(line);
+      } else if (line.endsWith("\n")) {
+        offset += Buffer.byteLength(line);
+      }
+    }
+    return offset;
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readCliThreadUnqueued(files, includeTurns) {
+  const idFromPath = threadIdFromPath(files[0]);
+  const fileStats = await Promise.all(files.map(async (filePath) => ({
+    filePath, stat: await fs.stat(filePath),
+  })));
+  const latest = fileStats.at(-1);
+  const updatedAt = Math.max(...fileStats.map(({ stat }) => stat.mtimeMs / 1000));
+  const cacheKey = fileStats.map(({ filePath, stat }) => `${filePath}:${stat.mtimeMs}:${stat.size}`).join("|");
+  const syncRevision = fileStats.map(({ stat }) => `${stat.mtimeMs}:${stat.size}`).join("|");
   if (!includeTurns) {
-    const cached = threadSummaryCache.get(filePath);
+    const cached = threadSummaryCache.get(files[0]);
     if (cached?.key === cacheKey) return { thread: cached.thread, turns: [] };
   }
-  const state = {
+  // ponytail: Codex rollouts grow by append; rewriting a longer file in place requires a fresh parse.
+  const reusable = includeTurns && detailCache?.files.length === files.length
+    && fileStats.every(({ filePath, stat }, index) => {
+      const cached = detailCache.files[index];
+      return cached.filePath === filePath && cached.ino === stat.ino && cached.dev === stat.dev
+        && (index === files.length - 1
+          ? stat.size > cached.size || (stat.size === cached.size && stat.mtimeMs === cached.mtimeMs)
+          : stat.size === cached.size && stat.mtimeMs === cached.mtimeMs);
+    });
+  const state = reusable ? detailCache.state : {
     id: idFromPath,
     cwd: null,
     cliVersion: null,
@@ -682,7 +800,7 @@ export async function readCliThread(filePath, { includeTurns = true } = {}) {
     threadSource: "cli-local",
     sessionId: idFromPath,
     createdAt: 0,
-    updatedAt: stat.mtimeMs / 1000,
+    updatedAt,
     currentTurnId: null,
     turnMap: new Map(),
     toolCallMap: new Map(),
@@ -690,14 +808,21 @@ export async function readCliThread(filePath, { includeTurns = true } = {}) {
     turns: [],
     usage: null,
   };
-  const raw = await fs.readFile(filePath, "utf8");
-  for (const line of raw.split("\n")) {
-    if (line.trim()) parseSessionLine(state, safeJson(line));
+  const cachedFiles = [];
+  for (const [index, { filePath, stat }] of fileStats.entries()) {
+    const previous = reusable ? detailCache.files[index] : null;
+    const start = previous?.offset || 0;
+    const offset = !previous || stat.size > previous.size
+      ? await parseSessionFile(state, filePath, stat, start)
+      : start;
+    cachedFiles.push({ filePath, ino: stat.ino, dev: stat.dev,
+      size: stat.size, mtimeMs: stat.mtimeMs, offset });
   }
+  if (includeTurns) detailCache = { files: cachedFiles, state };
   const indexedName = (await readSessionIndexNames()).get(state.id);
   if (indexedName) state.name = indexedName;
-  const createdAt = state.createdAt || stat.birthtimeMs / 1000 || state.updatedAt;
-  const updatedAt = Math.max(state.updatedAt || 0, stat.mtimeMs / 1000);
+  const createdAt = state.createdAt || fileStats[0].stat.birthtimeMs / 1000 || state.updatedAt;
+  const recencyAt = Math.max(state.updatedAt || 0, updatedAt);
   const thread = {
     id: state.id,
     extra: null,
@@ -711,11 +836,11 @@ export async function readCliThread(filePath, { includeTurns = true } = {}) {
     modelProvider: state.modelProvider,
     model: state.model,
     createdAt,
-    updatedAt,
-    syncRevision: `${stat.mtimeMs}:${stat.size}`,
-    recencyAt: updatedAt,
-    status: statusFromTurns(state.turns, updatedAt),
-    path: filePath,
+    updatedAt: recencyAt,
+    syncRevision,
+    recencyAt,
+    status: statusFromTurns(state.turns, recencyAt),
+    path: latest.filePath,
     cwd: state.cwd || "未指定项目目录",
     cliVersion: state.cliVersion,
     source: state.source || "codex-cli",
@@ -728,7 +853,7 @@ export async function readCliThread(filePath, { includeTurns = true } = {}) {
     usage: state.usage,
     ...(includeTurns ? { turns: state.turns } : {}),
   };
-  if (!includeTurns) threadSummaryCache.set(filePath, { key: cacheKey, thread });
+  if (!includeTurns) threadSummaryCache.set(files[0], { key: cacheKey, thread });
   return { thread, turns: includeTurns ? state.turns : [] };
 }
 
@@ -736,30 +861,47 @@ export async function readArchiveSet() {
   try {
     const data = JSON.parse(await fs.readFile(ARCHIVE_FILE, "utf8"));
     return new Set(Array.isArray(data.archivedThreadIds) ? data.archivedThreadIds : []);
-  } catch {
-    return new Set();
+  } catch (error) {
+    if (error.code === "ENOENT") return new Set();
+    throw error;
   }
 }
 
 export async function writeArchiveSet(archiveSet) {
   await fs.mkdir(path.dirname(ARCHIVE_FILE), { recursive: true });
-  await fs.writeFile(ARCHIVE_FILE, JSON.stringify({
-    archivedThreadIds: [...archiveSet].sort(),
-    updatedAt: new Date().toISOString(),
-  }, null, 2));
+  const temporaryFile = `${ARCHIVE_FILE}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  try {
+    await fs.writeFile(temporaryFile, JSON.stringify({
+      archivedThreadIds: [...archiveSet].sort(),
+      updatedAt: new Date().toISOString(),
+    }, null, 2));
+    await fs.rename(temporaryFile, ARCHIVE_FILE);
+  } finally {
+    await fs.rm(temporaryFile, { force: true });
+  }
 }
 
 export async function archiveCliThread(threadId) {
-  const archiveSet = await readArchiveSet();
-  archiveSet.add(threadId);
-  await writeArchiveSet(archiveSet);
-  return { archived: true, threadId };
+  const operation = archiveWrite.then(async () => {
+    const archiveSet = await readArchiveSet();
+    archiveSet.add(threadId);
+    await writeArchiveSet(archiveSet);
+    return { archived: true, threadId };
+  });
+  archiveWrite = operation.catch(() => {});
+  return operation;
 }
 
 export async function listCliThreads({ archived = false } = {}) {
   const archiveSet = await readArchiveSet();
   const files = await findSessionFiles();
-  const settled = await Promise.allSettled(files.map((file) => readCliThread(file, { includeTurns: false })));
+  const groups = new Map();
+  for (const file of files) {
+    const id = threadIdFromPath(file);
+    if (!groups.has(id)) groups.set(id, []);
+    groups.get(id).push(file);
+  }
+  const settled = await Promise.allSettled([...groups.values()].map((group) => readCliThread(group, { includeTurns: false })));
   return settled
     .filter((item) => item.status === "fulfilled")
     .map((item) => item.value.thread)
@@ -776,10 +918,5 @@ export async function readCliThreadById(threadId) {
     error.status = 404;
     throw error;
   }
-  const stats = await Promise.all(matches.map(async (candidate) => ({
-    file: candidate,
-    stat: await fs.stat(candidate),
-  })));
-  const newest = stats.sort((left, right) => right.stat.mtimeMs - left.stat.mtimeMs)[0];
-  return readCliThread(newest.file);
+  return readCliThread(matches);
 }

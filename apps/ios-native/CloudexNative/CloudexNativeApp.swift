@@ -13,7 +13,11 @@ struct CloudexNativeApp: App {
 
     var body: some Scene {
         WindowGroup {
-            CloudexRootView()
+            CloudexRootView(viewModel: viewModel)
+                .tint(CloudexTheme.accent)
+                #if DEBUG
+                .preferredColorScheme(ProcessInfo.processInfo.arguments.contains("--ui-dark-fixture") ? .dark : nil)
+                #endif
                 .environmentObject(viewModel)
                 .onAppear {
                     CloudexAppDelegate.notifications.attach(viewModel: viewModel)
@@ -23,7 +27,8 @@ struct CloudexNativeApp: App {
                     CloudexAppDelegate.notifications.setAppIsInForeground(phase == .active)
                     if phase == .active {
                         Task { await viewModel.resumeFromForeground() }
-                    } else {
+                    } else if phase == .background {
+                        viewModel.suspendForBackground()
                         for approval in viewModel.pendingApprovals {
                             CloudexAppDelegate.notifications.scheduleApproval(approval)
                         }
@@ -55,6 +60,9 @@ final class CloudexNotificationManager: NSObject, UNUserNotificationCenterDelega
     private var appIsInForeground = true
 
     func configure() {
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--ui-fixture") { return }
+        #endif
         let center = UNUserNotificationCenter.current()
         center.delegate = self
         center.setNotificationCategories([

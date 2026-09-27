@@ -5,6 +5,7 @@ import { CodexError } from "./codex-client.js";
 import {
   commandActivity,
   findSessionFiles,
+  isContinuationPath,
   readCliThreadById,
   threadIdFromPath,
 } from "./cli-sessions.js";
@@ -328,7 +329,7 @@ async function waitForNewSession(before, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const files = await findSessionFiles();
-    const candidates = files.filter((file) => !before.has(file));
+    const candidates = files.filter((file) => !before.has(file) && !isContinuationPath(file));
     if (candidates.length > 0) {
       const stats = await Promise.all(candidates.map(async (file) => ({
         file,

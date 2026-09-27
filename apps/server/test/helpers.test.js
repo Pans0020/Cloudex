@@ -1,12 +1,59 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { listModelsViaStdio } from "../src/app-server-stdio.js";
 import { readCliThread } from "../src/cli-sessions.js";
 import { daemonPaths, isProcessRunning, readPidRecord } from "../src/daemon.js";
 import { isPathInside, normalizeAllowedPath } from "../src/file-roots.js";
+import { projectsFromThreads } from "../src/server.js";
+
+test("temporary Codex workspaces do not become phone projects", () => {
+  const realTemp = path.join(fsSync.realpathSync(os.tmpdir()), "pytest-of-user", "test_fake_cli_matrix_records_e0");
+  const aliasTemp = path.join(os.tmpdir(), "cue-codex-smoke-example");
+  const threads = [
+    { id: "test-real", cwd: realTemp, updatedAt: 3 },
+    { id: "test-alias", cwd: aliasTemp, updatedAt: 2 },
+    { id: "real", cwd: path.join(os.homedir(), "Cloudex"), updatedAt: 1 },
+  ];
+  const projects = projectsFromThreads(threads);
+  assert.deepEqual(projects.map((project) => project.name), ["Cloudex"]);
+  assert.deepEqual(projects[0].threads.map((thread) => thread.id), ["real"]);
+});
+
+test("application support sessions do not create a second project with the same name", () => {
+  const threads = [
+    { id: "project", cwd: path.join(os.homedir(), "Project", "Cue"), updatedAt: 2 },
+    { id: "app-data", cwd: path.join(os.homedir(), "Library", "Application Support", "Cue"), updatedAt: 1 },
+  ];
+  const projects = projectsFromThreads(threads);
+  assert.deepEqual(projects.map((project) => project.name), ["Cue", "无项目"]);
+  assert.deepEqual(projects.map((project) => project.threads[0].id), ["project", "app-data"]);
+});
+
+test("internal exec runs are hidden without hiding real image conversations or CLI projects", () => {
+  const home = os.homedir();
+  const petRuns = path.join(home, ".codex", "pet-runs", "example");
+  const appData = path.join(home, "Library", "Application Support", "Cue");
+  const image = '<image name=[Image #1] path="/picture.png"></image>Read this picture';
+  const threads = [
+    { id: "pet-qa", source: "exec", threadSource: "user", cwd: petRuns, preview: image },
+    { id: "pet-render", source: "exec", cwd: petRuns, preview: "Generate a sprite row" },
+    { id: "cue-benchmark", source: "exec", cwd: appData, preview: image },
+    { id: "real-image", source: "vscode", cwd: home, preview: image },
+    { id: "real-cli", source: "exec", cwd: path.join(home, "Project", "Cue"), preview: image },
+    { id: "real-home-cli", source: "exec", cwd: home, preview: image },
+    { id: "interactive-pet", source: "vscode", cwd: petRuns, preview: image },
+    { id: "skill-edit", source: "exec", cwd: path.join(home, ".codex", "skills"), preview: image },
+    { id: "prefix-sibling", source: "exec", cwd: path.join(home, ".codex", "pet-runs-backup"), preview: image },
+    { id: "other-provider", provider: "claude", source: "exec", cwd: petRuns, preview: image },
+  ];
+  const actual = projectsFromThreads(threads).flatMap((project) => project.threads.map((thread) => thread.id));
+  const expected = threads.filter((thread) => !["pet-qa", "pet-render", ...(process.platform === "darwin" ? ["cue-benchmark"] : [])].includes(thread.id)).map((thread) => thread.id);
+  assert.deepEqual(actual.sort(), expected.sort());
+});
 
 test("project has a package and a safe default workspace root", async () => {
   const packageJson = await import("../package.json", { with: { type: "json" } });

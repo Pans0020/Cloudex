@@ -1,4 +1,5 @@
 import http from "node:http";
+import crypto from "node:crypto";
 import os from "node:os";
 import fs from "node:fs/promises";
 import syncFs from "node:fs";
@@ -16,21 +17,36 @@ import {
   stopThread as stopWindowsThread,
 } from "./windows-cli.js";
 import { printConnectionQRCode } from "./connection-qr.js";
-import { normalizeAllowedPath } from "./file-roots.js";
+import { isPathInside, normalizeAllowedPath } from "./file-roots.js";
 import { listModelsViaStdio } from "./app-server-stdio.js";
 import { QwenProvider } from "./qwen-provider.js";
 import { ClaudeProvider } from "./claude-provider.js";
+import { mediaAttachments } from "./media-attachments.js";
+import { collaborationModeParams } from "./collaboration-mode.js";
+import { MessageQueue } from "./message-queue.js";
 
 const client = new CodexClient();
 const qwenProvider = new QwenProvider();
 const claudeProvider = new ClaudeProvider();
 const execFile = promisify(execFileCallback);
 const subscribers = new Map();
+const unsubscribeTimers = new Map();
+const ownedRunningThreads = new Set();
+const streamLeaseTimers = new Map();
 const globalSubscribers = new Set();
 const eventHistory = new Map();
 const pendingApprovals = new Map();
+const pendingInputs = new Map();
 const EVENT_HISTORY_LIMIT = 250;
 const APPROVAL_HISTORY_FILE = path.join(config.stateDir, "approval-history.json");
+const UPLOAD_ROOT = path.join(config.stateDir, "uploads");
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const messageQueue = new MessageQueue({
+  file: path.join(config.stateDir, "message-queue.json"),
+  send: sendThreadMessage,
+  inspect: async threadId => ({ ...await readThreadDetail(threadId), busy: ownedRunningThreads.has(threadId) }),
+  changed: (threadId, queue) => broadcastGlobal("queue/changed", { threadId, ...queue }),
+});
 let approvalHistory = null;
 let approvalHistoryLoadPromise = null;
 let approvalHistoryWrite = Promise.resolve();
@@ -41,6 +57,7 @@ let syncInFlight = false;
 let syncAgainReason = null;
 let syncTimer = null;
 let syncInterval = null;
+let archiveRevision = 0;
 
 async function loadApprovalHistory() {
   if (approvalHistory) return approvalHistory;
@@ -295,8 +312,27 @@ function fileContentType(filePath) {
   })[extension] || "application/octet-stream";
 }
 
-async function sendFilePreview(res, candidate) {
+async function sendFilePreview(res, candidate, previewRoot = null) {
   const filePath = await normalizeWorkspacePath(candidate);
+  const realFile = await fs.realpath(filePath);
+  const roots = [...config.fileRoots, UPLOAD_ROOT, ...(latestProjectSnapshot?.projects || []).map(project => project.cwd).filter(Boolean)];
+  const withinRealRoots = async values => {
+    for (const root of values) {
+      try { if (isPathInside(await fs.realpath(root), realFile)) return true; } catch {}
+    }
+    return false;
+  };
+  if (!await withinRealRoots(roots) && !await withinRealRoots(projectRootsFromThreads(await listAllThreads(false)))) {
+    throw Object.assign(new Error("File target is outside allowed file roots"), { status: 403 });
+  }
+  if (previewRoot) {
+    const root = await fs.realpath(await normalizeWorkspacePath(previewRoot));
+    if (!isPathInside(root, realFile)) {
+      const error = new Error("HTML resources must remain inside the document directory");
+      error.status = 403;
+      throw error;
+    }
+  }
   const metadata = await fs.stat(filePath);
   if (!metadata.isFile()) {
     const error = new Error("Path is not a file");
@@ -318,9 +354,12 @@ async function sendFilePreview(res, candidate) {
   res.end(data);
 }
 
-function errorResponse(res, error) {
-  const status = error.status || (error instanceof CodexError ? 502 : 400);
-  json(res, status, { error: error.message || "Request failed" });
+export function errorResponse(res, error) {
+  const writerBusy = /already has an active writer/i.test(error.message || "");
+  const status = writerBusy ? 409 : error.status || (error instanceof CodexError ? 502 : 400);
+  json(res, status, { error: writerBusy
+    ? "此会话正由其他客户端占用写入权。仅切换电脑端对话不会释放；请关闭占用该会话的客户端后重试。"
+    : error.message || "Request failed" });
 }
 
 function isImage(filePath) {
@@ -367,6 +406,40 @@ function body(req) {
   });
 }
 
+async function imageBody(req) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > MAX_IMAGE_BYTES) {
+      const error = new Error("Image is larger than 10 MB");
+      error.status = 413;
+      throw error;
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+export async function saveUploadedImage(data, contentType) {
+  const formats = {
+    "image/jpeg": { extension: "jpg", valid: data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff },
+    "image/png": { extension: "png", valid: data.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])) },
+    "image/webp": { extension: "webp", valid: data.toString("ascii", 0, 4) === "RIFF" && data.toString("ascii", 8, 12) === "WEBP" },
+  };
+  const format = formats[contentType];
+  if (!format?.valid || data.length === 0 || data.length > MAX_IMAGE_BYTES) {
+    const error = new Error("Only PNG, JPEG or WebP images up to 10 MB are supported");
+    error.status = 415;
+    throw error;
+  }
+  await fs.mkdir(UPLOAD_ROOT, { recursive: true, mode: 0o700 });
+  const name = `${crypto.randomUUID()}.${format.extension}`;
+  const filePath = path.join(UPLOAD_ROOT, name);
+  await fs.writeFile(filePath, data, { mode: 0o600 });
+  return { name, path: filePath, type: "file", size: data.length, selectable: true };
+}
+
 function getThreadId(message) {
   const params = message.params || {};
   return params.threadId || params.thread?.id || params.turn?.threadId || null;
@@ -392,8 +465,20 @@ function remember(message) {
 }
 
 function publish(message) {
+  if (message.params?.item) {
+    const attachments = mediaAttachments(message.params.item);
+    if (attachments.length) message = { ...message, params: { ...message.params, item: { ...message.params.item,
+      id: `${message.params.item.id}-images`, type: "imageArtifact", attachments } } };
+  }
   const threadId = getThreadId(message);
   const record = remember(message);
+  if (threadId && ["turn/completed", "turn/failed", "turn/interrupted", "turn/cancelled", "turn/canceled"].includes(message.method)) {
+    ownedRunningThreads.delete(threadId);
+    scheduleThreadUnsubscribe(threadId);
+    const turnId = message.params?.turn?.id || message.params?.turnId;
+    const status = message.params?.turn?.status || message.method.split("/")[1];
+    void messageQueue.finish(threadId, turnId, status).then(() => messageQueue.kick(threadId)).catch(error => console.warn("Queue:", error.message));
+  }
   // Keep the global bus lossless so other local clients (including a CLI
   // bridge) can observe the same live tool progress as thread subscribers.
   broadcastGlobal("notification", message);
@@ -456,6 +541,25 @@ function approvalFromRequest(message) {
 }
 
 client.on("serverRequest", (message) => {
+  if (["item/tool/requestUserInput", "mcpServer/elicitation/request"].includes(message.method)) {
+    const params = message.params || {};
+    const fields = Object.entries(params.requestedSchema?.properties || {}).map(([key, value]) => {
+      const schema = value && typeof value === "object" ? value : {};
+      const options = schema.enum || schema.oneOf?.map((option) => option.const);
+      return {
+        key,
+        title: schema.title || key,
+        description: schema.description || null,
+        type: typeof schema.type === "string" ? schema.type : "string",
+        options: Array.isArray(options) ? options.filter((option) => typeof option === "string") : null,
+        required: params.requestedSchema?.required?.includes(key) || false,
+      };
+    });
+    const input = { ...params, id: String(message.id), method: message.method, fields };
+    pendingInputs.set(input.id, input);
+    broadcastGlobal("input/requested", input);
+    return;
+  }
   const approval = approvalFromRequest(message);
   if (!approval) return;
   pendingApprovals.set(approval.id, { approval, rpcId: message.id, requestParams: message.params || {} });
@@ -468,6 +572,7 @@ client.on("notification", (message) => {
   const requestId = message.params?.requestId;
   if (requestId === undefined) return;
   const id = String(requestId);
+  if (pendingInputs.delete(id)) broadcastGlobal("input/resolved", { id });
   const pendingApproval = pendingApprovals.get(id);
   if (!pendingApproval) return;
   pendingApprovals.delete(id);
@@ -486,12 +591,49 @@ client.on("notification", (message) => {
   });
 });
 
-function subscribe(threadId, res) {
+client.on("disconnected", () => {
+  ownedRunningThreads.clear();
+  for (const id of pendingInputs.keys()) broadcastGlobal("input/resolved", { id });
+  pendingInputs.clear();
+});
+
+export function scheduleThreadUnsubscribe(threadId, delay = 250) {
+  if (!hasCodexProvider() || usesWindowsCliFallback() || ownedRunningThreads.has(threadId)) return;
+  if (unsubscribeTimers.has(threadId)) clearTimeout(unsubscribeTimers.get(threadId));
+  const timer = setTimeout(() => {
+    unsubscribeTimers.delete(threadId);
+    if (!ownedRunningThreads.has(threadId)) {
+      client.unsubscribeThread(threadId, () => !ownedRunningThreads.has(threadId)).catch((error) =>
+        console.warn(`Cloudex unsubscribe failed: ${error.message}`));
+    }
+  }, delay);
+  unsubscribeTimers.set(threadId, timer);
+}
+
+export function renewThreadLease(threadId, delay = 20000) {
+  if (!subscribers.has(threadId)) return;
+  clearTimeout(streamLeaseTimers.get(threadId));
+  const timer = setTimeout(() => {
+    streamLeaseTimers.delete(threadId);
+    for (const res of subscribers.get(threadId) || []) res.destroy();
+    subscribers.delete(threadId);
+    scheduleThreadUnsubscribe(threadId);
+  }, delay);
+  streamLeaseTimers.set(threadId, timer);
+}
+
+export function subscribe(threadId, res, leased = false) {
   if (!subscribers.has(threadId)) subscribers.set(threadId, new Set());
   subscribers.get(threadId).add(res);
+  if (leased) renewThreadLease(threadId);
   const cleanup = () => {
     subscribers.get(threadId)?.delete(res);
-    if (subscribers.get(threadId)?.size === 0) subscribers.delete(threadId);
+    if (subscribers.get(threadId)?.size === 0) {
+      subscribers.delete(threadId);
+      clearTimeout(streamLeaseTimers.get(threadId));
+      streamLeaseTimers.delete(threadId);
+      scheduleThreadUnsubscribe(threadId);
+    }
   };
   res.on("close", cleanup);
   return cleanup;
@@ -715,6 +857,11 @@ async function projectReview(candidate) {
 }
 
 async function listAllThreads(archived = false) {
+  // Share visibility across projects, search, thread lists and SSE snapshots.
+  return (await listProviderThreads(archived)).filter((thread) => projectCwdForThread(thread) !== null);
+}
+
+async function listProviderThreads(archived = false) {
   if (usesQwenProvider()) return qwenProvider.listThreads({ archived });
   if (usesClaudeProvider()) return claudeProvider.listThreads({ archived });
   if (usesBothProviders()) {
@@ -763,7 +910,12 @@ async function readThreadDetail(threadId, { limit = Number.MAX_SAFE_INTEGER, bef
         const thread = result.thread || result;
         return { thread, turns: thread.turns || [] };
       });
-  const turns = await mergeApprovalHistory(threadId, fullDetail.turns || []);
+  const turns = await mergeApprovalHistory(threadId, (fullDetail.turns || []).map(turn => ({
+    ...turn, items: (turn.items || []).map(item => {
+      const attachments = mediaAttachments(item);
+      return attachments.length ? { ...item, id: `${item.id}-images`, type: "imageArtifact", attachments } : item;
+    }),
+  })));
   const aroundIndex = around ? turns.findIndex((turn) => turn.id === around) : -1;
   const beforeIndex = before ? turns.findIndex((turn) => turn.id === before) : turns.length;
   let end = beforeIndex >= 0 ? beforeIndex : turns.length;
@@ -874,7 +1026,7 @@ function compactTurn(turn) {
   const finalAgentIndex = items.findLastIndex((item) => item.type === "agentMessage" && item.phase === "final_answer") >= 0
     ? items.findLastIndex((item) => item.type === "agentMessage" && item.phase === "final_answer")
     : items.findLastIndex((item) => item.type === "agentMessage");
-  const visibleItems = items.filter((item, index) => item.type === "userMessage" || index === finalAgentIndex);
+  const visibleItems = items.filter((item, index) => item.type === "userMessage" || index === finalAgentIndex || item.attachments?.length);
   const processItemCount = Math.max(0, items.length - visibleItems.length);
   return {
     ...turn,
@@ -894,6 +1046,11 @@ function compactThreadDetail(detail) {
 }
 
 const NO_PROJECT_CWD = "未指定项目目录";
+const temporaryRoots = [os.tmpdir(), ...(process.platform === "darwin" ? ["/tmp"] : [])]
+  .flatMap((root) => {
+    try { return [path.resolve(root), syncFs.realpathSync(root)]; }
+    catch { return [path.resolve(root)]; }
+  });
 
 function projectCwdForThread(thread) {
   const cwd = String(thread.cwd || "").trim();
@@ -903,24 +1060,36 @@ function projectCwdForThread(thread) {
   const home = path.resolve(os.homedir());
   const codexScratchRoot = path.join(home, "Documents", "Codex");
   const codexStateRoot = path.join(home, ".codex");
+  const applicationSupportRoot = path.join(home, "Library", "Application Support");
   const isInside = (root) => {
     const relative = path.relative(root, resolved);
     return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
   };
 
+  if (temporaryRoots.some(isInside)) return null;
+
+  // Noninteractive helper runs can be labelled thread_source=user by Codex.
+  // Runtime workspaces identify these; image-prefixed prompts alone do not.
+  const isCodexExec = (!thread.provider || thread.provider === "codex")
+    && ["exec", "codex_exec"].includes(thread.source);
+  if (isCodexExec && (isInside(path.join(codexStateRoot, "pet-runs"))
+    || (process.platform === "darwin" && isInside(applicationSupportRoot)))) return null;
+
   // Codex creates dated scratch directories when a conversation is started
   // without choosing a project. Their final path component looks like a
   // project name (for example bh-w or token-api-api), but it is not one.
-  if (resolved === home || isInside(codexScratchRoot) || isInside(codexStateRoot)) {
+  if (resolved === home || isInside(codexScratchRoot) || isInside(codexStateRoot)
+    || (process.platform === "darwin" && isInside(applicationSupportRoot))) {
     return NO_PROJECT_CWD;
   }
   return cwd;
 }
 
-function projectsFromThreads(threads) {
+export function projectsFromThreads(threads) {
   const projects = new Map();
   for (const thread of threads) {
     const cwd = projectCwdForThread(thread);
+    if (cwd === null) continue;
     if (!projects.has(cwd)) {
       projects.set(cwd, {
         id: cwd,
@@ -937,6 +1106,10 @@ function projectsFromThreads(threads) {
   return [...projects.values()].sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
+function visibleThreadCount(projects) {
+  return projects.reduce((count, project) => count + project.threads.length, 0);
+}
+
 function projectRootsFromThreads(threads) {
   return projectsFromThreads(threads)
     .map((project) => project.cwd)
@@ -945,6 +1118,7 @@ function projectRootsFromThreads(threads) {
 }
 
 async function normalizeWorkspacePath(candidate) {
+  if (isUploadedImagePath(candidate)) return path.resolve(candidate);
   try {
     return normalizePath(candidate);
   } catch (error) {
@@ -970,6 +1144,12 @@ async function normalizeWorkspacePath(candidate) {
   });
 }
 
+function isUploadedImagePath(candidate) {
+  const resolved = path.resolve(candidate);
+  return isPathInside(UPLOAD_ROOT, resolved)
+    && /^[0-9a-f-]{36}\.(png|jpg|webp)$/.test(path.basename(resolved));
+}
+
 function threadSignature(threads) {
   return JSON.stringify(threads.map((thread) => ({
     id: thread.id,
@@ -984,10 +1164,11 @@ function threadSignature(threads) {
 }
 
 function snapshotFromThreads(threads) {
+  const projects = projectsFromThreads(threads);
   return {
     generatedAt: Date.now(),
-    projects: projectsFromThreads(threads),
-    total: threads.length,
+    projects,
+    total: visibleThreadCount(projects),
   };
 }
 
@@ -1006,7 +1187,13 @@ async function syncThreads(reason = "manual") {
   }
   syncInFlight = true;
   try {
+    void messageQueue.tick().catch(error => console.warn("Queue:", error.message));
+    const revision = archiveRevision;
     const threads = await listAllThreads(false);
+    if (revision !== archiveRevision) {
+      syncAgainReason = "thread-archived";
+      return;
+    }
     const signature = threadSignature(threads);
     if (signature !== latestThreadSignature) {
       latestThreadSignature = signature;
@@ -1056,11 +1243,18 @@ async function inputFrom(bodyData) {
   }
   const input = [{ type: "text", text: message }];
   for (const file of bodyData.files || []) {
-    const filePath = await normalizeWorkspacePath(file.path || file);
+    const candidate = file.path || file;
+    const filePath = await normalizeWorkspacePath(candidate);
     if (isImage(filePath)) input.push({ type: "localImage", path: filePath });
     else input[0].text += `\n\n[Attached local file: ${filePath}]`;
   }
   return input;
+}
+
+async function collaborationFor(data) {
+  if (!data.collaborationMode) return {};
+  const modes = await client.request("collaborationMode/list", {});
+  return collaborationModeParams(data, modes.data || []);
 }
 
 function isUnfinishedTurn(turn) {
@@ -1083,11 +1277,12 @@ async function resolveActiveTurn(threadId, { refresh = false } = {}) {
   if (cachedTurnId && !refresh) return { turnId: cachedTurnId, source: "cache" };
   const result = await readThreadDetail(threadId);
   const thread = result.thread || result;
-  const turnId = findActiveTurnId(thread);
+  const turnId = thread?.status?.type === "idle" ? null : findActiveTurnId(thread);
   if (turnId) client.setActiveTurn(threadId, turnId);
+  else client.clearActiveTurn(threadId);
   return {
-    turnId: turnId || cachedTurnId,
-    source: turnId ? (config.historySource === "cli-local" ? "cli-local" : "thread/read") : "cache",
+    turnId,
+    source: turnId ? (config.historySource === "cli-local" ? "cli-local" : "thread/read") : null,
     thread,
   };
 }
@@ -1102,7 +1297,87 @@ function isStaleTurnError(error) {
     || message.includes("expected turn");
 }
 
-async function handle(req, res, url) {
+async function sendThreadMessage(threadId, data) {
+  if (data.collaborationMode && (await isQwenThread(threadId) || await isClaudeThread(threadId) || usesWindowsCliFallback())) {
+    throw Object.assign(new Error("This provider does not support Codex collaboration modes"), { status: 422 });
+  }
+  let thread = null;
+  let turn = null;
+  const qwenThread = await isQwenThread(threadId);
+  if (qwenThread) {
+    const input = await inputFrom(data);
+    const prompt = input.map((part) => part.type === "text" ? part.text : "").join("\n").trim();
+    const result = await qwenProvider.sendMessage(threadId, {
+      prompt,
+      files: input.filter((part) => part.type === "localImage"),
+      model: data.model || null,
+      onEvent: (message) => publish(message),
+    });
+    thread = result.thread;
+    turn = result.turn;
+  } else if (await isClaudeThread(threadId)) {
+    const input = await inputFrom(data);
+    const prompt = input.map((part) => part.type === "text" ? part.text : "").join("\n").trim();
+    const result = await claudeProvider.sendMessage(threadId, {
+      prompt,
+      files: input.filter((part) => part.type === "localImage"),
+      model: data.model || null,
+      effort: data.effort || null,
+      permissionMode: data.claudePermissionMode || "manual",
+      onEvent: (message) => publish(message),
+    });
+    thread = result.thread;
+    turn = result.turn;
+  } else if (usesWindowsCliFallback()) {
+    const input = await inputFrom(data);
+    const prompt = input.map((part) => part.type === "text" ? part.text : "").join("\n").trim();
+    const images = input.filter((part) => part.type === "localImage");
+    const resumed = await resumeWindowsThread({
+      threadId,
+      prompt,
+      files: images,
+      model: data.model || null,
+      effort: data.effort || null,
+      sandbox: data.sandbox || "workspace-write",
+      approvalPolicy: data.approvalPolicy || "on-request",
+      approvalsReviewer: data.approvalsReviewer || "user",
+      onAppMessage: (message) => publish(message),
+    });
+    turn = { id: resumed.turnId, status: "inProgress" };
+  } else {
+    const collaboration = await collaborationFor(data);
+    if (ownedRunningThreads.has(threadId)) {
+      const error = new Error("此会话已有正在执行的 Cloudex 任务，请等待完成或使用引导对话。");
+      error.status = 409;
+      throw error;
+    }
+    ownedRunningThreads.add(threadId);
+    try {
+      const resume = await client.subscribeThread(threadId);
+      const turnResult = await client.request("turn/start", {
+        threadId,
+        input: await inputFrom(data),
+        clientUserMessageId: data.clientUserMessageId || null,
+        ...collaboration,
+        model: data.model || null,
+        effort: data.effort || null,
+        approvalPolicy: data.approvalPolicy || "on-request",
+        approvalsReviewer: data.approvalsReviewer || "user",
+        sandboxPolicy: sandboxPolicyFor(data.sandbox || "workspace-write"),
+      });
+      thread = resume?.thread || resume || null;
+      turn = turnResult.turn || turnResult;
+    } catch (error) {
+      ownedRunningThreads.delete(threadId);
+      throw error;
+    } finally {
+      scheduleThreadUnsubscribe(threadId, 2000);
+    }
+  }
+  return { thread, turn };
+}
+
+export async function handle(req, res, url) {
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
       "access-control-allow-origin": "*",
@@ -1136,14 +1411,34 @@ async function handle(req, res, url) {
       host: config.host,
       port: config.port,
       fileRoots: config.fileRoots,
+      messageQueue: true,
     });
   }
   if (req.method === "GET" && url.pathname === "/api/models") {
     return json(res, 200, await listModels());
   }
+  const queueMatch = url.pathname.match(/^\/api\/threads\/([^/]+)\/queue$/);
+  if (queueMatch) {
+    const threadId = decodeURIComponent(queueMatch[1]);
+    if (req.method === "GET") return json(res, 200, await messageQueue.list(threadId));
+    if (req.method === "POST") {
+      const data = await body(req);
+      if (data.action) return json(res, 200, await messageQueue.update(threadId, data));
+      await readThreadDetail(threadId, { limit: 1 });
+      await inputFrom(data);
+      if (data.collaborationMode) await collaborationFor(data);
+      return json(res, 202, await messageQueue.add(threadId, data));
+    }
+  }
+  if (req.method === "GET" && url.pathname === "/api/collaboration-modes") {
+    if (!hasCodexProvider() || isWindowsPlatform()) return json(res, 200, { data: [], supported: false });
+    const result = await client.request("collaborationMode/list", {});
+    return json(res, 200, { ...result, supported: true });
+  }
   if (req.method === "GET" && url.pathname === "/api/projects") {
     const threads = await listAllThreads(false);
-    return json(res, 200, { data: projectsFromThreads(threads), total: threads.length });
+    const projects = projectsFromThreads(threads);
+    return json(res, 200, { data: projects, total: visibleThreadCount(projects) });
   }
   if (req.method === "GET" && url.pathname === "/api/search/messages") {
     const query = url.searchParams.get("q") || "";
@@ -1165,6 +1460,7 @@ async function handle(req, res, url) {
     writeSse(res, "ready", { mode: "api-only" });
     if (latestProjectSnapshot) writeSse(res, "threads/changed", { reason: "replay", ...latestProjectSnapshot });
     for (const { approval } of pendingApprovals.values()) writeSse(res, "approval/requested", approval);
+    for (const input of pendingInputs.values()) writeSse(res, "input/requested", input);
     scheduleThreadSync("client-connected", 0);
     const keepAlive = setInterval(() => res.write(": keep-alive\n\n"), 15000);
     res.on("close", () => { clearInterval(keepAlive); cleanup(); });
@@ -1173,14 +1469,54 @@ async function handle(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/files") {
     return json(res, 200, await fileListing(url.searchParams.get("path")));
   }
+  if (req.method === "POST" && url.pathname === "/api/uploads/image") {
+    const file = await saveUploadedImage(await imageBody(req), req.headers["content-type"]?.split(";")[0]);
+    return json(res, 201, file);
+  }
   if (req.method === "GET" && url.pathname === "/api/review") {
     return json(res, 200, await projectReview(url.searchParams.get("path")));
   }
   if (req.method === "GET" && url.pathname === "/api/file") {
-    return sendFilePreview(res, url.searchParams.get("path"));
+    return sendFilePreview(res, url.searchParams.get("path"), url.searchParams.get("previewRoot"));
   }
   if (req.method === "GET" && url.pathname === "/api/approvals") {
     return json(res, 200, { data: [...pendingApprovals.values()].map(({ approval }) => approval) });
+  }
+  if (req.method === "GET" && url.pathname === "/api/inputs") {
+    return json(res, 200, { data: [...pendingInputs.values()] });
+  }
+  const inputMatch = url.pathname.match(/^\/api\/inputs\/([^/]+)\/respond$/);
+  if (req.method === "POST" && inputMatch) {
+    const id = decodeURIComponent(inputMatch[1]);
+    const input = pendingInputs.get(id);
+    if (!input) return json(res, 409, { error: "Input request is no longer pending" });
+    const response = await body(req);
+    if (input.method === "item/tool/requestUserInput") {
+      if (!response.answers || typeof response.answers !== "object" || Array.isArray(response.answers)) {
+        return json(res, 422, { error: "answers must be an object" });
+      }
+      for (const question of input.questions || []) {
+        if (!Array.isArray(response.answers[question.id]?.answers)
+          || !response.answers[question.id].answers.every((answer) => typeof answer === "string")) {
+          return json(res, 422, { error: `Missing answer for ${question.id}` });
+        }
+      }
+      client.respondServerRequest(id, { answers: response.answers });
+    } else {
+      if (!["accept", "decline", "cancel"].includes(response.action)) {
+        return json(res, 422, { error: "Invalid elicitation action" });
+      }
+      if (response.action === "accept" && response.content !== undefined
+        && (!response.content || typeof response.content !== "object" || Array.isArray(response.content))) {
+        return json(res, 422, { error: "content must be an object" });
+      }
+      client.respondServerRequest(id, response.action === "accept"
+        ? { action: "accept", content: response.content || {} }
+        : { action: response.action });
+    }
+    pendingInputs.delete(id);
+    broadcastGlobal("input/resolved", { id });
+    return json(res, 200, { ok: true });
   }
   const approvalMatch = url.pathname.match(/^\/api\/approvals\/([^/]+)\/respond$/);
   if (req.method === "POST" && approvalMatch) {
@@ -1248,6 +1584,11 @@ async function handle(req, res, url) {
     return json(res, 200, messageIndexFromDetail(detail));
   }
   const streamMatch = url.pathname.match(/^\/api\/threads\/([^/]+)\/stream$/);
+  const leaseMatch = url.pathname.match(/^\/api\/threads\/([^/]+)\/lease$/);
+  if (req.method === "POST" && leaseMatch) {
+    renewThreadLease(decodeURIComponent(leaseMatch[1]));
+    return json(res, 200, {});
+  }
   if (req.method === "GET" && streamMatch) {
     const threadId = decodeURIComponent(streamMatch[1]);
     const qwenThread = await isQwenThread(threadId);
@@ -1258,7 +1599,7 @@ async function handle(req, res, url) {
       connection: "keep-alive",
       "access-control-allow-origin": "*",
     });
-    const cleanup = subscribe(threadId, res);
+    const cleanup = subscribe(threadId, res, url.searchParams.get("lease") === "1");
     writeSse(res, "ready", { threadId, mode: "api-only" });
     replayEvents(threadId, res);
     // Let clients distinguish replayed history from newly arriving events.
@@ -1273,12 +1614,8 @@ async function handle(req, res, url) {
       // app receives live notifications instead of polling only.
       writeSse(res, "subscribed", { threadId });
     } else {
-      try {
-        await client.subscribeThread(threadId);
-        writeSse(res, "subscribed", { threadId });
-      } catch (error) {
-        writeSse(res, "error", { message: error.message || "Unable to subscribe to Codex task" });
-      }
+      // Viewing history must not claim the Codex writer; sending a turn resumes the thread.
+      writeSse(res, "read-only", { threadId });
     }
     const keepAlive = setInterval(() => res.write(": keep-alive\n\n"), 15000);
     res.on("close", () => { clearInterval(keepAlive); cleanup(); });
@@ -1287,6 +1624,10 @@ async function handle(req, res, url) {
 
   if (req.method === "POST" && url.pathname === "/api/threads") {
     const data = await body(req);
+    if (data.collaborationMode && (usesQwenProvider() || usesClaudeProvider() || ["qwen", "claude"].includes(data.provider) || usesWindowsCliFallback())) {
+      throw Object.assign(new Error("This provider does not support Codex collaboration modes"), { status: 422 });
+    }
+    const collaboration = data.collaborationMode ? await collaborationFor(data) : {};
     const noProject = data.noProject === true || data.cwd === NO_PROJECT_CWD;
     const cwd = noProject ? null : await normalizeThreadCwd(data.cwd || config.defaultCwd);
     let thread = null;
@@ -1341,17 +1682,26 @@ async function handle(req, res, url) {
       // that fact immediately so a phone opening the new thread does not issue a
       // redundant thread/resume before its first rollout has been persisted.
       client.markThreadSubscribed(thread.id);
-      if (data.prompt) {
-        const turnResult = await client.request("turn/start", {
-          threadId: thread.id,
-          input: await inputFrom({ message: data.prompt, files: data.files }),
-          model: data.model || null,
-          effort: data.effort || null,
-          approvalPolicy: data.approvalPolicy || "on-request",
-          approvalsReviewer: data.approvalsReviewer || "user",
-          sandboxPolicy: sandboxPolicyFor(data.sandbox || "workspace-write"),
-        });
-        turn = turnResult.turn || turnResult;
+      try {
+        if (data.prompt) {
+          ownedRunningThreads.add(thread.id);
+          const turnResult = await client.request("turn/start", {
+            threadId: thread.id,
+            input: await inputFrom({ message: data.prompt, files: data.files }),
+            ...collaboration,
+            model: data.model || null,
+            effort: data.effort || null,
+            approvalPolicy: data.approvalPolicy || "on-request",
+            approvalsReviewer: data.approvalsReviewer || "user",
+            sandboxPolicy: sandboxPolicyFor(data.sandbox || "workspace-write"),
+          });
+          turn = turnResult.turn || turnResult;
+        }
+      } catch (error) {
+        ownedRunningThreads.delete(thread.id);
+        throw error;
+      } finally {
+        scheduleThreadUnsubscribe(thread.id, 2000);
       }
     }
     scheduleThreadSync("thread-created", 100);
@@ -1364,62 +1714,11 @@ async function handle(req, res, url) {
     const action = threadMatch[2];
     if (req.method === "POST" && action === "message") {
       const data = await body(req);
-      let thread = null;
-      let turn = null;
-      const qwenThread = await isQwenThread(threadId);
-      if (qwenThread) {
-        const input = await inputFrom(data);
-        const prompt = input.map((part) => part.type === "text" ? part.text : "").join("\n").trim();
-        const result = await qwenProvider.sendMessage(threadId, {
-          prompt,
-          files: input.filter((part) => part.type === "localImage"),
-          model: data.model || null,
-          onEvent: (message) => publish(message),
-        });
-        thread = result.thread;
-        turn = result.turn;
-      } else if (await isClaudeThread(threadId)) {
-        const input = await inputFrom(data);
-        const prompt = input.map((part) => part.type === "text" ? part.text : "").join("\n").trim();
-        const result = await claudeProvider.sendMessage(threadId, {
-          prompt,
-          files: input.filter((part) => part.type === "localImage"),
-          model: data.model || null,
-          effort: data.effort || null,
-          permissionMode: data.claudePermissionMode || "manual",
-          onEvent: (message) => publish(message),
-        });
-        thread = result.thread;
-        turn = result.turn;
-      } else if (usesWindowsCliFallback()) {
-        const input = await inputFrom(data);
-        const prompt = input.map((part) => part.type === "text" ? part.text : "").join("\n").trim();
-        const images = input.filter((part) => part.type === "localImage");
-        await resumeWindowsThread({
-          threadId,
-          prompt,
-          files: images,
-          model: data.model || null,
-          effort: data.effort || null,
-          sandbox: data.sandbox || "workspace-write",
-          approvalPolicy: data.approvalPolicy || "on-request",
-          approvalsReviewer: data.approvalsReviewer || "user",
-          onAppMessage: (message) => publish(message),
-        });
-      } else {
-        const resume = await client.subscribeThread(threadId);
-        const turnResult = await client.request("turn/start", {
-          threadId,
-          input: await inputFrom(data),
-          model: data.model || null,
-          effort: data.effort || null,
-          approvalPolicy: data.approvalPolicy || "on-request",
-          approvalsReviewer: data.approvalsReviewer || "user",
-          sandboxPolicy: sandboxPolicyFor(data.sandbox || "workspace-write"),
-        });
-        thread = resume?.thread || resume || null;
-        turn = turnResult.turn || turnResult;
+      const queue = await messageQueue.list(threadId);
+      if (queue.items.some(item => ["pending", "running", "dispatching", "blocked", "unconfirmed"].includes(item.status))) {
+        throw Object.assign(new Error("此会话已有排队消息，请加入队列或先处理现有队列"), { status: 409 });
       }
+      const { thread, turn } = await sendThreadMessage(threadId, data);
       scheduleThreadSync("message-sent", 100);
       return json(res, 202, { thread, turn });
     }
@@ -1499,6 +1798,7 @@ async function handle(req, res, url) {
         throw error;
       }
       const forkParams = { threadId };
+      const collaboration = await collaborationFor(data);
       if (data.position === "before") forkParams.beforeTurnId = turnId;
       else forkParams.lastTurnId = turnId;
       const forkResult = await client.request("thread/fork", forkParams);
@@ -1506,23 +1806,33 @@ async function handle(req, res, url) {
       client.markThreadSubscribed(forkedThread.id);
 
       let turn = null;
-      const editedMessage = String(data.message || "").trim();
-      if (editedMessage) {
-        const turnResult = await client.request("turn/start", {
-          threadId: forkedThread.id,
-          input: await inputFrom({ message: editedMessage, files: data.files }),
-          model: data.model || null,
-          effort: data.effort || null,
-          approvalPolicy: data.approvalPolicy || "on-request",
-          approvalsReviewer: data.approvalsReviewer || "user",
-          sandboxPolicy: sandboxPolicyFor(data.sandbox || "workspace-write"),
-        });
-        turn = turnResult.turn || turnResult;
+      try {
+        const editedMessage = String(data.message || "").trim();
+        if (editedMessage) {
+          ownedRunningThreads.add(forkedThread.id);
+          const turnResult = await client.request("turn/start", {
+            threadId: forkedThread.id,
+            input: await inputFrom({ message: editedMessage, files: data.files }),
+            ...collaboration,
+            model: data.model || null,
+            effort: data.effort || null,
+            approvalPolicy: data.approvalPolicy || "on-request",
+            approvalsReviewer: data.approvalsReviewer || "user",
+            sandboxPolicy: sandboxPolicyFor(data.sandbox || "workspace-write"),
+          });
+          turn = turnResult.turn || turnResult;
+        }
+      } catch (error) {
+        ownedRunningThreads.delete(forkedThread.id);
+        throw error;
+      } finally {
+        scheduleThreadUnsubscribe(forkedThread.id, 2000);
       }
       scheduleThreadSync("thread-forked", 100);
       return json(res, 201, { thread: forkedThread, turn });
     }
     if (req.method === "POST" && action === "stop") {
+      await messageQueue.update(threadId, { action: "pause" });
       if (await isQwenThread(threadId)) {
         const stopped = await qwenProvider.stopThread(threadId);
         if (!stopped) {
@@ -1553,7 +1863,7 @@ async function handle(req, res, url) {
         scheduleThreadSync("turn-stopped", 100);
         return json(res, 200, { stopped: true, threadId, turnId: null, source: "windows-cli" });
       }
-      const { turnId, source, thread } = await resolveActiveTurn(threadId);
+      const { turnId, source, thread } = await resolveActiveTurn(threadId, { refresh: true });
       if (!turnId) {
         const status = thread?.status?.type ? ` (${thread.status.type})` : "";
         const error = new Error(`No active turn for this thread${status}`);
@@ -1566,22 +1876,27 @@ async function handle(req, res, url) {
       return json(res, 200, { stopped: true, threadId, turnId, source, result });
     }
     if (req.method === "POST" && action === "archive") {
+      await messageQueue.update(threadId, { action: "pause" });
       if (await isQwenThread(threadId)) {
         const result = await qwenProvider.archiveThread(threadId);
+        archiveRevision += 1;
         scheduleThreadSync("thread-archived", 100);
         return json(res, 200, result);
       }
       if (await isClaudeThread(threadId)) {
         const result = await claudeProvider.archiveThread(threadId);
+        archiveRevision += 1;
         scheduleThreadSync("thread-archived", 100);
         return json(res, 200, result);
       }
       if (config.historySource === "cli-local") {
         const result = await archiveCliThread(threadId);
+        archiveRevision += 1;
         scheduleThreadSync("thread-archived", 100);
         return json(res, 200, result);
       }
       const result = await client.request("thread/archive", { threadId });
+      archiveRevision += 1;
       scheduleThreadSync("thread-archived", 100);
       return json(res, 200, result);
     }

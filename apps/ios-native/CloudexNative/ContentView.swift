@@ -3,6 +3,7 @@ import gitdiff
 import UIKit
 import QuickLook
 import Foundation
+import PhotosUI
 
 private enum ConversationSubpage: Hashable {
     case conversation
@@ -10,40 +11,133 @@ private enum ConversationSubpage: Hashable {
     case review
 }
 
-private struct OlderHistoryScrollSnapshot {
-    let offset: CGPoint
-    let contentHeight: CGFloat
+// Only the composer observes keystrokes; the message tree does not re-render.
+private struct ComposerDraftScope<Content: View>: View {
+    @ObservedObject var draft: ComposerDraft
+    @ViewBuilder let content: () -> Content
+
+    var body: some View { content() }
 }
+
+struct AttachmentThumbnail: View {
+    let path: String
+    let server: String
+    let client: APIClient
+    @State private var image: UIImage?
+    @State private var failed = false
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(uiImage: image).resizable().scaledToFit()
+            } else {
+                Image(systemName: failed ? "photo.badge.exclamationmark" : "photo")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color(.tertiarySystemFill))
+            }
+        }
+        .task(id: "\(server)|\(path)") {
+            image = AttachmentImageCache.image(path: path, server: server)
+            failed = false
+            guard image == nil else { return }
+            do {
+                let data: Data
+                if path.hasPrefix("data:image/"), let encoded = path.split(separator: ",", maxSplits: 1).last,
+                   let decoded = Data(base64Encoded: String(encoded)) {
+                    data = decoded
+                } else {
+                    if let url = URL(string: path), ["http", "https"].contains(url.scheme ?? "") {
+                        let (download, response) = try await URLSession.shared.download(from: url)
+                        defer { try? FileManager.default.removeItem(at: download) }
+                        guard let response = response as? HTTPURLResponse, (200..<300).contains(response.statusCode),
+                              (try download.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) <= 50 * 1024 * 1024 else { throw URLError(.cannotDecodeContentData) }
+                        data = try Data(contentsOf: download)
+                    } else { data = try await client.download("/api/file", queryItems: [URLQueryItem(name: "path", value: path)]) }
+                }
+                guard !Task.isCancelled else { return }
+                let prepared = await AttachmentImageCache.prepare(data, path: path, server: server)
+                guard !Task.isCancelled else { return }
+                image = prepared
+                failed = image == nil
+            } catch {
+                if !Task.isCancelled { failed = true }
+            }
+        }
+    }
+}
+
+private struct ComposerTextInput: UIViewRepresentable {
+    @Binding var text: String
+    @Binding var focused: Bool
+
+    func makeUIView(context: Context) -> UITextView {
+        let view = UITextView()
+        view.delegate = context.coordinator
+        view.font = .preferredFont(forTextStyle: .body)
+        view.adjustsFontForContentSizeCategory = true
+        view.backgroundColor = .clear
+        view.isScrollEnabled = true
+        view.clipsToBounds = true
+        view.textContainerInset = UIEdgeInsets(top: 10, left: 8, bottom: 10, right: 8)
+        view.textContainer.lineFragmentPadding = 0
+        view.accessibilityIdentifier = "message-input"
+        view.accessibilityLabel = "消息输入框"
+        view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return view
+    }
+
+    func updateUIView(_ view: UITextView, context: Context) {
+        context.coordinator.parent = self
+        if view.text != text { view.text = text }
+        if context.coordinator.requestedFocus != focused {
+            context.coordinator.requestedFocus = focused
+            if focused && !view.isFirstResponder { view.becomeFirstResponder() }
+            if !focused && view.isFirstResponder { view.resignFirstResponder() }
+        }
+        view.invalidateIntrinsicContentSize()
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: UITextView, context: Context) -> CGSize? {
+        guard let width = proposal.width else { return nil }
+        let maximum = (uiView.font?.lineHeight ?? 22) * 5 + 20
+        let height = uiView.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude)).height
+        return CGSize(width: width, height: min(maximum, max(44, ceil(height))))
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+    final class Coordinator: NSObject, UITextViewDelegate {
+        var parent: ComposerTextInput
+        var requestedFocus = false
+        init(_ parent: ComposerTextInput) { self.parent = parent }
+        func textViewDidChange(_ view: UITextView) { parent.text = view.text }
+        func textViewDidBeginEditing(_ view: UITextView) {
+            if !parent.focused { parent.focused = true }
+        }
+        func textViewDidEndEditing(_ view: UITextView) {
+            if parent.focused { parent.focused = false }
+        }
+    }
+}
+
 
 struct ContentView: View {
     @EnvironmentObject private var viewModel: AppViewModel
-    @Environment(\.cloudexIsWindowedIPad) private var isWindowedIPad
-    @Environment(\.cloudexBottomSafeArea) private var bottomSafeArea
-    @StateObject private var chatScrollController = ChatScrollController()
+    @StateObject private var chatListActions = ChatListActions()
+    @StateObject private var speechInput = SpeechInputController()
     let expectedThreadID: String?
     let onToggleDirectory: (() -> Void)?
     let showsDirectoryButton: Bool
     @State private var showingFilePicker = false
-    @State private var isAtChatBottom = true
+    @State private var filePreview: FilePreviewRequest?
+    @State private var editingQueueItem: QueuedMessage?
+    @State private var queueEditText = ""
+    @State private var showingPhotosPicker = false
+    @State private var selectedPhoto: PhotosPickerItem?
     @State private var isFollowingChatBottom = true
-    @State private var hasLoadedChatContent = false
-    @State private var scrollToBottomRequest = 0
-    @State private var explicitScrollGeneration = 0
-    @State private var isExplicitScrollInProgress = false
-    @State private var initialBottomScrollGeneration = 0
-    @State private var isInitialBottomScrollInProgress = false
-    @State private var isPreparingInitialLayout = true
-    @State private var isStaticConversationLocked = false
-    @State private var messagePositioningGeneration = 0
-    @State private var isMessagePositioningInProgress = false
-    @State private var isProcessLayoutChangeInProgress = false
-    @State private var processLayoutGeneration = 0
-    @State private var processExpansionScrollOffset: CGPoint?
-    @State private var isUserScrollingChat = false
     @State private var messageJumpSnapshot: [MessageJumpItem] = []
-    @State private var scrollTargetMessageID: String?
     @State private var messageTextHighlight: MessageTextHighlight?
-    @State private var chatContentSnapshot = ChatScrollContent.empty
+    @State private var loadingJumpID: String?
     @State private var collapseProcessRequest = 0
     @State private var floatingCollapseVisible = false
     @State private var showingTokenUsage = false
@@ -52,9 +146,7 @@ struct ContentView: View {
     @State private var taskTimerStartedAt: Double?
     @State private var taskTimerCompletedAt: Double?
     @State private var taskTimerHidden = true
-    @FocusState private var composerFocused: Bool
-    @State private var keyboardHeight: CGFloat = 0
-    @State private var olderHistoryScrollSnapshot: OlderHistoryScrollSnapshot?
+    @State private var composerFocused = false
 
     init(
         expectedThreadID: String? = nil,
@@ -64,26 +156,13 @@ struct ContentView: View {
         self.expectedThreadID = expectedThreadID
         self.onToggleDirectory = onToggleDirectory
         self.showsDirectoryButton = showsDirectoryButton
-        _isPreparingInitialLayout = State(initialValue: expectedThreadID?.hasPrefix("new-") != true)
     }
 
     var body: some View {
+        VStack(spacing: 0) {
         ZStack {
             liquidBackground
             chat
-                // Keep the full message tree in the hierarchy so SwiftUI
-                // can measure it, but reveal text only after the initial
-                // bottom position has been calculated.
-                .opacity(isPreparingInitialLayout ? 0 : 1)
-            if isPreparingInitialLayout {
-                ProgressView()
-                    .controlSize(.small)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(.regularMaterial.opacity(0.72))
-                .allowsHitTesting(false)
-                .transition(.opacity)
-                .zIndex(20)
-            }
             if floatingCollapseVisible {
                 VStack {
                     HStack {
@@ -135,13 +214,45 @@ struct ContentView: View {
                     }
                     .padding(.bottom, 6)
                 }
-                composer
             }
             .animation(.easeInOut(duration: 0.18), value: isFollowingChatBottom)
         }
-        .ignoresSafeArea(.keyboard, edges: .top)
+        .clipped()
+        ComposerDraftScope(draft: viewModel.composerDraft) {
+            composer
+        }
+        }
+        .background(CloudexTheme.canvas)
+        .environment(\.previewClient, viewModel.client)
+        .environment(\.previewRoot, viewModel.selectedThread?.cwd ?? viewModel.selectedProjectCWD ?? "")
+        .environment(\.openURL, OpenURLAction { url in
+            let root = viewModel.selectedThread?.cwd ?? viewModel.selectedProjectCWD ?? ""
+            if let path = FilePreviewRequest.resolve(url, root: root) {
+                filePreview = FilePreviewRequest(path: path, client: viewModel.client, root: root)
+                return .handled
+            }
+            return ["http", "https", "mailto"].contains(url.scheme ?? "") ? .systemAction : .discarded
+        })
+        .sheet(item: $filePreview) { FilePreviewSheet(request: $0) }
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            #if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("--ui-stream-fixture") {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(viewModel.liveRunning ? "流式进行中" : "模拟连续回复") { viewModel.startUIFixtureStream() }
+                }
+            }
+            #endif
+            if let input = viewModel.pendingInputs.first(where: { $0.threadId == viewModel.selectedThreadID }) {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        viewModel.presentedInput = input
+                    } label: {
+                        Image(systemName: "questionmark.bubble")
+                    }
+                    .accessibilityLabel("回答 Codex 问题")
+                }
+            }
             ToolbarItem(placement: .principal) {
                 VStack(spacing: 1) {
                     Text(viewModel.navigationTitle)
@@ -189,6 +300,36 @@ struct ContentView: View {
         .onAppear {
             prepareNewChatRouteIfNeeded()
         }
+        .onDisappear { speechInput.stop() }
+        .onChange(of: "\(viewModel.serverURL)|\(viewModel.selectedThreadID ?? "new")") { _, _ in editingQueueItem = nil }
+        .task(id: "\(viewModel.serverURL)|\(viewModel.selectedThreadID ?? "new")|\(viewModel.selectedAgentProvider)") {
+            async let queue: Void = viewModel.loadMessageQueue()
+            async let modes: Void = viewModel.loadCollaborationModes()
+            _ = await (queue, modes)
+        }
+        .sheet(item: $editingQueueItem) { item in
+            NavigationStack {
+                TextEditor(text: $queueEditText).padding()
+                    .navigationTitle("修改排队消息")
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) { Button("取消") { editingQueueItem = nil } }
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("保存") {
+                                Task { await viewModel.changeQueue("edit", id: item.id, message: queueEditText) }
+                                editingQueueItem = nil
+                            }
+                        }
+                    }
+            }
+        }
+        .alert("语音输入", isPresented: Binding(
+            get: { speechInput.errorMessage != nil },
+            set: { if !$0 { speechInput.errorMessage = nil } }
+        )) {
+            Button("好", role: .cancel) { speechInput.errorMessage = nil }
+        } message: {
+            Text(speechInput.errorMessage ?? "")
+        }
         .sheet(isPresented: $showingFilePicker) {
             RemoteFilePickerView(
                 isPresented: $showingFilePicker,
@@ -197,6 +338,26 @@ struct ContentView: View {
                 viewModel.attach(file)
             }
             .environmentObject(viewModel)
+        }
+        .photosPicker(isPresented: $showingPhotosPicker, selection: $selectedPhoto, matching: .images)
+        .onChange(of: selectedPhoto) { _, item in
+            guard let item else { return }
+            Task {
+                guard let data = try? await item.loadTransferable(type: Data.self) else {
+                    viewModel.status = "无法读取所选照片"
+                    return
+                }
+                let jpeg = await Task.detached(priority: .userInitiated) {
+                    UIImage(data: data)?.jpegData(compressionQuality: 0.85)
+                }.value
+                guard let jpeg else { viewModel.status = "无法读取所选照片"; return }
+                _ = await viewModel.attachPhoneImage(jpeg)
+                selectedPhoto = nil
+            }
+        }
+        .sheet(item: $viewModel.presentedInput) { input in
+            InputRequestSheet(input: input)
+                .environmentObject(viewModel)
         }
         .sheet(isPresented: $showingTokenUsage) {
             TokenUsageSheet(usage: viewModel.selectedThread?.usage)
@@ -234,334 +395,160 @@ struct ContentView: View {
             }
         }
         .onChange(of: viewModel.active) { _, active in
-            if active {
-                isStaticConversationLocked = false
-                updateChatContent(force: true)
-            } else if hasLoadedChatContent && !isPreparingInitialLayout {
-                // Apply the terminal snapshot once, then freeze completed
-                // conversations against background layout changes.
-                updateChatContent(force: true)
-                DispatchQueue.main.async {
-                    guard !viewModel.active, !isPreparingInitialLayout else { return }
-                    isStaticConversationLocked = true
-                }
-            }
-            guard !active else { return }
-            let snapshot = MessageJumpItem.paired(
-                from: viewModel.messageIndex,
-                turns: viewModel.detail?.turns ?? []
-            )
-            if messageJumpSnapshot != snapshot {
-                messageJumpSnapshot = snapshot
+            if !active {
+                messageJumpSnapshot = MessageJumpItem.paired(from: viewModel.messageIndex, turns: viewModel.detail?.turns ?? [])
             }
         }
-        .onChange(of: viewModel.isOpeningThread, initial: true) { _, opening in
-            if opening {
-                resetChatLayoutForNewThread()
-                return
-            }
-            updateChatContent(force: !hasLoadedChatContent)
-            // During an active task the target message can arrive while the
-            // conversation is still opening. The ScrollView is disabled in
-            // that phase, so keep the request alive and fulfill it only after
-            // opening has completed.
-            fulfillPendingMessageJumpIfPossible()
+        .onChange(of: viewModel.detail, initial: true) { _, _ in syncTaskTimerState() }
+        .onChange(of: viewModel.liveRunning, initial: true) { _, _ in syncTaskTimerState() }
+        .onChange(of: viewModel.renderedMessages) { _, _ in fulfillPendingMessageJumpIfPossible() }
+        .onChange(of: viewModel.isOpeningThread) { _, opening in
+            if !opening { fulfillPendingMessageJumpIfPossible() }
         }
-        .onChange(of: viewModel.detail, initial: true) { _, _ in
-            syncTaskTimerState()
-        }
-        .onChange(of: viewModel.liveRunning, initial: true) { _, _ in
-            syncTaskTimerState()
-        }
-        .onChange(of: viewModel.selectedThreadID) { _, _ in
-            taskTimerTurnID = nil
-            taskTimerStartedAt = nil
-            taskTimerCompletedAt = nil
-            taskTimerHidden = true
-            syncTaskTimerState()
-        }
-        .onChange(of: currentChatContent, initial: true) { _, _ in
-            updateChatContent()
-            fulfillPendingMessageJumpIfPossible()
-        }
-        .onChange(of: viewModel.pendingMessageJump, initial: true) { _, _ in
-            fulfillPendingMessageJumpIfPossible()
-        }
-        .onChange(of: isFollowingChatBottom) { _, following in
-            guard following,
-                  !isPreparingInitialLayout,
-                  !viewModel.isOpeningThread else { return }
-            updateChatContent(force: true)
-        }
-        .onChange(of: expectedThreadID, initial: true) { _, _ in
-            resetChatLayoutForNewThread()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { note in
-            guard let value = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue else { return }
-            keyboardHeight = max(0, UIScreen.main.bounds.maxY - value.cgRectValue.minY)
-        }
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
-            keyboardHeight = 0
-        }
+        .onChange(of: viewModel.pendingMessageJump) { _, _ in fulfillPendingMessageJumpIfPossible() }
     }
 
     private var liquidBackground: some View {
-        Color(.systemBackground)
+        CloudexTheme.canvas
         .ignoresSafeArea()
     }
 
     private var chat: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                let isNewChat = expectedThreadID?.hasPrefix("new-") == true
-                let isReady = isNewChat
-                    || (expectedThreadID == viewModel.selectedThreadID && !viewModel.isOpeningThread)
-                let content = isReady ? chatContentSnapshot : .empty
-                LazyVStack(alignment: .leading, spacing: 12) {
-                    if !isReady {
-                        ProgressView("正在打开对话…")
-                            .frame(maxWidth: .infinity)
-                            .padding(.top, 120)
+        let content = currentChatContent
+        let rows = content.messages + [ChatMessage(id: "chat-footer", role: .system,
+            text: "\(viewModel.active)|\(viewModel.isBusy)|\(viewModel.pendingSteerDraft)|\(viewModel.isOpeningThread)|\(viewModel.conversationLoadState)|\(viewModel.visibleApprovals)|\(viewModel.queueItems)|\(viewModel.queuePaused)|\(viewModel.queueError ?? "")|\(viewModel.collaborationMode)",
+            processItemCount: collapseProcessRequest)]
+        return NativeChatList(
+            conversationID: "\(viewModel.selectedServerProfileID ?? "")|\(expectedThreadID ?? "")",
+            rows: rows,
+            ready: isExpectedChatReady && viewModel.conversationLoadState != .loading,
+            hasMore: viewModel.hasMoreHistory,
+            loadingOlder: viewModel.isLoadingOlderTurns,
+            presentationKey: "\(viewModel.active)|\(collapseProcessRequest)|\(messageTextHighlight?.messageID ?? "")|\(messageTextHighlight?.query ?? "")|\(viewModel.serverURL)|\(viewModel.chatDetails)",
+            actions: chatListActions,
+            onFollowingChanged: { isFollowingChatBottom = $0 },
+            onLoadOlder: { Task { await viewModel.loadOlderTurns() } }
+        ) { message in
+            if message.id == "chat-footer" {
+                chatFooter
+            } else {
+                MessageBubble(
+                    viewModel: viewModel, client: viewModel.client, isActive: viewModel.active,
+                    message: message, preferences: viewModel.chatDetails,
+                    highlightQuery: messageTextHighlight?.messageID == message.id ? messageTextHighlight?.query : nil,
+                    collapseRequest: $collapseProcessRequest,
+                    onQuickFill: { text in viewModel.draft = text; composerFocused = true },
+                    onFork: { await viewModel.forkAssistantMessage(message) },
+                    onProcessInteraction: { _ in chatListActions.preserveReadingPosition() },
+                    onFloatingProcessCollapse: { chatListActions.preserveReadingPosition() },
+                    onFloatingStateChange: { floatingCollapseVisible = $0 }
+                )
+                .environmentObject(viewModel)
+                .environment(\.previewClient, viewModel.client)
+                .environment(\.previewRoot, viewModel.selectedThread?.cwd ?? viewModel.selectedProjectCWD ?? "")
+                .environment(\.openURL, OpenURLAction { url in
+                    let root = viewModel.selectedThread?.cwd ?? viewModel.selectedProjectCWD ?? ""
+                    if let path = FilePreviewRequest.resolve(url, root: root) {
+                        filePreview = FilePreviewRequest(path: path, client: viewModel.client, root: root)
+                        return .handled
                     }
-                    if isReady && viewModel.selectedThread == nil && content.messages.isEmpty {
-                        VStack(spacing: 10) {
-                            Spacer(minLength: 130)
-                            Text(cloudexLocalized(viewModel.isCreatingNew ? "开始新对话" : "选择一个对话"))
-                                .font(.title2.bold())
-                            Text(viewModel.selectedProject == nil
-                                 ? "点击左上角菜单选择电脑上的项目和历史对话。"
-                                 : "当前项目：\(viewModel.selectedProject?.displayName ?? "")")
-                                .font(.subheadline)
-                                .foregroundStyle(.secondary)
-                                .multilineTextAlignment(.center)
-                            Spacer(minLength: 130)
-                        }
-                        .frame(maxWidth: .infinity)
-                    }
-
-                    ForEach(content.messages) { message in
-                        MessageBubble(
-                            message: message,
-                            highlightQuery: messageTextHighlight?.messageID == message.id
-                                ? messageTextHighlight?.query
-                                : nil,
-                            collapseRequest: $collapseProcessRequest,
-                            onQuickFill: { text in
-                                viewModel.draft = text
-                                composerFocused = true
-                            },
-                            onFork: {
-                                await viewModel.forkAssistantMessage(message)
-                            },
-                            onProcessInteraction: { isExpanding in
-                                beginProcessLayoutChange(expanding: isExpanding, restorePosition: false)
-                            },
-                            onFloatingProcessCollapse: {
-                                beginProcessLayoutChange(expanding: false, restorePosition: true)
-                            },
-                            onFloatingStateChange: { visible in
-                                floatingCollapseVisible = visible
-                            }
-                        )
-                        .id(message.id)
-                        .onAppear {
-                            guard message.id == content.messages.first?.id,
-                                  viewModel.hasMoreHistory,
-                                  !viewModel.isLoadingOlderTurns,
-                                  let offset = chatScrollController.currentContentOffset() else { return }
-                            olderHistoryScrollSnapshot = OlderHistoryScrollSnapshot(
-                                offset: offset,
-                                contentHeight: chatScrollController.contentSizeHeight()
-                            )
-                            Task { await viewModel.loadOlderTurns() }
-                        }
-                    }
-
-                    ForEach(content.approvals) { approval in
-                        ApprovalBubble(approval: approval)
-                            .environmentObject(viewModel)
-                            .id("approval-\(approval.id)")
-                            .transition(.opacity.combined(with: .move(edge: .bottom)))
-                    }
-
-                    if !viewModel.pendingSteerDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        PendingSteerBubble(
-                            text: viewModel.pendingSteerDraft,
-                            isSending: viewModel.isBusy,
-                            onEdit: {
-                                viewModel.editPendingSteer()
-                                composerFocused = true
-                            },
-                            onDelete: {
-                                viewModel.deletePendingSteer()
-                            },
-                            onSend: { Task { await viewModel.sendPendingSteer() } }
-                        )
-                        .id("pending-steer")
-                    }
-
-                    if content.active {
-                        HStack(spacing: 0) {
-                            Spacer(minLength: 0)
-                            ProgressView()
-                            Spacer(minLength: 0)
-                        }
-                        .frame(maxWidth: .infinity)
-                            .padding(.vertical, 8)
-                    }
-
-                    // Reserve only the space needed by the overlaid composer.
-                    // Keeping this close to the actual composer height avoids
-                    // leaving a visible gap below the running-task spinner.
-                    Color.clear
-                        .frame(height: viewModel.attachedFiles.isEmpty ? 112 : 156)
-                        .id("chat-bottom")
-                }
-                .padding(.horizontal, 16)
-                .padding(.top, 16)
-                .background {
-                    ChatScrollViewResolver(controller: chatScrollController)
-                        .frame(width: 0, height: 0)
-                }
+                    return ["http", "https", "mailto"].contains(url.scheme ?? "") ? .systemAction : .discarded
+                })
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier("message-\(message.id)")
             }
-            .nativeTopScrollEdgeEffect()
-            .scrollDisabled(viewModel.isOpeningThread || isPreparingInitialLayout)
-            .scrollDismissesKeyboard(.interactively)
-            .trackChatScroll(
-                isAtBottom: $isAtChatBottom,
-                isFollowingBottom: $isFollowingChatBottom,
-                isExplicitScrollInProgress: $isExplicitScrollInProgress,
-                isUserScrolling: $isUserScrollingChat,
-                isLayoutChangeInProgress: $isProcessLayoutChangeInProgress,
-                isFollowRestorationDisabled: {
-                    isPreparingInitialLayout || viewModel.isOpeningThread
-                },
-                nativeIsAtBottom: { chatScrollController.isAtBottom() }
-            )
-            .onChange(of: scrollToBottomRequest) { _, _ in
-                guard !isMessagePositioningInProgress,
-                      isFollowingChatBottom || isExplicitScrollInProgress else { return }
-                let generation = explicitScrollGeneration
-                let initialGeneration = initialBottomScrollGeneration
-                let requestGeneration = scrollToBottomRequest
-                DispatchQueue.main.async {
-                    guard !isMessagePositioningInProgress,
-                          scrollToBottomRequest == requestGeneration,
-                          isFollowingChatBottom
-                            || (isExplicitScrollInProgress && explicitScrollGeneration == generation) else { return }
-
-                    let initialStillOwnsScroll = isInitialBottomScrollInProgress
-                        && initialBottomScrollGeneration == initialGeneration
-                        && isFollowingChatBottom
-                        && !isUserScrollingChat
-                    if initialStillOwnsScroll {
-                        var transaction = Transaction()
-                        transaction.disablesAnimations = true
-                        withTransaction(transaction) {
-                            proxy.scrollTo("chat-bottom", anchor: .bottom)
-                        }
-
-                        // One anchor repeat lets LazyVStack materialize the
-                        // target row. A single native reconciliation then
-                        // accounts for adjusted insets without repeatedly
-                        // chasing a growing contentSize.
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
-                            guard isInitialBottomScrollInProgress,
-                                  initialBottomScrollGeneration == initialGeneration,
-                                  scrollToBottomRequest == requestGeneration,
-                                  isFollowingChatBottom,
-                                  !isUserScrollingChat else { return }
-                            var repeatTransaction = Transaction()
-                            repeatTransaction.disablesAnimations = true
-                            withTransaction(repeatTransaction) {
-                                proxy.scrollTo("chat-bottom", anchor: .bottom)
+        }
+        .overlay {
+            if content.messages.isEmpty {
+                if viewModel.conversationLoadState == .loading {
+                    ProgressView("正在打开对话…")
+                } else if case let .failed(error) = viewModel.conversationLoadState {
+                    VStack(spacing: 12) {
+                        Text(error).foregroundStyle(.secondary)
+                        Button("重试") {
+                            if let thread = viewModel.selectedThread {
+                                Task { await viewModel.openThread(thread, projectCWD: viewModel.selectedProjectCWD) }
                             }
                         }
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                            guard isInitialBottomScrollInProgress,
-                                  initialBottomScrollGeneration == initialGeneration,
-                                  scrollToBottomRequest == requestGeneration else { return }
-                            if isFollowingChatBottom && !isUserScrollingChat {
-                                _ = chatScrollController.scrollToBottom(animated: false)
-                            }
-                            isInitialBottomScrollInProgress = false
-                            isAtChatBottom = chatScrollController.isAtBottom()
-                        }
-                        return
                     }
-
-                    let explicitStillOwnsScroll = isExplicitScrollInProgress
-                        && explicitScrollGeneration == generation
-                    if explicitStillOwnsScroll {
-                        // The button can be tapped while LazyVStack is still
-                        // materializing the newest rows. Re-anchor the bottom
-                        // sentinel first, then recompute UIScrollView's
-                        // content height several times as layout settles.
-                        let reconcileBottom = {
-                            guard scrollToBottomRequest == requestGeneration,
-                                  explicitScrollGeneration == generation,
-                                  isExplicitScrollInProgress else { return }
-                            var transaction = Transaction()
-                            transaction.disablesAnimations = true
-                            withTransaction(transaction) {
-                                proxy.scrollTo("chat-bottom", anchor: .bottom)
-                            }
-                            _ = chatScrollController.scrollToBottom(animated: true)
-                            isAtChatBottom = true
-                        }
-                        reconcileBottom()
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: reconcileBottom)
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: reconcileBottom)
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.50, execute: reconcileBottom)
-                        return
-                    }
-                    if !chatScrollController.scrollToBottom(animated: true) {
-                        withAnimation(.easeOut(duration: 0.28)) {
-                            proxy.scrollTo("chat-bottom", anchor: .bottom)
-                        }
-                    }
+                } else {
+                    CloudexEmptyState(symbol: "bubble.left.and.text.bubble.right",
+                        title: viewModel.isCreatingNew ? "准备好，开始新的想法" : "这段对话还没有消息",
+                        detail: "写下指令，或添加图片和文件。")
                 }
-            }
-            .onChange(of: scrollTargetMessageID) { _, messageID in
-                guard let messageID else { return }
-                let generation = messagePositioningGeneration
-                let positionTarget = {
-                    guard isMessagePositioningInProgress,
-                          messagePositioningGeneration == generation else { return }
-                    proxy.scrollTo(messageID, anchor: .top)
-                }
-                // LazyVStack layout and live message insertion can move the
-                // target during the first few frames. Reassert the explicit
-                // destination until layout has settled instead of allowing a
-                // pending bottom-follow scroll to win the race.
-                DispatchQueue.main.async(execute: positionTarget)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: positionTarget)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) {
-                    positionTarget()
-                    guard messagePositioningGeneration == generation else { return }
-                    scrollTargetMessageID = nil
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.48) {
-                    guard messagePositioningGeneration == generation else { return }
-                    isMessagePositioningInProgress = false
-                }
-            }
-            .onChange(of: viewModel.isLoadingOlderTurns) { _, loading in
-                guard !loading, let snapshot = olderHistoryScrollSnapshot else { return }
-                olderHistoryScrollSnapshot = nil
-                let restore = {
-                    guard !viewModel.isLoadingOlderTurns else { return }
-                    let addedHeight = max(0, chatScrollController.contentSizeHeight() - snapshot.contentHeight)
-                    _ = chatScrollController.restoreContentOffset(
-                        CGPoint(x: snapshot.offset.x, y: snapshot.offset.y + addedHeight)
-                    )
-                }
-                DispatchQueue.main.async(execute: restore)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: restore)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.22, execute: restore)
             }
         }
         .frame(maxHeight: .infinity)
+    }
+
+    private var chatFooter: some View {
+        VStack(spacing: 12) {
+            ForEach(viewModel.visibleApprovals) { approval in
+                ApprovalBubble(approval: approval).environmentObject(viewModel)
+            }
+            if !viewModel.pendingSteerDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                PendingSteerBubble(text: viewModel.pendingSteerDraft, isSending: viewModel.isBusy,
+                    onEdit: { viewModel.editPendingSteer(); composerFocused = true },
+                    onDelete: { viewModel.deletePendingSteer() },
+                    onSend: { Task { await viewModel.sendPendingSteer() } })
+            }
+            if !viewModel.queueItems.isEmpty {
+                HStack {
+                    Text("待处理消息 · \(viewModel.queueItems.count)").font(.caption.weight(.medium))
+                    Spacer()
+                    Button(cloudexLocalized(viewModel.queuePaused ? "继续队列" : "暂停队列")) {
+                        Task { await viewModel.changeQueue(viewModel.queuePaused ? "resume" : "pause") }
+                    }.font(.caption)
+                }
+                ForEach(viewModel.queueItems) { item in
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text(cloudexLocalized(item.statusTitle)).font(.caption).foregroundStyle(CloudexTheme.accent)
+                            if item.body.collaborationMode == "plan" { Text("计划").font(.caption) }
+                            Spacer()
+                            Menu {
+                                if item.status == "uploading" {
+                                    Button("重试入队") { Task { await viewModel.uploadQueueDraft(id: item.id) } }
+                                    Button("恢复到输入框核对") { viewModel.recoverLocalQueueDraft(id: item.id) }
+                                    Button("取消入队", role: .destructive) { Task { await viewModel.cancelLocalQueueDraft(id: item.id) } }
+                                } else if !["running", "dispatching"].contains(item.status) {
+                                    if !["unconfirmed", "failed"].contains(item.status) {
+                                        Button("修改") { queueEditText = item.body.message; editingQueueItem = item }
+                                        Button("上移") { Task { await viewModel.changeQueue("up", id: item.id) } }
+                                    }
+                                    Button(cloudexLocalized(item.status == "unconfirmed" ? "已核对，停止追踪此消息" : "删除"), role: .destructive) {
+                                        Task { await viewModel.changeQueue("cancel", id: item.id) }
+                                    }
+                                }
+                            } label: { Image(systemName: "ellipsis").frame(width: 44, height: 32) }
+                            .accessibilityIdentifier("queue-actions-\(item.id)")
+                        }
+                        Text(item.body.message).font(.body).frame(maxWidth: .infinity, alignment: .leading)
+                        if let files = item.body.files, !files.isEmpty {
+                            Text("附件 · \(files.count)").font(.caption).foregroundStyle(.secondary)
+                        }
+                        if let error = item.error { Text(error).font(.caption).foregroundStyle(.red) }
+                    }.padding(12).cloudexSurface(radius: 16)
+                }
+            }
+            if let error = viewModel.queueError, !viewModel.queueItems.isEmpty {
+                Text(error).font(.caption).foregroundStyle(.red)
+            }
+            if !viewModel.active && viewModel.collaborationMode == "plan" && viewModel.selectedThreadID != nil {
+                Button("按此计划执行") {
+                    viewModel.selectCollaborationMode("default")
+                    viewModel.draft = "请按刚才确认的计划开始执行。"
+                    composerFocused = true
+                }.font(.subheadline)
+            }
+            if viewModel.active || viewModel.isBusy {
+                HStack(spacing: 7) {
+                    Image(systemName: "waveform").symbolEffect(.variableColor.iterative, options: .repeating)
+                    Text(viewModel.isBusy ? "正在发送…" : "等待回复…").font(.caption)
+                }.foregroundStyle(.secondary)
+            }
+            Color.clear.frame(height: 1)
+        }
     }
 
     private var composer: some View {
@@ -571,24 +558,45 @@ struct ContentView: View {
                     HStack(spacing: 7) {
                         ForEach(viewModel.attachedFiles) { file in
                             HStack(spacing: 5) {
-                                Image(systemName: "doc")
-                                Text(file.name).lineLimit(1)
+                                if file.isImage {
+                                    AttachmentThumbnail(path: file.path, server: viewModel.serverURL, client: viewModel.client)
+                                        .frame(width: 62, height: 62)
+                                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                                        .accessibilityIdentifier("attachment-thumbnail")
+                                } else {
+                                    Image(systemName: "doc")
+                                    Text(file.name).lineLimit(1).frame(maxWidth: 180)
+                                }
                                 Button { viewModel.removeAttachment(file) } label: {
                                     Image(systemName: "xmark.circle.fill")
+                                        .frame(width: 32, height: 44)
                                 }
+                                .accessibilityLabel("移除\(file.name)")
                             }
                             .font(.caption)
                             .padding(.horizontal, 9)
                             .padding(.vertical, 6)
-                            .liquidGlass(in: Capsule(), interactive: true)
+                            .cloudexSurface(radius: 14)
                         }
                     }
                     .padding(.horizontal, 14)
                 }
             }
 
+            ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 7) {
+                attachmentAndVoiceControls
                 Menu {
+                    if viewModel.selectedAgentProvider == .codex {
+                        Picker("工作模式（下条消息生效）", selection: Binding(
+                            get: { viewModel.collaborationMode }, set: { viewModel.selectCollaborationMode($0) }
+                        )) {
+                            ForEach(viewModel.collaborationModes, id: \.self) { mode in
+                                Text(cloudexLocalized(mode == "plan" ? "计划模式" : "普通执行")).tag(mode)
+                            }
+                        }
+                        if let error = viewModel.collaborationModeError { Text(error) }
+                    }
                     Button {
                         Task { await viewModel.loadModelsIfNeeded(force: true) }
                     } label: {
@@ -637,6 +645,9 @@ struct ContentView: View {
                         Text(viewModel.compactModelTitle)
                             .lineLimit(1)
                             .truncationMode(.middle)
+                        if viewModel.selectedAgentProvider == .codex && viewModel.collaborationMode == "plan" {
+                            Text("计划").foregroundStyle(CloudexTheme.accent)
+                        }
                         Text("·")
                             .foregroundStyle(.secondary)
                         Text(viewModel.selectedEffortTitle)
@@ -702,40 +713,39 @@ struct ContentView: View {
                 .layoutPriority(0)
                 .accessibilityLabel("切换执行模式")
 
-                Spacer(minLength: 0)
+                if viewModel.chatDetails.statistics {
+                    taskTimerBubble
 
-                taskTimerBubble
-
-                Button {
-                    showingTokenUsage = true
-                } label: {
-                    Text(contextRemainingLabel)
-                        .font(.caption2.weight(.semibold))
-                        .lineLimit(1)
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 6)
+                    Button {
+                        showingTokenUsage = true
+                    } label: {
+                        Text(contextRemainingLabel)
+                            .font(.caption2.weight(.semibold))
+                            .lineLimit(1)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 6)
+                    }
+                    .buttonStyle(.plain)
+                    .liquidGlass(in: Capsule(), interactive: true)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .layoutPriority(1)
+                    .accessibilityLabel("查看本轮 Token 使用量")
                 }
-                .buttonStyle(.plain)
-                .liquidGlass(in: Capsule(), interactive: true)
-                .fixedSize(horizontal: true, vertical: false)
-                .layoutPriority(1)
-                .accessibilityLabel("查看本轮 Token 使用量")
             }
             .padding(.horizontal, 20)
+            .padding(.vertical, 4)
+            }
 
             composerControls
         }
+        .padding(.top, 8)
+        .background(CloudexTheme.canvas)
+        .overlay(alignment: .top) { CloudexTheme.line.opacity(0.35).frame(height: 0.5) }
     }
 
     @ViewBuilder
     private var composerControls: some View {
-        if #available(iOS 26.0, *) {
-            GlassEffectContainer(spacing: 12) {
-                composerControlStack
-            }
-        } else {
-            composerControlStack
-        }
+        composerControlStack
     }
 
     private var agentBuiltInCommands: [AgentBuiltInCommand] {
@@ -781,18 +791,46 @@ struct ContentView: View {
         }
     }
 
-    private var composerControlStack: some View {
-        HStack(alignment: .bottom, spacing: 10) {
-            Button { showingFilePicker = true } label: {
+    private var attachmentAndVoiceControls: some View {
+        Group {
+            Menu {
+                Button { showingFilePicker = true } label: {
+                    Label("电脑文件", systemImage: "folder")
+                }
+                Button { showingPhotosPicker = true } label: {
+                    Label("手机照片", systemImage: "photo")
+                }
+            } label: {
                 Image(systemName: "paperclip")
                     .font(.body.weight(.semibold))
-                    .frame(width: 46, height: 46)
+                    .frame(width: 44, height: 44)
                     .contentShape(Circle())
             }
             .buttonStyle(.plain)
-            .liquidGlass(in: Circle(), interactive: true)
-            .disabled((viewModel.selectedProjectCWD ?? viewModel.selectedThread?.cwd ?? viewModel.projects.first?.cwd) == nil)
-            .accessibilityLabel("上传文件")
+            .liquidGlass(in: Capsule(), interactive: true)
+            .accessibilityLabel("添加附件")
+
+            Button {
+                if speechInput.isRecording {
+                    speechInput.stop()
+                } else {
+                    let existing = viewModel.draft
+                    Task {
+                        await speechInput.start { transcript in
+                            viewModel.draft = existing + (existing.isEmpty ? "" : " ") + transcript
+                        }
+                    }
+                }
+            } label: {
+                Image(systemName: speechInput.isRecording ? "stop.circle.fill" : "mic")
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(speechInput.isRecording ? Color.red : Color.primary)
+                    .frame(width: 44, height: 44)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .liquidGlass(in: Capsule(), interactive: true)
+            .accessibilityLabel(speechInput.isRecording ? "停止语音输入" : "开始语音输入")
 
             if !agentBuiltInCommands.isEmpty {
                 Menu {
@@ -816,41 +854,47 @@ struct ContentView: View {
                 } label: {
                     Text("/")
                         .font(.system(size: 22, weight: .medium, design: .rounded))
-                        .frame(width: 46, height: 46)
+                        .frame(width: 38, height: 34)
                         .contentShape(Circle())
                 }
                 .buttonStyle(.plain)
-                .liquidGlass(in: Circle(), interactive: true)
+                .liquidGlass(in: Capsule(), interactive: true)
                 .accessibilityLabel("打开内置命令")
             }
+            if speechInput.isRecording {
+                Text("正在听写")
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+            }
+        }
+    }
 
+    private var composerControlStack: some View {
             HStack(alignment: .bottom, spacing: 4) {
-                ZStack(alignment: .topLeading) {
-                    if viewModel.draft.isEmpty {
-                        Text(cloudexLocalized(viewModel.selectedThreadID == nil ? "向 Codex 发送新指令…" : "继续发送指令…"))
-                            .foregroundStyle(.tertiary)
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 10)
+                ComposerTextInput(text: Binding(get: { viewModel.draft }, set: { viewModel.draft = $0 }),
+                                  focused: Binding(get: { composerFocused }, set: { composerFocused = $0 }))
+                    .overlay(alignment: .topLeading) {
+                        if viewModel.draft.isEmpty {
+                            Text(cloudexLocalized(viewModel.selectedThreadID == nil ? "向 Codex 发送新指令…" : "继续发送指令…"))
+                                .foregroundStyle(.tertiary)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 10)
+                                .allowsHitTesting(false)
+                        }
                     }
-                    TextEditor(text: $viewModel.draft)
-                        .scrollContentBackground(.hidden)
-                        .frame(minHeight: 38, maxHeight: 110)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .focused($composerFocused)
-                }
-                .padding(.leading, 4)
 
-                if viewModel.active {
-                    if viewModel.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                if viewModel.active || (!viewModel.queueItems.isEmpty && (!viewModel.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !viewModel.attachedFiles.isEmpty)) {
+                    if viewModel.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        && viewModel.attachedFiles.isEmpty {
                         Button { Task { await viewModel.stop() } } label: {
                             Image(systemName: "stop.fill")
                                 .font(.caption.weight(.semibold))
-                                .foregroundStyle(.white)
-                                .frame(width: 40, height: 40)
+                                .foregroundStyle(CloudexTheme.onAction)
+                                .frame(width: 44, height: 44)
                                 .contentShape(Circle())
                         }
                         .buttonStyle(.plain)
-                        .background(Color.black, in: Circle())
+                        .background(Color.primary, in: Circle())
                         .disabled(viewModel.isBusy)
                         .accessibilityLabel("停止任务")
                     } else {
@@ -859,30 +903,31 @@ struct ContentView: View {
                         } label: {
                             Image(systemName: "arrow.up")
                                 .font(.body.bold())
-                                .foregroundStyle(.white)
-                                .frame(width: 40, height: 40)
+                                .foregroundStyle(CloudexTheme.onAction)
+                                .frame(width: 44, height: 44)
                                 .contentShape(Circle())
                         }
                         .buttonStyle(.plain)
-                        .background(Color.black, in: Circle())
+                        .background(Color.primary, in: Circle())
                         .accessibilityLabel(cloudexLocalized("等待发送"))
+                        .contextMenu {
+                            if viewModel.active && viewModel.selectedAgentProvider == .codex {
+                                Button("立即补充当前任务") { Task { await viewModel.sendDraftAsSteer() } }
+                            }
+                        }
                     }
                 } else {
                     Button { Task { await viewModel.send() } } label: {
                         Group {
-                            if viewModel.isBusy {
-                                ProgressView().tint(.white)
-                            } else {
-                                Image(systemName: "arrow.up")
-                                    .font(.body.bold())
-                                    .foregroundStyle(.white)
-                            }
+                            Image(systemName: "arrow.up")
+                                .font(.body.bold())
+                                .foregroundStyle(CloudexTheme.onAction)
                         }
-                        .frame(width: 40, height: 40)
+                        .frame(width: 44, height: 44)
                         .contentShape(Circle())
                     }
                     .buttonStyle(.plain)
-                    .background(Color.black, in: Circle())
+                    .background(Color.primary, in: Circle())
                     .opacity(isSendButtonDisabled ? 0.45 : 1)
                     .disabled(isSendButtonDisabled)
                     .accessibilityLabel("发送消息")
@@ -891,7 +936,7 @@ struct ContentView: View {
             .padding(.vertical, 4)
             .padding(.trailing, 6)
             .padding(.leading, 3)
-            .liquidGlass(in: RoundedRectangle(cornerRadius: 27, style: .continuous), interactive: true)
+            .cloudexSurface(radius: 23, selected: composerFocused)
             .overlay(alignment: .bottomLeading) {
                 if !slashSuggestions.isEmpty {
                     VStack(alignment: .leading, spacing: 0) {
@@ -932,22 +977,14 @@ struct ContentView: View {
                     .offset(y: -52)
                 }
             }
-        }
-        .padding(.horizontal, 24)
-        .padding(.top, 10)
-        .padding(.bottom, bottomControlPadding)
-    }
-
-    private var bottomControlPadding: CGFloat {
-        if keyboardHeight > 0 { return 18 }
-        guard UIDevice.current.userInterfaceIdiom == .pad else { return -7 }
-        guard isWindowedIPad else { return 0 }
-        return max(0, 24 - bottomSafeArea)
+        .padding(.horizontal, 20)
+        .padding(.bottom, 8)
     }
 
     private var isSendButtonDisabled: Bool {
         viewModel.isBusy
-            || viewModel.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || (viewModel.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && viewModel.attachedFiles.isEmpty)
     }
 
     private var isExpectedChatReady: Bool {
@@ -967,238 +1004,55 @@ struct ContentView: View {
             projectCWD: isNoProjectRoute ? nil : viewModel.selectedProjectCWD,
             clearProject: isNoProjectRoute
         )
-        resetChatLayoutForNewThread()
-        updateChatContent(force: true)
     }
 
     private var currentChatContent: ChatScrollContent {
-        guard isExpectedChatReady else { return .empty }
+        guard isExpectedChatReady, viewModel.conversationLoadState != .loading else { return .empty }
         return ChatScrollContent(
-            messages: viewModel.renderedMessages,
+            messages: viewModel.chatDetails.visibleMessages(viewModel.renderedMessages),
             approvals: viewModel.visibleApprovals,
             active: viewModel.active
         )
     }
 
-    private func updateChatContent(force: Bool = false) {
-        guard isExpectedChatReady, !viewModel.isOpeningThread else { return }
-        if isStaticConversationLocked && !force { return }
-        let latest = currentChatContent
-        if !hasLoadedChatContent {
-            beginInitialBottomPositioning()
-            chatContentSnapshot = latest
-            hasLoadedChatContent = true
-            return
-        }
-
-        if isPreparingInitialLayout {
-            // Keep the hidden initial snapshot current while the first layout
-            // settles. Do not enqueue another scroll for every streamed delta.
-            chatContentSnapshot = latest
-            return
-        }
-
-        if viewModel.isLoadingOlderTurns {
-            // Prepending history updates the rows without entering bottom
-            // follow mode. The native offset is restored after layout.
-            chatContentSnapshot = latest
-            return
-        }
-
-        if force || isFollowingChatBottom {
-            chatContentSnapshot = latest
-            if isFollowingChatBottom {
-                let requestGeneration = scrollToBottomRequest + 1
-                DispatchQueue.main.async {
-                    guard isFollowingChatBottom,
-                          !isPreparingInitialLayout,
-                          !isUserScrollingChat else { return }
-                    scrollToBottomRequest = requestGeneration
-                }
-            }
-        } else {
-            // Leaving follow mode must freeze only the viewport, not the
-            // conversation data. Keep replacing rows that are still being
-            // streamed and append newly arrived rows without requesting a
-            // scroll, so messages and execution commands remain live while
-            // the user reads older content.
-            if shouldReplaceForCompletedProcess(with: latest) {
-                // Completion changes the timeline's structure: fine-grained
-                // live rows are replaced by one process-summary row plus the
-                // final answer. An append-only merge would retain all of the
-                // obsolete live rows. Apply the final snapshot atomically but
-                // deliberately do not request any scroll positioning.
-                chatContentSnapshot = latest
-                return
-            }
-            mergeLiveChatContent(from: latest)
-        }
-    }
-
-    private func beginInitialBottomPositioning() {
-        // A new conversation has no history to measure or scroll. Revealing
-        // the empty composer immediately also avoids waiting on a ScrollView
-        // layout pass that may never report a usable bottom offset.
-        if expectedThreadID?.hasPrefix("new-") == true {
-            isInitialBottomScrollInProgress = false
-            isPreparingInitialLayout = false
-            return
-        }
-        initialBottomScrollGeneration += 1
-        let generation = initialBottomScrollGeneration
-        isInitialBottomScrollInProgress = true
-        isPreparingInitialLayout = true
-        DispatchQueue.main.async {
-            guard initialBottomScrollGeneration == generation,
-                  isFollowingChatBottom else { return }
-            scrollToBottomRequest += 1
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-            guard initialBottomScrollGeneration == generation else { return }
-            if isFollowingChatBottom && !isUserScrollingChat {
-                // The final native correction runs while the content is still
-                // hidden, so revealing it cannot expose an intermediate offset.
-                _ = chatScrollController.scrollToBottom(animated: false)
-                isAtChatBottom = chatScrollController.isAtBottom()
-            }
-            isInitialBottomScrollInProgress = false
-            isPreparingInitialLayout = false
-            if !viewModel.active {
-                isStaticConversationLocked = true
-            }
-        }
-    }
-
-    private func resetChatLayoutForNewThread() {
-        chatScrollController.cancelCurrentScroll()
-        initialBottomScrollGeneration += 1
-        explicitScrollGeneration += 1
-        messagePositioningGeneration += 1
-        processLayoutGeneration += 1
-        scrollTargetMessageID = nil
-        chatContentSnapshot = .empty
-        hasLoadedChatContent = false
-        isStaticConversationLocked = false
-        isPreparingInitialLayout = expectedThreadID?.hasPrefix("new-") != true
-        isInitialBottomScrollInProgress = false
-        isMessagePositioningInProgress = false
-        isProcessLayoutChangeInProgress = false
-        processExpansionScrollOffset = nil
-        isAtChatBottom = true
-        isFollowingChatBottom = true
-        isUserScrollingChat = false
-    }
-
-    private func shouldReplaceForCompletedProcess(with latest: ChatScrollContent) -> Bool {
-        let currentIDs = Set(chatContentSnapshot.messages.map(\.id))
-        let latestIDs = Set(latest.messages.map(\.id))
-        let introducedProcessSummary = latest.messages.contains {
-            $0.role == .processSummary && !currentIDs.contains($0.id)
-        }
-        let removesLiveRows = chatContentSnapshot.messages.contains {
-            !latestIDs.contains($0.id)
-        }
-        return introducedProcessSummary && removesLiveRows
-    }
-
-    private func mergeLiveChatContent(from latest: ChatScrollContent) {
-        let existingIDs = Set(chatContentSnapshot.messages.map(\.id))
-        let latestIDs = Set(latest.messages.map(\.id))
-        // Keep the server's canonical order. Only retain rows that are still
-        // live and have not reached the persisted snapshot yet; preserving
-        // removed rows in the old order caused jumps and blank sections.
-        var messages = latest.messages
-        messages.append(contentsOf: chatContentSnapshot.messages.filter {
-            existingIDs.contains($0.id) && !latestIDs.contains($0.id)
-        })
-
-        chatContentSnapshot = ChatScrollContent(
-            messages: messages,
-            approvals: latest.approvals,
-            active: latest.active
-        )
-    }
-
     private func showLatestChatContent() {
-        beginExplicitScroll()
-        if isFollowingChatBottom {
-            updateChatContent(force: true)
-            return
-        }
-        isFollowingChatBottom = true
-    }
-
-    private func beginExplicitScroll() {
-        explicitScrollGeneration += 1
-        let generation = explicitScrollGeneration
-        isExplicitScrollInProgress = true
-        // A button tap can arrive while UIScrollView is still decelerating.
-        // Cancel that native motion before changing follow state; otherwise
-        // the scroll-phase callback can leave isUserScrollingChat=true and
-        // the bottom request will be rejected until the deceleration ends.
-        chatScrollController.cancelCurrentScroll()
-        isUserScrollingChat = false
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) {
-            guard explicitScrollGeneration == generation else { return }
-            isExplicitScrollInProgress = false
-        }
-    }
-
-    private func beginProcessLayoutChange(expanding: Bool, restorePosition: Bool) {
-        processLayoutGeneration += 1
-        let generation = processLayoutGeneration
-        chatScrollController.cancelCurrentScroll()
-        isFollowingChatBottom = false
-        isProcessLayoutChangeInProgress = true
-
-        if expanding {
-            processExpansionScrollOffset = chatScrollController.currentContentOffset()
-        } else if restorePosition, let offset = processExpansionScrollOffset {
-            processExpansionScrollOffset = nil
-            let restoreSavedPosition = {
-                guard processLayoutGeneration == generation else { return }
-                _ = chatScrollController.restoreContentOffset(offset)
-            }
-            DispatchQueue.main.async(execute: restoreSavedPosition)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: restoreSavedPosition)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.22, execute: restoreSavedPosition)
-        } else {
-            processExpansionScrollOffset = nil
-        }
-
-        // Long histories need several LazyVStack layout passes. During that
-        // window, do not interpret content-height changes as a reason to
-        // resume bottom following.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
-            guard processLayoutGeneration == generation else { return }
-            isProcessLayoutChangeInProgress = false
-            isAtChatBottom = chatScrollController.isAtBottom()
+        let thread = viewModel.selectedThreadID
+        Task {
+            await viewModel.restoreLatestWindow()
+            guard viewModel.selectedThreadID == thread else { return }
+            isFollowingChatBottom = true
+            chatListActions.showLatest()
         }
     }
 
     private func showMessage(_ messageID: String, highlightQuery: String? = nil) {
-        messagePositioningGeneration += 1
-        isMessagePositioningInProgress = true
-        beginExplicitScroll()
-        chatScrollController.cancelCurrentScroll()
-        isFollowingChatBottom = false
-        isAtChatBottom = false
-        messageTextHighlight = highlightQuery.flatMap { query in
-            let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : MessageTextHighlight(messageID: messageID, query: trimmed)
+        if !viewModel.renderedMessages.contains(where: { $0.id == messageID }),
+           let threadID = viewModel.selectedThreadID,
+           let item = viewModel.messageIndex.first(where: { $0.id == messageID }) {
+            viewModel.requestMessageJump(threadID: threadID, messageID: messageID, turnID: item.turnId, query: highlightQuery ?? "")
+            return
         }
-        chatContentSnapshot = currentChatContent
-        hasLoadedChatContent = true
-        DispatchQueue.main.async {
-            scrollTargetMessageID = messageID
-        }
+        messageTextHighlight = highlightQuery.map { MessageTextHighlight(messageID: messageID, query: $0) }
+        chatListActions.showMessage(messageID)
     }
 
     private func fulfillPendingMessageJumpIfPossible() {
         guard !viewModel.isOpeningThread,
               let request = viewModel.pendingMessageJump,
-              request.threadID == viewModel.selectedThreadID,
-              viewModel.renderedMessages.contains(where: { $0.id == request.messageID }) else { return }
+              request.threadID == viewModel.selectedThreadID else { return }
+        if !viewModel.renderedMessages.contains(where: { $0.id == request.messageID }) {
+            guard loadingJumpID != request.messageID else { return }
+            loadingJumpID = request.messageID
+            Task {
+                let loaded = await viewModel.loadMessageFromIndex(messageID: request.messageID, turnID: request.turnID)
+                loadingJumpID = nil
+                guard viewModel.pendingMessageJump == request else { return }
+                viewModel.clearMessageJumpRequest()
+                if loaded { showMessage(request.messageID, highlightQuery: request.query) }
+                else { viewModel.status = "没有找到目标消息，请重试" }
+            }
+            return
+        }
         viewModel.clearMessageJumpRequest()
         showMessage(request.messageID, highlightQuery: request.query)
     }
@@ -1325,235 +1179,7 @@ private struct AgentBuiltInCommand: Identifiable {
     var id: String { command }
 }
 
-private final class ChatScrollController: ObservableObject {
-    private weak var scrollView: UIScrollView?
 
-    func attach(_ scrollView: UIScrollView) {
-        self.scrollView = scrollView
-    }
-
-    func detach() {
-        scrollView = nil
-    }
-
-    func isAtBottom(tolerance: CGFloat = 24) -> Bool {
-        guard let scrollView, scrollView.window != nil else { return false }
-        scrollView.layoutIfNeeded()
-        let minimumY = -scrollView.adjustedContentInset.top
-        let maximumY = max(
-            minimumY,
-            scrollView.contentSize.height
-                - scrollView.bounds.height
-                + scrollView.adjustedContentInset.bottom
-        )
-        return maximumY - scrollView.contentOffset.y <= tolerance
-    }
-
-    func currentContentOffset() -> CGPoint? {
-        guard let scrollView, scrollView.window != nil else { return nil }
-        return scrollView.contentOffset
-    }
-
-    func contentSizeHeight() -> CGFloat {
-        scrollView?.layoutIfNeeded()
-        return scrollView?.contentSize.height ?? 0
-    }
-
-    @discardableResult
-    func restoreContentOffset(_ offset: CGPoint) -> Bool {
-        guard let scrollView, scrollView.window != nil else { return false }
-        scrollView.layoutIfNeeded()
-        let minimumY = -scrollView.adjustedContentInset.top
-        let maximumY = max(
-            minimumY,
-            scrollView.contentSize.height
-                - scrollView.bounds.height
-                + scrollView.adjustedContentInset.bottom
-        )
-        let targetY = min(max(offset.y, minimumY), maximumY)
-        scrollView.setContentOffset(CGPoint(x: offset.x, y: targetY), animated: false)
-        return true
-    }
-
-    @discardableResult
-    func scrollToBottom(animated: Bool) -> Bool {
-        guard let scrollView, scrollView.window != nil else { return false }
-
-        // Stop both an active drag and any remaining deceleration before
-        // starting the explicit navigation animation. Toggling the pan
-        // recognizer forces UIKit to cancel the gesture immediately.
-        let currentOffset = scrollView.contentOffset
-        scrollView.layer.removeAllAnimations()
-        scrollView.setContentOffset(currentOffset, animated: false)
-        scrollView.panGestureRecognizer.isEnabled = false
-        scrollView.panGestureRecognizer.isEnabled = true
-        scrollView.layoutIfNeeded()
-
-        let minimumY = -scrollView.adjustedContentInset.top
-        let maximumY = max(
-            minimumY,
-            scrollView.contentSize.height
-                - scrollView.bounds.height
-                + scrollView.adjustedContentInset.bottom
-        )
-        let target = CGPoint(x: scrollView.contentOffset.x, y: maximumY)
-        scrollView.setContentOffset(target, animated: animated)
-        return true
-    }
-
-    func cancelCurrentScroll() {
-        guard let scrollView, scrollView.window != nil else { return }
-        let currentOffset = scrollView.contentOffset
-        scrollView.layer.removeAllAnimations()
-        scrollView.setContentOffset(currentOffset, animated: false)
-        // Cancel both a finger-owned gesture and UIKit deceleration. The
-        // search positioning transaction takes ownership immediately after.
-        scrollView.panGestureRecognizer.isEnabled = false
-        scrollView.panGestureRecognizer.isEnabled = true
-    }
-}
-
-private struct ChatScrollViewResolver: UIViewRepresentable {
-    let controller: ChatScrollController
-
-    func makeUIView(context: Context) -> ResolverView {
-        ResolverView(controller: controller)
-    }
-
-    func updateUIView(_ uiView: ResolverView, context: Context) {
-        uiView.controller = controller
-        uiView.resolveScrollView()
-    }
-
-    static func dismantleUIView(_ uiView: ResolverView, coordinator: ()) {
-        uiView.controller.detach()
-    }
-
-    final class ResolverView: UIView {
-        var controller: ChatScrollController
-
-        init(controller: ChatScrollController) {
-            self.controller = controller
-            super.init(frame: .zero)
-            isUserInteractionEnabled = false
-        }
-
-        @available(*, unavailable)
-        required init?(coder: NSCoder) {
-            fatalError("init(coder:) has not been implemented")
-        }
-
-        override func didMoveToSuperview() {
-            super.didMoveToSuperview()
-            resolveScrollView()
-        }
-
-        override func didMoveToWindow() {
-            super.didMoveToWindow()
-            resolveScrollView()
-        }
-
-        func resolveScrollView() {
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                var ancestor = self.superview
-                while let view = ancestor {
-                    if let scrollView = view as? UIScrollView {
-                        self.controller.attach(scrollView)
-                        return
-                    }
-                    ancestor = view.superview
-                }
-            }
-        }
-    }
-}
-
-private extension View {
-    @ViewBuilder
-    func trackChatScroll(
-        isAtBottom: Binding<Bool>,
-        isFollowingBottom: Binding<Bool>,
-        isExplicitScrollInProgress: Binding<Bool>,
-        isUserScrolling: Binding<Bool>,
-        isLayoutChangeInProgress: Binding<Bool>,
-        isFollowRestorationDisabled: @escaping () -> Bool,
-        nativeIsAtBottom: @escaping () -> Bool
-    ) -> some View {
-        if #available(iOS 18.0, *) {
-            self.onScrollGeometryChange(for: Bool.self) { geometry in
-                let visibleBottom = geometry.contentOffset.y + geometry.containerSize.height
-                let distanceToBottom = geometry.contentSize.height - visibleBottom
-                return geometry.contentSize.height <= geometry.containerSize.height || distanceToBottom <= 24
-            } action: { _, atBottom in
-                isAtBottom.wrappedValue = atBottom
-                // Scroll geometry can deliver its final bottom value just
-                // after the phase changes to idle. Restore follow mode here
-                // as well so that event ordering cannot leave a stale button.
-                if atBottom
-                    && !isUserScrolling.wrappedValue
-                    && !isLayoutChangeInProgress.wrappedValue
-                    && !isExplicitScrollInProgress.wrappedValue
-                    && !isFollowRestorationDisabled() {
-                    isFollowingBottom.wrappedValue = true
-                }
-            }
-            .onScrollPhaseChange { _, phase in
-                switch phase {
-                case .tracking, .interacting, .decelerating:
-                    guard !isExplicitScrollInProgress.wrappedValue else { break }
-                    isUserScrolling.wrappedValue = true
-                    // Any user-initiated scroll leaves follow mode. Do not
-                    // automatically restore it when scrolling becomes idle:
-                    // an upward drag that starts at the bottom can still be
-                    // reported as "at bottom" for a moment, which previously
-                    // caused the next content update to jump back down.
-                    // Follow mode is restored only after the gesture really
-                    // settles at the bottom (see the idle case below), or by
-                    // showLatestChatContent().
-                    isFollowingBottom.wrappedValue = false
-                case .idle:
-                    isUserScrolling.wrappedValue = false
-                    // SwiftUI's geometry can lag behind the final rubber-band
-                    // position. Reconcile against the underlying UIScrollView
-                    // now and once more on the next run loop after layout.
-                    let reconcileBottom = {
-                        let atBottom = nativeIsAtBottom()
-                        isAtBottom.wrappedValue = atBottom
-                        if atBottom
-                            && !isLayoutChangeInProgress.wrappedValue
-                            && !isExplicitScrollInProgress.wrappedValue
-                            && !isFollowRestorationDisabled() {
-                            isFollowingBottom.wrappedValue = true
-                        }
-                    }
-                    reconcileBottom()
-                    DispatchQueue.main.async(execute: reconcileBottom)
-                default:
-                    break
-                }
-            }
-        } else {
-            self.simultaneousGesture(
-                DragGesture(minimumDistance: 2)
-                    .onChanged { _ in
-                        guard !isExplicitScrollInProgress.wrappedValue else { return }
-                        isUserScrolling.wrappedValue = true
-                        isAtBottom.wrappedValue = false
-                        isFollowingBottom.wrappedValue = false
-                    }
-                    .onEnded { _ in
-                        isUserScrolling.wrappedValue = false
-                        if isAtBottom.wrappedValue
-                            && !isExplicitScrollInProgress.wrappedValue
-                            && !isFollowRestorationDisabled() {
-                            isFollowingBottom.wrappedValue = true
-                        }
-                    }
-            )
-        }
-    }
-}
 
 private struct TokenUsageSheet: View {
     let usage: CloudexUsage?
@@ -1613,7 +1239,7 @@ private struct PendingSteerBubble: View {
             Spacer(minLength: 42)
 
             VStack(alignment: .leading, spacing: 8) {
-                Text(cloudexLocalized("等待发送"))
+                Text("旧版待发送草稿 · 请核对所属会话")
                     .font(.caption2.weight(.semibold))
                     .foregroundStyle(.secondary)
 
@@ -1665,14 +1291,18 @@ private struct PendingSteerBubble: View {
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 11)
-            .background(Color.blue.opacity(0.14), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .cloudexSurface(radius: 18, selected: true)
         }
     }
 }
 
-private struct MessageBubble: View {
-    @EnvironmentObject private var viewModel: AppViewModel
+private struct MessageBubble: View, Equatable {
+    // Used for user actions only; unrelated model publications must not invalidate every row.
+    let viewModel: AppViewModel
+    let client: APIClient
+    let isActive: Bool
     let message: ChatMessage
+    let preferences: ChatDetailPreferences
     let highlightQuery: String?
     @Binding var collapseRequest: Int
     let onQuickFill: (String) -> Void
@@ -1682,14 +1312,19 @@ private struct MessageBubble: View {
     let onFloatingStateChange: (Bool) -> Void
     @State private var isPerformingAction = false
     @State private var isErrorExpanded = false
-    @State private var previewItem: EditPreviewItem?
-    @State private var previewLoadingPath: String?
-    @State private var previewError: String?
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.viewModel === rhs.viewModel && lhs.client.serverURL == rhs.client.serverURL
+            && lhs.client.token == rhs.client.token && lhs.isActive == rhs.isActive
+            && lhs.message == rhs.message && lhs.highlightQuery == rhs.highlightQuery
+            && lhs.preferences == rhs.preferences
+            && lhs.collapseRequest == rhs.collapseRequest
+    }
 
     @ViewBuilder
     var body: some View {
         if message.role == .execution {
-            ExecutionStepRow(message: message)
+            ExecutionStepRow(message: message, showStatistics: preferences.statistics)
         } else if message.role == .processSummary {
             ProcessSummaryBubble(
                 message: message,
@@ -1702,37 +1337,8 @@ private struct MessageBubble: View {
         } else if message.role == .taskSummary || message.role == .compressed || message.role == .system {
             SystemTimelineBubble(message: message)
         } else if message.role == .assistant {
-            AdaptiveConversationLayout(fillsWidth: true) {
-                messageContent
-            }
+            messageContent
             .frame(maxWidth: .infinity, alignment: .leading)
-            .sheet(item: $previewItem) { item in
-                NavigationStack {
-                    Group {
-                        if let code = item.code {
-                            CodePreviewView(source: code, fileName: item.name)
-                        } else {
-                            EditQuickLookPreview(url: item.url)
-                        }
-                    }
-                    .navigationTitle(item.name)
-                    .navigationBarTitleDisplayMode(.inline)
-                    .toolbar {
-                        ToolbarItem(placement: .confirmationAction) {
-                            Button(cloudexLocalized("完成")) { previewItem = nil }
-                        }
-                    }
-                }
-                .presentationDragIndicator(.visible)
-            }
-            .alert(cloudexLocalized("无法预览文件"), isPresented: Binding(
-                get: { previewError != nil },
-                set: { if !$0 { previewError = nil } }
-            )) {
-                Button(cloudexLocalized("好"), role: .cancel) {}
-            } message: {
-                Text(previewError ?? cloudexLocalized("未知错误"))
-            }
         } else if message.role == .error {
             // Errors are status messages like assistant responses: give the
             // bubble the row's proposed width instead of letting its text
@@ -1742,7 +1348,7 @@ private struct MessageBubble: View {
         } else {
             HStack {
                 if message.role == .user { Spacer(minLength: 42) }
-                AdaptiveConversationLayout(fillsWidth: message.role == .assistant) {
+                AdaptiveConversationLayout {
                     messageContent
                 }
                 if message.role != .user && message.role != .assistant {
@@ -1754,10 +1360,18 @@ private struct MessageBubble: View {
     }
 
     private var messageContent: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(roleTitle)
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(message.role == .error ? Color.red : Color.secondary)
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 6) {
+                if message.role == .user || message.role == .assistant {
+                    Image(systemName: message.role == .user ? "person.crop.circle" : "sparkle")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(CloudexTheme.accent)
+                        .accessibilityHidden(true)
+                }
+                Text(roleTitle)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(message.role == .error ? Color.red : Color.secondary)
+            }
 
             if message.role == .error {
                 VStack(alignment: .leading, spacing: 6) {
@@ -1769,22 +1383,29 @@ private struct MessageBubble: View {
                         .lineLimit(isErrorExpanded || !canExpandError ? nil : 2)
                 }
             } else {
-                if message.role == .user, !message.attachments.isEmpty {
+                if !message.attachments.isEmpty {
                     VStack(alignment: .leading, spacing: 6) {
                         ForEach(message.attachments) { attachment in
-                            HStack(spacing: 7) {
-                                Image(systemName: attachment.systemImage)
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(.secondary)
-                                Text(attachment.name)
-                                    .font(.caption.weight(.medium))
-                                    .lineLimit(1)
-                                    .truncationMode(.middle)
-                                Spacer(minLength: 0)
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack(spacing: 7) {
+                                    Image(systemName: attachment.systemImage)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(.secondary)
+                                    Text(attachment.name)
+                                        .font(.caption.weight(.medium))
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                    Spacer(minLength: 0)
+                                }
+                                if attachment.kind == .image, let path = attachment.path {
+                                    MarkdownImage(destination: path, label: attachment.name)
+                                } else if let path = attachment.path, let url = URL(string: path) {
+                                    Link("浏览文件", destination: url)
+                                }
                             }
                             .padding(.horizontal, 9)
                             .padding(.vertical, 7)
-                            .background(Color(.systemGray6), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                            .cloudexSurface(radius: 15)
                         }
                     }
                     .padding(.bottom, message.text.isEmpty ? 0 : 3)
@@ -1792,10 +1413,9 @@ private struct MessageBubble: View {
 
                 if !message.text.isEmpty {
                     MarkdownText(
-                        text: message.text,
-                        highlightQuery: highlightQuery,
-                        rendersMarkdown: message.role != .user,
-                        onFileLink: message.role == .assistant ? { url in previewFile(url) } : nil
+                        document: message.markdown,
+                        fallbackText: message.text,
+                        highlightQuery: highlightQuery
                     )
                         .font(.body)
                         .foregroundStyle(message.role == .error ? Color.red : Color.primary)
@@ -1804,7 +1424,7 @@ private struct MessageBubble: View {
                 }
             }
 
-            if message.role == .assistant,
+            if preferences.tools, message.role == .assistant,
                let editDiff = message.editDiff,
                !editDiff.isEmpty {
                 EditSummaryCard(payloads: editDiff)
@@ -1813,18 +1433,21 @@ private struct MessageBubble: View {
 
             messageFooter
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 11)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 15)
         .frame(minWidth: 0)
         .frame(
             maxWidth: message.role == .assistant || message.role == .error ? .infinity : nil,
             alignment: .leading
         )
-        .background(message.role == .user ? bubbleColor : .clear,
-                    in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .background(messageBackground,
+                    in: RoundedRectangle(cornerRadius: 20, style: .continuous))
         .overlay {
             if message.role == .error {
-                RoundedRectangle(cornerRadius: 16).stroke(Color.red.opacity(0.3))
+                RoundedRectangle(cornerRadius: 20).stroke(Color.red.opacity(0.3))
+            } else if message.role == .assistant || message.role == .user {
+                RoundedRectangle(cornerRadius: 20)
+                    .stroke(CloudexTheme.line.opacity(0.4), lineWidth: 0.6)
             }
         }
     }
@@ -1833,83 +1456,6 @@ private struct MessageBubble: View {
         message.text.count > 100 || message.text.contains("\n")
     }
 
-    private func previewFile(_ url: URL) {
-        guard url.scheme == nil || url.isFileURL else { return }
-        guard previewLoadingPath == nil else { return }
-
-        let candidates = previewPathCandidates(for: url)
-        guard let firstCandidate = candidates.first else { return }
-        previewLoadingPath = firstCandidate
-        Task {
-            var lastError: Error?
-            for path in candidates {
-                do {
-                    let data = try await viewModel.previewFile(path: path)
-                    let name = (path as NSString).lastPathComponent
-                    let directory = FileManager.default.temporaryDirectory
-                        .appendingPathComponent("CloudexPreviews", isDirectory: true)
-                        .appendingPathComponent(UUID().uuidString, isDirectory: true)
-                    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                    let localURL = directory.appendingPathComponent(name)
-                    try data.write(to: localURL, options: .atomic)
-                    previewItem = EditPreviewItem(
-                        name: name,
-                        url: localURL,
-                        code: CodePreviewFile.supports(fileName: name) ? CodePreviewFile.decode(data) : nil
-                    )
-                    previewLoadingPath = nil
-                    return
-                } catch {
-                    lastError = error
-                }
-            }
-            previewError = lastError?.localizedDescription ?? cloudexLocalized("未知错误")
-            previewLoadingPath = nil
-        }
-    }
-
-    private func previewPathCandidates(for url: URL) -> [String] {
-        let rawPath = (url.isFileURL ? url.path : (url.path.isEmpty ? url.absoluteString : url.path))
-            .removingPercentEncoding ?? url.absoluteString
-        let normalizedPath = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalizedPath.isEmpty else { return [] }
-
-        let root = viewModel.selectedThread?.cwd ?? viewModel.selectedProjectCWD
-        let linkedName = (normalizedPath as NSString).lastPathComponent
-        let comparisonPath = normalizedPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        var knownPaths = message.editDiff?.map(\.name) ?? []
-        knownPaths.append(contentsOf: (viewModel.detail?.turns ?? []).flatMap { turn in
-            (turn.items ?? []).flatMap { $0.diff?.map(\.name) ?? [] }
-        })
-
-        let matchingPaths = knownPaths.filter { candidate in
-            let normalizedCandidate = candidate.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            return normalizedCandidate == comparisonPath
-                || (normalizedCandidate as NSString).lastPathComponent == linkedName
-        }
-
-        func resolveAgainstRoot(_ path: String) -> String {
-            guard !path.hasPrefix("/"), let root, !root.isEmpty else { return path }
-            return URL(fileURLWithPath: root, isDirectory: true)
-                .appendingPathComponent(path)
-                .standardizedFileURL.path
-        }
-
-        var candidates = matchingPaths.map(resolveAgainstRoot)
-        candidates.append(resolveAgainstRoot(normalizedPath))
-        // Some summaries use a workspace-relative path beginning with `/`.
-        // Try it as written first, then as a path beneath the active thread.
-        if normalizedPath.hasPrefix("/"), let root, !root.isEmpty {
-            candidates.append(
-                URL(fileURLWithPath: root, isDirectory: true)
-                    .appendingPathComponent(String(normalizedPath.dropFirst()))
-                    .standardizedFileURL.path
-            )
-        }
-        return candidates.reduce(into: [String]()) { result, candidate in
-            if !result.contains(candidate) { result.append(candidate) }
-        }
-    }
 
     private var roleTitle: String {
         switch message.role {
@@ -1924,7 +1470,13 @@ private struct MessageBubble: View {
         }
     }
 
-    private var bubbleColor: Color { Color.gray.opacity(0.18) }
+    private var messageBackground: Color {
+        switch message.role {
+        case .user: return CloudexTheme.userBubble.opacity(0.88)
+        case .assistant: return CloudexTheme.surface.opacity(0.78)
+        default: return .clear
+        }
+    }
 
     private var messageTime: String {
         DateFormatting.messageTime(from: message.createdAt)
@@ -1933,8 +1485,13 @@ private struct MessageBubble: View {
     @ViewBuilder
     private var messageFooter: some View {
         HStack(spacing: 6) {
-            if !messageTime.isEmpty {
+            if preferences.statistics, !messageTime.isEmpty {
                 Text(messageTime)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            if message.id.hasPrefix("outgoing-") {
+                Text(message.executionStatus == "unconfirmed" ? "发送结果待确认" : (message.executionStatus == "sent" ? "已发送" : "发送中…"))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
@@ -1977,7 +1534,7 @@ private struct MessageBubble: View {
                     .foregroundStyle(.secondary)
                     .disabled(isPerformingAction)
                     .accessibilityLabel("填充到输入框")
-                } else if !viewModel.active {
+                } else if !isActive {
                     Button {
                         Task {
                             isPerformingAction = true
@@ -2022,12 +1579,16 @@ private struct ProcessSummaryBubble: View {
     let onInteraction: (Bool) -> Void
     let onFloatingCollapse: () -> Void
     let onFloatingStateChange: (Bool) -> Void
-    @State private var expanded = false
+    private var expanded: Bool {
+        get { viewModel.expandedProcessIDs.contains(message.id) }
+        nonmutating set { viewModel.setProcessExpanded(message.id, expanded: newValue) }
+    }
     @State private var expansionGeneration = 0
     @State private var expandedContentHeight: CGFloat = 0
     @State private var collapseButtonVisible = true
     @State private var bubbleVisible = true
     @State private var loadingDetails = false
+    @State private var detailsError: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -2044,7 +1605,9 @@ private struct ProcessSummaryBubble: View {
                             expanded = true
                         }
                     } else if let turnID = message.sourceTurnID, !loadingDetails {
+                        onInteraction(true)
                         loadingDetails = true
+                        detailsError = nil
                         Task {
                             let loaded = await viewModel.loadTurnDetails(turnID: turnID)
                             loadingDetails = false
@@ -2053,34 +1616,48 @@ private struct ProcessSummaryBubble: View {
                                 withAnimation(.easeInOut(duration: 0.3)) {
                                     expanded = true
                                 }
+                            } else {
+                                detailsError = "过程详情加载失败，点击重试"
                             }
                         }
                     }
                 } label: {
                     HStack(spacing: 8) {
-                        Image(systemName: "chevron.right.circle.fill")
-                            .foregroundStyle(.secondary)
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(CloudexTheme.accent)
                             .rotationEffect(.degrees(expanded ? 90 : 0))
-                        MarkdownText(text: message.text)
-                            .font(.body.weight(.semibold))
+                        Text(viewModel.chatDetails.statistics ? message.text : cloudexLocalized("查看过程"))
+                            .font(.subheadline.weight(.medium))
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.leading)
                         Spacer(minLength: 0)
                     }
+                    .frame(minHeight: 24)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityIdentifier("process-toggle-\(message.sourceTurnID ?? message.id)")
                 .modifier(ScrollVisibilityModifier { visible in
                     collapseButtonVisible = visible
                     updateFloatingState()
                 })
 
+                ForEach(message.attachments) { attachment in
+                    if let path = attachment.path { MarkdownImage(destination: path, label: attachment.name) }
+                }
                 if expanded {
                     VStack(alignment: .leading, spacing: 8) {
-                        ForEach(message.processItems ?? []) { item in
+                        let items = (message.processItems ?? []).filter { viewModel.chatDetails.includes($0) }
+                        if (message.processItems ?? []).isEmpty {
+                            Text("暂无过程详情").foregroundStyle(.secondary)
+                        } else if items.isEmpty {
+                            Text("过程细节已在设置中隐藏").foregroundStyle(.secondary)
+                        }
+                        ForEach(items) { item in
                             if item.role == .execution {
-                                ExecutionStepRow(message: item)
+                                ExecutionStepRow(message: item, showStatistics: viewModel.chatDetails.statistics)
                                     .id("\(item.id)-\(expansionGeneration)")
                             } else {
                                 VStack(alignment: .leading, spacing: 4) {
@@ -2089,12 +1666,12 @@ private struct ProcessSummaryBubble: View {
                                             .font(.caption2.weight(.semibold))
                                             .foregroundStyle(.secondary)
                                     }
-                                    MarkdownText(text: item.text)
+                                    MarkdownText(document: item.markdown, fallbackText: item.text)
                                         .font(.body)
                                         .foregroundStyle(.primary)
                                         .textSelection(.enabled)
                                     let time = DateFormatting.messageTime(from: item.createdAt)
-                                    if !time.isEmpty {
+                                    if viewModel.chatDetails.statistics, !time.isEmpty {
                                         Text(time)
                                             .font(.caption2)
                                             .foregroundStyle(.secondary)
@@ -2113,9 +1690,12 @@ private struct ProcessSummaryBubble: View {
                         }
                     }
                 }
+                if loadingDetails { ProgressView("正在读取过程…") }
+                if let detailsError { Text(detailsError).font(.caption).foregroundStyle(.red) }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
+            .cloudexSurface(radius: 16)
             // Keep the expanded process content constrained to the same
             // bubble width as its header. Without an explicit finite width,
             // long shell commands and diff rows can make the VStack choose
@@ -2123,7 +1703,6 @@ private struct ProcessSummaryBubble: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         .frame(maxWidth: .infinity, alignment: .leading)
         .onChange(of: message.id) { _, _ in
-            expanded = false
             expansionGeneration += 1
             expandedContentHeight = 0
             collapseButtonVisible = true
@@ -2248,41 +1827,6 @@ private struct EditSummaryCard: View {
 
 }
 
-private struct EditPreviewItem: Identifiable {
-    let id = UUID()
-    let name: String
-    let url: URL
-    let code: String?
-}
-
-private struct EditQuickLookPreview: UIViewControllerRepresentable {
-    let url: URL
-
-    func makeCoordinator() -> Coordinator { Coordinator(url: url) }
-
-    func makeUIViewController(context: Context) -> QLPreviewController {
-        let controller = QLPreviewController()
-        controller.dataSource = context.coordinator
-        return controller
-    }
-
-    func updateUIViewController(_ controller: QLPreviewController, context: Context) {
-        context.coordinator.url = url
-        controller.reloadData()
-    }
-
-    final class Coordinator: NSObject, QLPreviewControllerDataSource {
-        var url: URL
-
-        init(url: URL) { self.url = url }
-
-        func numberOfPreviewItems(in controller: QLPreviewController) -> Int { 1 }
-
-        func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> QLPreviewItem {
-            url as NSURL
-        }
-    }
-}
 
 private struct TurnReviewSheet: View {
     let payloads: [EditDiffPayload]
@@ -2389,287 +1933,61 @@ private struct SystemTimelineBubble: View {
     }
 }
 
-private struct MarkdownText: View {
-    let text: String
+struct MarkdownText: View {
+    let document: PreparedMarkdown?
+    let fallbackText: String
     var highlightQuery: String? = nil
-    var rendersMarkdown = true
-    var onFileLink: ((URL) -> Void)? = nil
 
     var body: some View {
         Group {
-            if rendersMarkdown {
+            if let document {
                 VStack(alignment: .leading, spacing: 8) {
-                    ForEach(Self.blocks(from: text)) { block in
+                    ForEach(document.blocks) { block in
                         switch block.content {
                         case let .paragraph(value):
-                            Text(Self.parseInline(value, highlightQuery: highlightQuery))
-                                .frame(maxWidth: .infinity, alignment: .leading)
+                            Text(styled(value)).frame(maxWidth: .infinity, alignment: .leading)
                         case let .quote(value):
                             HStack(alignment: .top, spacing: 9) {
-                                Rectangle()
-                                    .fill(Color.secondary.opacity(0.45))
-                                    .frame(width: 3)
-                                Text(Self.parseInline(value, highlightQuery: highlightQuery))
-                                    .foregroundStyle(.secondary)
+                                Rectangle().fill(Color.secondary.opacity(0.45)).frame(width: 3)
+                                Text(styled(value)).foregroundStyle(.secondary)
                                     .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            .padding(.vertical, 2)
+                            }.padding(.vertical, 2)
                         case let .list(items):
                             VStack(alignment: .leading, spacing: 4) {
                                 ForEach(items) { item in
                                     HStack(alignment: .firstTextBaseline, spacing: 8) {
-                                        Text(item.marker)
-                                            .font(.subheadline.weight(.semibold))
-                                            .foregroundStyle(.secondary)
-                                        Text(Self.parseInline(item.text, highlightQuery: highlightQuery))
-                                            .frame(maxWidth: .infinity, alignment: .leading)
-                                    }
-                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                        Text(item.marker).font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+                                        Text(styled(item.text)).frame(maxWidth: .infinity, alignment: .leading)
+                                    }.frame(maxWidth: .infinity, alignment: .leading)
                                 }
                             }
                         case let .code(value, language):
                             MarkdownCodeBlock(source: value, language: language)
                         case let .table(rows):
                             MarkdownTableView(rows: rows, highlightQuery: highlightQuery)
+                        case let .image(destination, label):
+                            MarkdownImage(destination: destination, label: label)
                         }
                     }
                 }
             } else {
-                Text(Self.parsePlainText(text, highlightQuery: highlightQuery))
+                // Optimistic outgoing messages are literal text and appear immediately.
+                Text(highlightedAttributedString(fallbackText, query: highlightQuery))
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
         .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
         .fixedSize(horizontal: false, vertical: true)
-        .environment(\.openURL, OpenURLAction { url in
-            guard let onFileLink else { return .systemAction }
-            onFileLink(url)
-            return .handled
-        })
     }
 
-    private static func parseInline(_ text: String, highlightQuery: String?) -> AttributedString {
-        let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .full)
-        let parsed = (try? AttributedString(markdown: text, options: options)) ?? AttributedString(text)
-        return highlightedAttributedString(markdownInlineCodeBackground(parsed), query: highlightQuery)
-    }
-
-    private static func parsePlainText(_ text: String, highlightQuery: String?) -> AttributedString {
-        let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        var parsed = (try? AttributedString(markdown: text, options: options)) ?? AttributedString(text)
-        for run in parsed.runs {
-            parsed[run.range].inlinePresentationIntent = nil
-        }
-        return highlightedAttributedString(parsed, query: highlightQuery)
-    }
-
-    private static func blocks(from source: String) -> [MarkdownBlock] {
-        let lines = source
-            .replacingOccurrences(of: "\r\n", with: "\n")
-            .replacingOccurrences(of: "\r", with: "\n")
-            .split(separator: "\n", omittingEmptySubsequences: false)
-            .map(String.init)
-        var blocks: [MarkdownBlock] = []
-        var paragraph: [String] = []
-        var index = 0
-        var blockID = 0
-
-        func appendBlock(_ content: MarkdownBlock.Content) {
-            blocks.append(MarkdownBlock(id: blockID, content: content))
-            blockID += 1
-        }
-
-        func flushParagraph() {
-            let value = paragraph.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-            if !value.isEmpty {
-                appendBlock(.paragraph(value))
-            }
-            paragraph.removeAll(keepingCapacity: true)
-        }
-
-        while index < lines.count {
-            let line = lines[index]
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-
-            if let language = Self.fenceLanguage(in: trimmed) {
-                flushParagraph()
-                index += 1
-                var codeLines: [String] = []
-                while index < lines.count {
-                    let codeLine = lines[index]
-                    if codeLine.trimmingCharacters(in: .whitespaces).hasPrefix("```") {
-                        index += 1
-                        break
-                    }
-                    codeLines.append(codeLine)
-                    index += 1
-                }
-                appendBlock(.code(codeLines.joined(separator: "\n"), language))
-                continue
-            }
-
-            if index + 1 < lines.count,
-               trimmed.contains("|"),
-               Self.isTableSeparator(lines[index + 1]) {
-                flushParagraph()
-                var rows = [Self.tableRow(from: line)]
-                index += 2
-                while index < lines.count {
-                    let row = lines[index]
-                    let rowTrimmed = row.trimmingCharacters(in: .whitespaces)
-                    guard !rowTrimmed.isEmpty, rowTrimmed.contains("|") else { break }
-                    rows.append(Self.tableRow(from: row))
-                    index += 1
-                }
-                if rows.first?.count ?? 0 > 0 {
-                    appendBlock(.table(rows))
-                }
-                continue
-            }
-
-            if let item = Self.listItem(from: line, id: blockID) {
-                flushParagraph()
-                var items = [item]
-                index += 1
-                while index < lines.count {
-                    let nextLine = lines[index]
-                    guard let nextItem = Self.listItem(from: nextLine, id: blockID + items.count) else { break }
-                    items.append(nextItem)
-                    index += 1
-                }
-                appendBlock(.list(items))
-                continue
-            }
-
-            if Self.isQuoteLine(line) {
-                flushParagraph()
-                var quoteLines: [String] = []
-                while index < lines.count, Self.isQuoteLine(lines[index]) {
-                    quoteLines.append(Self.quoteText(from: lines[index]))
-                    index += 1
-                }
-                appendBlock(.quote(quoteLines.joined(separator: "\n")))
-                continue
-            }
-
-            if Self.isIndentedCode(line) {
-                flushParagraph()
-                var codeLines: [String] = []
-                while index < lines.count {
-                    let codeLine = lines[index]
-                    if codeLine.isEmpty {
-                        codeLines.append("")
-                        index += 1
-                    } else if Self.isIndentedCode(codeLine) {
-                        let indentation = codeLine.hasPrefix("\t") ? 1 : min(4, codeLine.count)
-                        codeLines.append(String(codeLine.dropFirst(indentation)))
-                        index += 1
-                    } else {
-                        break
-                    }
-                }
-                while codeLines.last?.isEmpty == true { codeLines.removeLast() }
-                appendBlock(.code(codeLines.joined(separator: "\n"), ""))
-                continue
-            }
-
-            if trimmed.isEmpty {
-                flushParagraph()
-            } else {
-                paragraph.append(line)
-            }
-            index += 1
-        }
-        flushParagraph()
-        return blocks
-    }
-
-    private static func fenceLanguage(in line: String) -> String? {
-        guard line.hasPrefix("```") else { return nil }
-        return String(line.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private static func isIndentedCode(_ line: String) -> Bool {
-        line.hasPrefix("    ") || line.hasPrefix("\t")
-    }
-
-    private static func isQuoteLine(_ line: String) -> Bool {
-        line.trimmingCharacters(in: .whitespaces).hasPrefix(">")
-    }
-
-    private static func quoteText(from line: String) -> String {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        return String(trimmed.dropFirst()).trimmingCharacters(in: .whitespaces)
-    }
-
-    private static func listItem(from line: String, id: Int) -> MarkdownListItem? {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { return nil }
-
-        if let first = trimmed.first, ["-", "*", "+"].contains(first) {
-            let remainder = trimmed.dropFirst()
-            guard remainder.first?.isWhitespace == true else { return nil }
-            let text = remainder.trimmingCharacters(in: .whitespaces)
-            guard !text.isEmpty else { return nil }
-            return MarkdownListItem(id: id, marker: "•", text: text)
-        }
-
-        var digits = ""
-        var index = trimmed.startIndex
-        while index < trimmed.endIndex, trimmed[index].isNumber {
-            digits.append(trimmed[index])
-            index = trimmed.index(after: index)
-        }
-        guard !digits.isEmpty, index < trimmed.endIndex else { return nil }
-        let separator = trimmed[index]
-        guard separator == "." || separator == ")" else { return nil }
-        index = trimmed.index(after: index)
-        guard index < trimmed.endIndex, trimmed[index].isWhitespace else { return nil }
-        let text = trimmed[index...].trimmingCharacters(in: .whitespaces)
-        guard !text.isEmpty else { return nil }
-        return MarkdownListItem(id: id, marker: "\(digits).", text: text)
-    }
-
-    private static func isTableSeparator(_ line: String) -> Bool {
-        let cells = tableRow(from: line)
-        guard cells.count >= 2 else { return false }
-        return cells.allSatisfy { cell in
-            let value = cell.trimmingCharacters(in: .whitespaces)
-            let withoutEdges = value.trimmingCharacters(in: CharacterSet(charactersIn: ":"))
-            return withoutEdges.count >= 3 && withoutEdges.allSatisfy { $0 == "-" }
-        }
-    }
-
-    private static func tableRow(from line: String) -> [String] {
-        var value = line.trimmingCharacters(in: .whitespaces)
-        if value.hasPrefix("|") { value.removeFirst() }
-        if value.hasSuffix("|") { value.removeLast() }
-
-        var cells: [String] = []
-        var current = ""
-        var escaped = false
-        for character in value {
-            if character == "|" && !escaped {
-                cells.append(current.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "\\|", with: "|"))
-                current = ""
-            } else {
-                current.append(character)
-            }
-            escaped = character == "\\" && !escaped
-        }
-        cells.append(current.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "\\|", with: "|"))
-        return cells
+    private func styled(_ text: AttributedString) -> AttributedString {
+        highlightedAttributedString(markdownInlineCodeBackground(text), query: highlightQuery)
     }
 }
 
 private struct AdaptiveConversationLayout: Layout {
     private let maximumWidth: CGFloat = 720
     private let maximumFraction: CGFloat = 0.82
-    private let fillsWidth: Bool
-
-    init(fillsWidth: Bool = false) {
-        self.fillsWidth = fillsWidth
-    }
 
     func sizeThatFits(
         proposal: ProposedViewSize,
@@ -2678,11 +1996,8 @@ private struct AdaptiveConversationLayout: Layout {
     ) -> CGSize {
         guard let subview = subviews.first else { return .zero }
         let availableWidth = proposal.width ?? maximumWidth
-        let widthLimit = fillsWidth
-            ? max(1, availableWidth)
-            : min(maximumWidth, max(1, availableWidth * maximumFraction))
-        let idealWidth = subview.sizeThatFits(.unspecified).width
-        let width = fillsWidth ? widthLimit : min(max(idealWidth, 1), widthLimit)
+        let widthLimit = min(maximumWidth, max(1, availableWidth * maximumFraction))
+        let width = min(max(subview.sizeThatFits(.unspecified).width, 1), widthLimit)
         let measured = subview.sizeThatFits(.init(width: width, height: proposal.height))
         return CGSize(width: width, height: measured.height)
     }
@@ -2702,24 +2017,6 @@ private struct AdaptiveConversationLayout: Layout {
     }
 }
 
-private struct MarkdownBlock: Identifiable {
-    enum Content {
-        case paragraph(String)
-        case quote(String)
-        case list([MarkdownListItem])
-        case code(String, String)
-        case table([[String]])
-    }
-
-    let id: Int
-    let content: Content
-}
-
-private struct MarkdownListItem: Identifiable {
-    let id: Int
-    let marker: String
-    let text: String
-}
 
 private struct MarkdownCodeBlock: View {
     let source: String
@@ -2776,7 +2073,7 @@ private struct MarkdownCodeBlock: View {
 }
 
 private struct MarkdownTableView: View {
-    let rows: [[String]]
+    let rows: [[AttributedString]]
     let highlightQuery: String?
 
     var body: some View {
@@ -2786,7 +2083,7 @@ private struct MarkdownTableView: View {
                 ForEach(Array(rows.enumerated()), id: \.offset) { rowIndex, row in
                     GridRow {
                         ForEach(0..<columnCount, id: \.self) { column in
-                            Text(inlineText(row.indices.contains(column) ? row[column] : ""))
+                            Text(highlightedAttributedString(markdownInlineCodeBackground(row.indices.contains(column) ? row[column] : AttributedString("")), query: highlightQuery))
                                 .font(.subheadline)
                                 .foregroundStyle(.primary)
                                 .multilineTextAlignment(.leading)
@@ -2814,20 +2111,11 @@ private struct MarkdownTableView: View {
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
-    private func inlineText(_ value: String) -> AttributedString {
-        let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .full)
-        let normalized = value.replacingOccurrences(
-            of: #"(?i)<br\s*/?>"#,
-            with: "\n",
-            options: .regularExpression
-        )
-        let parsed = (try? AttributedString(markdown: normalized, options: options)) ?? AttributedString(normalized)
-        return highlightedAttributedString(markdownInlineCodeBackground(parsed), query: highlightQuery)
-    }
 }
 
 private struct ExecutionStepRow: View {
     let message: ChatMessage
+    let showStatistics: Bool
     @State private var expanded = false
 
     var body: some View {
@@ -2943,13 +2231,13 @@ private struct ExecutionStepRow: View {
 
     private var detailText: String? {
         var values: [String] = []
-        if let duration = message.executionDuration, !duration.isEmpty { values.append(duration) }
+        if showStatistics, let duration = message.executionDuration, !duration.isEmpty { values.append(duration) }
         if message.executionStatus == "failed", let code = message.executionExitCode {
             values.append(cloudexLocalized("退出码 %lld", Int64(code)))
         }
         if message.executionStatus == "inProgress" { values.append(cloudexLocalized("运行中")) }
         let time = DateFormatting.messageTime(from: message.createdAt)
-        if !time.isEmpty { values.append(time) }
+        if showStatistics, !time.isEmpty { values.append(time) }
         return values.isEmpty ? nil : values.joined(separator: " · ")
     }
 
@@ -3250,6 +2538,192 @@ struct CodexDiffLineRow: View {
     }
 }
 
+private struct InputRequestSheet: View {
+    @EnvironmentObject private var viewModel: AppViewModel
+    @Environment(\.dismiss) private var dismiss
+    let input: InputRequest
+    @State private var values: [String: String] = [:]
+    @State private var rawContent = "{}"
+    @State private var error: String?
+    @State private var sending = false
+
+    private var isQuestion: Bool { input.method == "item/tool/requestUserInput" }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                if let message = input.message, !message.isEmpty {
+                    Section { Text(message) }
+                }
+                if let description = input.description, !description.isEmpty {
+                    Section { Text(description) }
+                }
+                if let challenge = input.challenge, !challenge.isEmpty {
+                    Section("验证请求") { Text(challenge).textSelection(.enabled) }
+                }
+                if let url = input.url, let destination = URL(string: url),
+                   destination.scheme == "https" || destination.scheme == "http" {
+                    Section { Link("打开验证页面", destination: destination) }
+                }
+                if isQuestion {
+                    ForEach(input.questions ?? []) { question in
+                        Section(question.header) {
+                            Text(question.question)
+                            if let options = question.options, !options.isEmpty {
+                                Picker("选择回答", selection: value(for: question.id)) {
+                                    Text("请选择").tag("")
+                                    ForEach(options, id: \.label) { option in
+                                        Text(option.label).tag(option.label)
+                                    }
+                                }
+                                ForEach(options, id: \.label) { option in
+                                    Text("\(option.label)：\(option.description)")
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
+                            if question.isSecret == true {
+                                SecureField("回答", text: value(for: question.id))
+                            } else {
+                                TextField(optionsLabel(question), text: value(for: question.id))
+                            }
+                        }
+                    }
+                } else if let fields = input.fields, !fields.isEmpty {
+                    ForEach(fields) { field in
+                        Section(field.title) {
+                            if let options = field.options, !options.isEmpty {
+                                Picker(field.title, selection: value(for: field.key)) {
+                                    Text("请选择").tag("")
+                                    ForEach(options, id: \.self) { option in
+                                        Text(option).tag(option)
+                                    }
+                                }
+                            } else if field.type == "boolean" {
+                                Toggle(field.title, isOn: Binding(
+                                    get: { values[field.key] == "true" },
+                                    set: { values[field.key] = $0 ? "true" : "false" }
+                                ))
+                            } else {
+                                TextField(field.type == "array" ? "JSON 数组" : field.title,
+                                          text: value(for: field.key))
+                                    .textInputAutocapitalization(.never)
+                            }
+                            if let description = field.description {
+                                Text(description).font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                } else if input.mode != "url" {
+                    Section("回应内容 (JSON)") {
+                        TextEditor(text: $rawContent).frame(minHeight: 120)
+                    }
+                }
+                if let error { Text(error).foregroundStyle(.red) }
+            }
+            .navigationTitle(input.title ?? (isQuestion ? "Codex 提问" : "补充信息"))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("稍后") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("提交") { Task { await submit(action: "accept") } }
+                        .disabled(sending)
+                }
+                if !isQuestion {
+                    ToolbarItem(placement: .bottomBar) {
+                        Button("拒绝") { Task { await submit(action: "decline") } }
+                            .disabled(sending)
+                    }
+                }
+            }
+        }
+    }
+
+    private func value(for key: String) -> Binding<String> {
+        Binding(get: { values[key] ?? "" }, set: { values[key] = $0 })
+    }
+
+    private func optionsLabel(_ question: InputQuestion) -> String {
+        question.options?.isEmpty == false ? "或输入其他回答" : "回答"
+    }
+
+    private func response(action: String) throws -> [String: Any] {
+        if isQuestion {
+            var answers: [String: Any] = [:]
+            for question in input.questions ?? [] {
+                let answer = (values[question.id] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !answer.isEmpty else { throw InputError.message("请回答：\(question.question)") }
+                answers[question.id] = ["answers": [answer]]
+            }
+            return ["answers": answers]
+        }
+        if action != "accept" { return ["action": action] }
+        var content: [String: Any] = [:]
+        if let fields = input.fields, !fields.isEmpty {
+            for field in fields {
+                let value = (values[field.key] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                if field.required && value.isEmpty && field.type != "boolean" {
+                    throw InputError.message("请填写：\(field.title)")
+                }
+                if field.type == "boolean" {
+                    if field.required || !value.isEmpty { content[field.key] = value == "true" }
+                    continue
+                }
+                if value.isEmpty { continue }
+                switch field.type {
+                case "integer":
+                    guard let number = Int(value) else { throw InputError.message("\(field.title) 需要整数") }
+                    content[field.key] = number
+                case "number":
+                    guard let number = Double(value) else { throw InputError.message("\(field.title) 需要数字") }
+                    content[field.key] = number
+                case "array":
+                    guard let data = value.data(using: .utf8),
+                          let array = try? JSONSerialization.jsonObject(with: data, options: .fragmentsAllowed) as? [Any] else {
+                        throw InputError.message("\(field.title) 需要 JSON 数组")
+                    }
+                    content[field.key] = array
+                case "object":
+                    guard let data = value.data(using: .utf8),
+                          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                        throw InputError.message("\(field.title) 需要 JSON 对象")
+                    }
+                    content[field.key] = object
+                default: content[field.key] = value
+                }
+            }
+        } else if input.mode != "url" {
+            guard let data = rawContent.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw InputError.message("回应内容需要 JSON 对象")
+            }
+            content = object
+        }
+        return ["action": "accept", "content": content]
+    }
+
+    private func submit(action: String) async {
+        do {
+            let payload = try response(action: action)
+            sending = true
+            try await viewModel.respondToInput(input, response: payload)
+            dismiss()
+        } catch {
+            self.error = error.localizedDescription
+        }
+        sending = false
+    }
+
+    private enum InputError: LocalizedError {
+        case message(String)
+        var errorDescription: String? {
+            if case let .message(text) = self { return text }
+            return nil
+        }
+    }
+}
+
 private struct ApprovalBubble: View {
     @EnvironmentObject private var viewModel: AppViewModel
     let approval: ApprovalRequest
@@ -3445,6 +2919,7 @@ private struct MessageJumpListView: View {
     var showsNavigationChrome = true
     @State private var pendingSelection: MessageJumpItem?
     @State private var selectedSubpage = ConversationSubpage.conversation
+    @State private var visitedSubpages: Set<ConversationSubpage> = [.conversation]
 
     var body: some View {
         VStack(spacing: 0) {
@@ -3468,21 +2943,25 @@ private struct MessageJumpListView: View {
                     .allowsHitTesting(selectedSubpage == .conversation)
                     .accessibilityHidden(selectedSubpage != .conversation)
 
-                WorkspaceFilesView(rootPath: workspaceRoot)
+                if visitedSubpages.contains(.files) { WorkspaceFilesView(rootPath: workspaceRoot)
                     .environmentObject(viewModel)
                     .id(workspaceRoot)
                     .opacity(selectedSubpage == .files ? 1 : 0)
                     .allowsHitTesting(selectedSubpage == .files)
                     .accessibilityHidden(selectedSubpage != .files)
+                }
 
-                ProjectReviewView(rootPath: workspaceRoot)
+                if visitedSubpages.contains(.review) { ProjectReviewView(rootPath: workspaceRoot)
                     .environmentObject(viewModel)
                     .id(workspaceRoot)
                     .opacity(selectedSubpage == .review ? 1 : 0)
                     .allowsHitTesting(selectedSubpage == .review)
                     .accessibilityHidden(selectedSubpage != .review)
+                }
             }
         }
+        .onChange(of: selectedSubpage) { _, page in visitedSubpages.insert(page) }
+        .onChange(of: workspaceRoot) { _, _ in visitedSubpages = [.conversation, selectedSubpage] }
         .modifier(DirectoryNavigationChromeModifier(
             isVisible: showsNavigationChrome,
             onExpand: onExpand
@@ -3603,14 +3082,6 @@ extension View {
         interactive: Bool = false,
         tint: Color? = nil
     ) -> some View {
-        if #available(iOS 26.0, *) {
-            let glass = Glass.regular.tint(tint).interactive(interactive)
-            self.glassEffect(glass, in: shape)
-        } else {
-            self
-                .background(.ultraThinMaterial, in: shape)
-                .background((tint ?? .clear), in: shape)
-                .overlay(shape.stroke(Color.white.opacity(0.3), lineWidth: 0.7))
-        }
+        modifier(CloudexGlassModifier(shape: shape, interactive: interactive, tint: tint))
     }
 }

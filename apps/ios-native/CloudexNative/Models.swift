@@ -193,6 +193,41 @@ struct HealthResponse: Codable {
     let codexConnected: Bool?
 }
 
+struct CollaborationModesResponse: Decodable {
+    struct Mode: Decodable { let name: String; let mode: String? }
+    let data: [Mode]
+}
+
+struct QueuedMessage: Codable, Identifiable, Equatable {
+    struct Body: Codable, Equatable {
+        struct File: Codable, Equatable { let path: String }
+        let message: String
+        var files: [File]?
+        var model: String?
+        var effort: String?
+        var collaborationMode: String?
+    }
+    let id: String
+    var body: Body
+    var status: String
+    var error: String?
+    var turnId: String?
+    var statusTitle: String {
+        switch status {
+        case "pending": return "排队中"
+        case "dispatching": return "正在发送"
+        case "running": return "执行中"
+        case "blocked": return "等待写入权"
+        case "unconfirmed": return "发送结果待确认"
+        case "failed": return "执行失败"
+        case "uploading": return "待上传"
+        default: return status
+        }
+    }
+}
+struct MessageQueueSnapshot: Codable { let paused: Bool; let items: [QueuedMessage]; var revision: Int? = nil }
+struct LocalQueueDraft: Codable { let id: String; let payload: Data }
+
 struct ConnectionHistoryItem: Codable, Identifiable, Equatable {
     let id: String
     let serverURL: String
@@ -266,6 +301,15 @@ struct ServerProfile: Codable, Identifiable, Equatable {
     }
 }
 
+struct ServerOverview: Identifiable, Equatable {
+    let id: String
+    let isOnline: Bool
+    let projectCount: Int
+    let activeThreads: [String]
+    let pendingApprovalCount: Int
+    let projects: [CloudexProject]
+}
+
 struct ProjectsResponse: Codable {
     let data: [CloudexProject]
     let total: Int?
@@ -277,6 +321,48 @@ struct ProjectSnapshot: Codable {
 
 struct ApprovalsResponse: Codable {
     let data: [ApprovalRequest]
+}
+
+struct InputsResponse: Codable {
+    let data: [InputRequest]
+}
+
+struct InputRequest: Codable, Identifiable, Equatable {
+    let id: String
+    let method: String
+    let threadId: String?
+    let serverName: String?
+    let mode: String?
+    let title: String?
+    let message: String?
+    let description: String?
+    let challenge: String?
+    let url: String?
+    let questions: [InputQuestion]?
+    let fields: [InputField]?
+}
+
+struct InputQuestion: Codable, Equatable, Identifiable {
+    let id: String
+    let header: String
+    let question: String
+    let options: [InputOption]?
+    let isSecret: Bool?
+}
+
+struct InputOption: Codable, Equatable {
+    let label: String
+    let description: String
+}
+
+struct InputField: Codable, Equatable, Identifiable {
+    let key: String
+    let title: String
+    let description: String?
+    let type: String
+    let options: [String]?
+    let required: Bool
+    var id: String { key }
 }
 
 struct ApprovalResolvedEvent: Codable {
@@ -558,6 +644,7 @@ struct TurnDetailResponse: Codable {
 }
 
 struct TurnItem: Codable, Equatable {
+    var attachments: [MessageAttachment]? = nil
     let type: String
     let id: String?
     let text: String?
@@ -781,6 +868,15 @@ struct ReasoningEffortOption: Codable, Equatable, Identifiable {
 
 struct CreateThreadResponse: Codable {
     let thread: CloudexThread
+    let turn: SubmittedTurn?
+}
+
+struct SendMessageResponse: Codable {
+    let turn: SubmittedTurn?
+}
+
+struct SubmittedTurn: Codable {
+    let id: String?
 }
 
 struct ForkThreadResponse: Codable {
@@ -847,10 +943,15 @@ struct RemoteFileEntry: Codable, Identifiable, Hashable {
 
     var id: String { path }
     var isDirectory: Bool { type == "directory" }
+    var isImage: Bool {
+        ["jpg", "jpeg", "png", "gif", "heic", "heif", "webp"].contains(
+            (path as NSString).pathExtension.lowercased()
+        )
+    }
 }
 
-struct MessageAttachment: Identifiable, Equatable {
-    enum Kind: String, Equatable {
+struct MessageAttachment: Identifiable, Equatable, Codable {
+    enum Kind: String, Equatable, Codable {
         case image
         case file
     }
@@ -859,12 +960,62 @@ struct MessageAttachment: Identifiable, Equatable {
     let path: String?
     let kind: Kind
 
-    var id: String { "\(kind.rawValue):\(path ?? name)" }
+    var id: String { "\(kind.rawValue):\(path?.hasPrefix("data:") == true ? name : (path ?? name))" }
     var systemImage: String { kind == .image ? "photo" : "doc" }
 }
 
-struct ChatMessage: Identifiable, Equatable {
-    enum Role: String {
+struct ChatDetailPreferences: Codable, Equatable {
+    var process = true
+    var thinking = false
+    var tools = false
+    var progress = false
+    var statistics = false
+
+    static let storageKey = "cloudex.chatDetailPreferences"
+    static func load(from defaults: UserDefaults = .standard) -> Self {
+        guard let data = defaults.data(forKey: storageKey),
+              let value = try? JSONDecoder().decode(Self.self, from: data) else { return Self() }
+        return value
+    }
+
+    func includes(_ message: ChatMessage) -> Bool {
+        // Artifacts and failures remain accessible even in the quietest display.
+        if !message.attachments.isEmpty || mustKeep(message) { return true }
+        switch message.role {
+        case .execution: return message.executionKind == "thinking" ? thinking : tools
+        case .assistant: return message.phase != "commentary" || progress
+        case .taskSummary: return statistics
+        default: return true
+        }
+    }
+
+    func mustKeep(_ message: ChatMessage) -> Bool {
+        // Conservatively retain link-bearing commentary, including unloaded Markdown.
+        message.role == .error || message.executionKind == "approval"
+            || ["failed", "declined"].contains(message.executionStatus ?? "")
+            || (message.executionExitCode ?? 0) != 0
+            || (message.role == .assistant && (message.text.contains("](") || message.text.contains("]:")))
+    }
+
+    func visibleMessages(_ messages: [ChatMessage]) -> [ChatMessage] {
+        messages.flatMap { message -> [ChatMessage] in
+            guard message.role == .processSummary, !process else {
+                return includes(message) ? [message] : []
+            }
+            // Keep the original row identity for artifacts; never change cached history.
+            var rows: [ChatMessage] = []
+            if !message.attachments.isEmpty {
+                rows.append(ChatMessage(id: message.id, role: .assistant, text: "",
+                    sourceTurnID: message.sourceTurnID, attachments: message.attachments))
+            }
+            rows += (message.processItems ?? []).filter { mustKeep($0) }
+            return rows
+        }
+    }
+}
+
+struct ChatMessage: Identifiable, Equatable, Codable {
+    enum Role: String, Codable {
         case user
         case assistant
         case error
@@ -888,9 +1039,18 @@ struct ChatMessage: Identifiable, Equatable {
     var isCompressed: Bool = false
     var threadID: String? = nil
     var sourceTurnID: String? = nil
+    var phase: String? = nil
     var processItemCount: Int? = nil
     var processDetailsLoaded: Bool = true
     var attachments: [MessageAttachment] = []
+    var markdown: PreparedMarkdown? = nil
+
+    // Persist content, never the in-memory Markdown rendering cache.
+    private enum CodingKeys: String, CodingKey {
+        case id, role, text, executionStatus, executionDuration, executionExitCode, executionKind
+        case editDiff, processItems, createdAt, isCompressed, threadID, sourceTurnID
+        case phase, processItemCount, processDetailsLoaded, attachments
+    }
 }
 
 struct SSEEvent {
