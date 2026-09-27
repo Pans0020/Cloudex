@@ -21,6 +21,9 @@ import { isPathInside, normalizeAllowedPath } from "./file-roots.js";
 import { listModelsViaStdio } from "./app-server-stdio.js";
 import { QwenProvider } from "./qwen-provider.js";
 import { ClaudeProvider } from "./claude-provider.js";
+import { mediaAttachments } from "./media-attachments.js";
+import { collaborationModeParams } from "./collaboration-mode.js";
+import { MessageQueue } from "./message-queue.js";
 
 const client = new CodexClient();
 const qwenProvider = new QwenProvider();
@@ -38,6 +41,12 @@ const EVENT_HISTORY_LIMIT = 250;
 const APPROVAL_HISTORY_FILE = path.join(config.stateDir, "approval-history.json");
 const UPLOAD_ROOT = path.join(config.stateDir, "uploads");
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const messageQueue = new MessageQueue({
+  file: path.join(config.stateDir, "message-queue.json"),
+  send: sendThreadMessage,
+  inspect: async threadId => ({ ...await readThreadDetail(threadId), busy: ownedRunningThreads.has(threadId) }),
+  changed: (threadId, queue) => broadcastGlobal("queue/changed", { threadId, ...queue }),
+});
 let approvalHistory = null;
 let approvalHistoryLoadPromise = null;
 let approvalHistoryWrite = Promise.resolve();
@@ -303,8 +312,27 @@ function fileContentType(filePath) {
   })[extension] || "application/octet-stream";
 }
 
-async function sendFilePreview(res, candidate) {
+async function sendFilePreview(res, candidate, previewRoot = null) {
   const filePath = await normalizeWorkspacePath(candidate);
+  const realFile = await fs.realpath(filePath);
+  const roots = [...config.fileRoots, UPLOAD_ROOT, ...(latestProjectSnapshot?.projects || []).map(project => project.cwd).filter(Boolean)];
+  const withinRealRoots = async values => {
+    for (const root of values) {
+      try { if (isPathInside(await fs.realpath(root), realFile)) return true; } catch {}
+    }
+    return false;
+  };
+  if (!await withinRealRoots(roots) && !await withinRealRoots(projectRootsFromThreads(await listAllThreads(false)))) {
+    throw Object.assign(new Error("File target is outside allowed file roots"), { status: 403 });
+  }
+  if (previewRoot) {
+    const root = await fs.realpath(await normalizeWorkspacePath(previewRoot));
+    if (!isPathInside(root, realFile)) {
+      const error = new Error("HTML resources must remain inside the document directory");
+      error.status = 403;
+      throw error;
+    }
+  }
   const metadata = await fs.stat(filePath);
   if (!metadata.isFile()) {
     const error = new Error("Path is not a file");
@@ -437,11 +465,19 @@ function remember(message) {
 }
 
 function publish(message) {
+  if (message.params?.item) {
+    const attachments = mediaAttachments(message.params.item);
+    if (attachments.length) message = { ...message, params: { ...message.params, item: { ...message.params.item,
+      id: `${message.params.item.id}-images`, type: "imageArtifact", attachments } } };
+  }
   const threadId = getThreadId(message);
   const record = remember(message);
   if (threadId && ["turn/completed", "turn/failed", "turn/interrupted", "turn/cancelled", "turn/canceled"].includes(message.method)) {
     ownedRunningThreads.delete(threadId);
     scheduleThreadUnsubscribe(threadId);
+    const turnId = message.params?.turn?.id || message.params?.turnId;
+    const status = message.params?.turn?.status || message.method.split("/")[1];
+    void messageQueue.finish(threadId, turnId, status).then(() => messageQueue.kick(threadId)).catch(error => console.warn("Queue:", error.message));
   }
   // Keep the global bus lossless so other local clients (including a CLI
   // bridge) can observe the same live tool progress as thread subscribers.
@@ -874,7 +910,12 @@ async function readThreadDetail(threadId, { limit = Number.MAX_SAFE_INTEGER, bef
         const thread = result.thread || result;
         return { thread, turns: thread.turns || [] };
       });
-  const turns = await mergeApprovalHistory(threadId, fullDetail.turns || []);
+  const turns = await mergeApprovalHistory(threadId, (fullDetail.turns || []).map(turn => ({
+    ...turn, items: (turn.items || []).map(item => {
+      const attachments = mediaAttachments(item);
+      return attachments.length ? { ...item, id: `${item.id}-images`, type: "imageArtifact", attachments } : item;
+    }),
+  })));
   const aroundIndex = around ? turns.findIndex((turn) => turn.id === around) : -1;
   const beforeIndex = before ? turns.findIndex((turn) => turn.id === before) : turns.length;
   let end = beforeIndex >= 0 ? beforeIndex : turns.length;
@@ -985,7 +1026,7 @@ function compactTurn(turn) {
   const finalAgentIndex = items.findLastIndex((item) => item.type === "agentMessage" && item.phase === "final_answer") >= 0
     ? items.findLastIndex((item) => item.type === "agentMessage" && item.phase === "final_answer")
     : items.findLastIndex((item) => item.type === "agentMessage");
-  const visibleItems = items.filter((item, index) => item.type === "userMessage" || index === finalAgentIndex);
+  const visibleItems = items.filter((item, index) => item.type === "userMessage" || index === finalAgentIndex || item.attachments?.length);
   const processItemCount = Math.max(0, items.length - visibleItems.length);
   return {
     ...turn,
@@ -1146,6 +1187,7 @@ async function syncThreads(reason = "manual") {
   }
   syncInFlight = true;
   try {
+    void messageQueue.tick().catch(error => console.warn("Queue:", error.message));
     const revision = archiveRevision;
     const threads = await listAllThreads(false);
     if (revision !== archiveRevision) {
@@ -1209,6 +1251,12 @@ async function inputFrom(bodyData) {
   return input;
 }
 
+async function collaborationFor(data) {
+  if (!data.collaborationMode) return {};
+  const modes = await client.request("collaborationMode/list", {});
+  return collaborationModeParams(data, modes.data || []);
+}
+
 function isUnfinishedTurn(turn) {
   if (!turn?.id) return false;
   const status = String(turn.status || "").toLowerCase();
@@ -1249,6 +1297,86 @@ function isStaleTurnError(error) {
     || message.includes("expected turn");
 }
 
+async function sendThreadMessage(threadId, data) {
+  if (data.collaborationMode && (await isQwenThread(threadId) || await isClaudeThread(threadId) || usesWindowsCliFallback())) {
+    throw Object.assign(new Error("This provider does not support Codex collaboration modes"), { status: 422 });
+  }
+  let thread = null;
+  let turn = null;
+  const qwenThread = await isQwenThread(threadId);
+  if (qwenThread) {
+    const input = await inputFrom(data);
+    const prompt = input.map((part) => part.type === "text" ? part.text : "").join("\n").trim();
+    const result = await qwenProvider.sendMessage(threadId, {
+      prompt,
+      files: input.filter((part) => part.type === "localImage"),
+      model: data.model || null,
+      onEvent: (message) => publish(message),
+    });
+    thread = result.thread;
+    turn = result.turn;
+  } else if (await isClaudeThread(threadId)) {
+    const input = await inputFrom(data);
+    const prompt = input.map((part) => part.type === "text" ? part.text : "").join("\n").trim();
+    const result = await claudeProvider.sendMessage(threadId, {
+      prompt,
+      files: input.filter((part) => part.type === "localImage"),
+      model: data.model || null,
+      effort: data.effort || null,
+      permissionMode: data.claudePermissionMode || "manual",
+      onEvent: (message) => publish(message),
+    });
+    thread = result.thread;
+    turn = result.turn;
+  } else if (usesWindowsCliFallback()) {
+    const input = await inputFrom(data);
+    const prompt = input.map((part) => part.type === "text" ? part.text : "").join("\n").trim();
+    const images = input.filter((part) => part.type === "localImage");
+    const resumed = await resumeWindowsThread({
+      threadId,
+      prompt,
+      files: images,
+      model: data.model || null,
+      effort: data.effort || null,
+      sandbox: data.sandbox || "workspace-write",
+      approvalPolicy: data.approvalPolicy || "on-request",
+      approvalsReviewer: data.approvalsReviewer || "user",
+      onAppMessage: (message) => publish(message),
+    });
+    turn = { id: resumed.turnId, status: "inProgress" };
+  } else {
+    const collaboration = await collaborationFor(data);
+    if (ownedRunningThreads.has(threadId)) {
+      const error = new Error("此会话已有正在执行的 Cloudex 任务，请等待完成或使用引导对话。");
+      error.status = 409;
+      throw error;
+    }
+    ownedRunningThreads.add(threadId);
+    try {
+      const resume = await client.subscribeThread(threadId);
+      const turnResult = await client.request("turn/start", {
+        threadId,
+        input: await inputFrom(data),
+        clientUserMessageId: data.clientUserMessageId || null,
+        ...collaboration,
+        model: data.model || null,
+        effort: data.effort || null,
+        approvalPolicy: data.approvalPolicy || "on-request",
+        approvalsReviewer: data.approvalsReviewer || "user",
+        sandboxPolicy: sandboxPolicyFor(data.sandbox || "workspace-write"),
+      });
+      thread = resume?.thread || resume || null;
+      turn = turnResult.turn || turnResult;
+    } catch (error) {
+      ownedRunningThreads.delete(threadId);
+      throw error;
+    } finally {
+      scheduleThreadUnsubscribe(threadId, 2000);
+    }
+  }
+  return { thread, turn };
+}
+
 export async function handle(req, res, url) {
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
@@ -1283,10 +1411,29 @@ export async function handle(req, res, url) {
       host: config.host,
       port: config.port,
       fileRoots: config.fileRoots,
+      messageQueue: true,
     });
   }
   if (req.method === "GET" && url.pathname === "/api/models") {
     return json(res, 200, await listModels());
+  }
+  const queueMatch = url.pathname.match(/^\/api\/threads\/([^/]+)\/queue$/);
+  if (queueMatch) {
+    const threadId = decodeURIComponent(queueMatch[1]);
+    if (req.method === "GET") return json(res, 200, await messageQueue.list(threadId));
+    if (req.method === "POST") {
+      const data = await body(req);
+      if (data.action) return json(res, 200, await messageQueue.update(threadId, data));
+      await readThreadDetail(threadId, { limit: 1 });
+      await inputFrom(data);
+      if (data.collaborationMode) await collaborationFor(data);
+      return json(res, 202, await messageQueue.add(threadId, data));
+    }
+  }
+  if (req.method === "GET" && url.pathname === "/api/collaboration-modes") {
+    if (!hasCodexProvider() || isWindowsPlatform()) return json(res, 200, { data: [], supported: false });
+    const result = await client.request("collaborationMode/list", {});
+    return json(res, 200, { ...result, supported: true });
   }
   if (req.method === "GET" && url.pathname === "/api/projects") {
     const threads = await listAllThreads(false);
@@ -1330,7 +1477,7 @@ export async function handle(req, res, url) {
     return json(res, 200, await projectReview(url.searchParams.get("path")));
   }
   if (req.method === "GET" && url.pathname === "/api/file") {
-    return sendFilePreview(res, url.searchParams.get("path"));
+    return sendFilePreview(res, url.searchParams.get("path"), url.searchParams.get("previewRoot"));
   }
   if (req.method === "GET" && url.pathname === "/api/approvals") {
     return json(res, 200, { data: [...pendingApprovals.values()].map(({ approval }) => approval) });
@@ -1477,6 +1624,10 @@ export async function handle(req, res, url) {
 
   if (req.method === "POST" && url.pathname === "/api/threads") {
     const data = await body(req);
+    if (data.collaborationMode && (usesQwenProvider() || usesClaudeProvider() || ["qwen", "claude"].includes(data.provider) || usesWindowsCliFallback())) {
+      throw Object.assign(new Error("This provider does not support Codex collaboration modes"), { status: 422 });
+    }
+    const collaboration = data.collaborationMode ? await collaborationFor(data) : {};
     const noProject = data.noProject === true || data.cwd === NO_PROJECT_CWD;
     const cwd = noProject ? null : await normalizeThreadCwd(data.cwd || config.defaultCwd);
     let thread = null;
@@ -1537,6 +1688,7 @@ export async function handle(req, res, url) {
           const turnResult = await client.request("turn/start", {
             threadId: thread.id,
             input: await inputFrom({ message: data.prompt, files: data.files }),
+            ...collaboration,
             model: data.model || null,
             effort: data.effort || null,
             approvalPolicy: data.approvalPolicy || "on-request",
@@ -1562,75 +1714,11 @@ export async function handle(req, res, url) {
     const action = threadMatch[2];
     if (req.method === "POST" && action === "message") {
       const data = await body(req);
-      let thread = null;
-      let turn = null;
-      const qwenThread = await isQwenThread(threadId);
-      if (qwenThread) {
-        const input = await inputFrom(data);
-        const prompt = input.map((part) => part.type === "text" ? part.text : "").join("\n").trim();
-        const result = await qwenProvider.sendMessage(threadId, {
-          prompt,
-          files: input.filter((part) => part.type === "localImage"),
-          model: data.model || null,
-          onEvent: (message) => publish(message),
-        });
-        thread = result.thread;
-        turn = result.turn;
-      } else if (await isClaudeThread(threadId)) {
-        const input = await inputFrom(data);
-        const prompt = input.map((part) => part.type === "text" ? part.text : "").join("\n").trim();
-        const result = await claudeProvider.sendMessage(threadId, {
-          prompt,
-          files: input.filter((part) => part.type === "localImage"),
-          model: data.model || null,
-          effort: data.effort || null,
-          permissionMode: data.claudePermissionMode || "manual",
-          onEvent: (message) => publish(message),
-        });
-        thread = result.thread;
-        turn = result.turn;
-      } else if (usesWindowsCliFallback()) {
-        const input = await inputFrom(data);
-        const prompt = input.map((part) => part.type === "text" ? part.text : "").join("\n").trim();
-        const images = input.filter((part) => part.type === "localImage");
-        await resumeWindowsThread({
-          threadId,
-          prompt,
-          files: images,
-          model: data.model || null,
-          effort: data.effort || null,
-          sandbox: data.sandbox || "workspace-write",
-          approvalPolicy: data.approvalPolicy || "on-request",
-          approvalsReviewer: data.approvalsReviewer || "user",
-          onAppMessage: (message) => publish(message),
-        });
-      } else {
-        if (ownedRunningThreads.has(threadId)) {
-          const error = new Error("此会话已有正在执行的 Cloudex 任务，请等待完成或使用引导对话。");
-          error.status = 409;
-          throw error;
-        }
-        ownedRunningThreads.add(threadId);
-        try {
-          const resume = await client.subscribeThread(threadId);
-          const turnResult = await client.request("turn/start", {
-            threadId,
-            input: await inputFrom(data),
-            model: data.model || null,
-            effort: data.effort || null,
-            approvalPolicy: data.approvalPolicy || "on-request",
-            approvalsReviewer: data.approvalsReviewer || "user",
-            sandboxPolicy: sandboxPolicyFor(data.sandbox || "workspace-write"),
-          });
-          thread = resume?.thread || resume || null;
-          turn = turnResult.turn || turnResult;
-        } catch (error) {
-          ownedRunningThreads.delete(threadId);
-          throw error;
-        } finally {
-          scheduleThreadUnsubscribe(threadId, 2000);
-        }
+      const queue = await messageQueue.list(threadId);
+      if (queue.items.some(item => ["pending", "running", "dispatching", "blocked", "unconfirmed"].includes(item.status))) {
+        throw Object.assign(new Error("此会话已有排队消息，请加入队列或先处理现有队列"), { status: 409 });
       }
+      const { thread, turn } = await sendThreadMessage(threadId, data);
       scheduleThreadSync("message-sent", 100);
       return json(res, 202, { thread, turn });
     }
@@ -1710,6 +1798,7 @@ export async function handle(req, res, url) {
         throw error;
       }
       const forkParams = { threadId };
+      const collaboration = await collaborationFor(data);
       if (data.position === "before") forkParams.beforeTurnId = turnId;
       else forkParams.lastTurnId = turnId;
       const forkResult = await client.request("thread/fork", forkParams);
@@ -1724,6 +1813,7 @@ export async function handle(req, res, url) {
           const turnResult = await client.request("turn/start", {
             threadId: forkedThread.id,
             input: await inputFrom({ message: editedMessage, files: data.files }),
+            ...collaboration,
             model: data.model || null,
             effort: data.effort || null,
             approvalPolicy: data.approvalPolicy || "on-request",
@@ -1742,6 +1832,7 @@ export async function handle(req, res, url) {
       return json(res, 201, { thread: forkedThread, turn });
     }
     if (req.method === "POST" && action === "stop") {
+      await messageQueue.update(threadId, { action: "pause" });
       if (await isQwenThread(threadId)) {
         const stopped = await qwenProvider.stopThread(threadId);
         if (!stopped) {
@@ -1785,6 +1876,7 @@ export async function handle(req, res, url) {
       return json(res, 200, { stopped: true, threadId, turnId, source, result });
     }
     if (req.method === "POST" && action === "archive") {
+      await messageQueue.update(threadId, { action: "pause" });
       if (await isQwenThread(threadId)) {
         const result = await qwenProvider.archiveThread(threadId);
         archiveRevision += 1;

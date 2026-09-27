@@ -169,3 +169,19 @@ test('new rollout items retain images, MCP calls and file changes', async () => 
     await fs.rm(dir, { recursive: true, force: true });
   }
 });
+
+test('generated and tool images survive history normalization in the original turn', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cloudex-artifacts-unit-'));
+  const file = path.join(dir, 'rollout-2026-09-27-01a0d7e2-1b3c-7ea1-9c38-3913a8e36e26.jsonl');
+  try {
+    await fs.writeFile(file, [
+      { type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn' } },
+      { type: 'event_msg', payload: { type: 'item_completed', turn_id: 'turn', item: { type: 'ImageGeneration', id: 'gen', saved_path: '/output/picture.png', result: 'opaque' } } },
+      { type: 'event_msg', payload: { type: 'item_completed', turn_id: 'turn', item: { type: 'McpToolCall', id: 'mcp', server: 'tool', tool: 'image', result: { content: [{ type: 'image', mimeType: 'image/png', data: 'aGVsbG8=' }] } } } },
+      { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn' } },
+    ].map(JSON.stringify).join('\n'));
+    const result = await readCliThread(file);
+    assert.equal(result.turns.length, 1);
+    assert.deepEqual(result.turns[0].items.flatMap(item => item.attachments || []).map(item => item.path), ['/output/picture.png', 'data:image/png;base64,aGVsbG8=']);
+  } finally { await fs.rm(dir, { recursive: true, force: true }); }
+});

@@ -239,6 +239,7 @@ export class CodexClient extends EventEmitter {
         await this.connectProxy();
         await this.request("initialize", {
           clientInfo: { name: "cloudex-codex-control", title: "Cloudex local controller", version: "0.2.0" },
+          capabilities: { experimentalApi: true },
         });
         this.notify("initialized", {});
         this.emit("ready");

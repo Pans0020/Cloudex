@@ -1,6 +1,79 @@
 import XCTest
 
 final class CloudexUITests: XCTestCase {
+    func testQueuedMessagesStaySeparateAfterRelaunch() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--ui-fixture", "--ui-queue-fixture", "-AppleLanguages", "(zh-Hans)"]
+        app.launch()
+        XCTAssertTrue(app.buttons["展开CV"].waitForExistence(timeout: 10))
+        app.buttons["展开CV"].tap()
+        app.buttons.containing(.staticText, identifier: "布局回归 CV").firstMatch.tap()
+        let input = app.textViews["message-input"]
+        XCTAssertTrue(input.waitForExistence(timeout: 10))
+        let token = String(UUID().uuidString.prefix(6))
+        for index in 1...3 {
+            input.tap(); input.typeText("queue-\(token)-\(index)")
+            app.buttons["等待发送"].tap()
+            XCTAssertTrue(app.staticTexts["queue-\(token)-\(index)"].waitForExistence(timeout: 5))
+        }
+        snapshot("three-independent-queued-messages")
+        app.terminate(); app.launch()
+        XCTAssertTrue(app.buttons["展开CV"].waitForExistence(timeout: 10))
+        app.buttons["展开CV"].tap()
+        app.buttons.containing(.staticText, identifier: "布局回归 CV").firstMatch.tap()
+        XCTAssertTrue(app.staticTexts["queue-\(token)-3"].waitForExistence(timeout: 10))
+        XCTAssertFalse(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@ AND label CONTAINS %@", "queue-\(token)-1", "queue-\(token)-2")).firstMatch.exists)
+        snapshot("queue-restored-after-relaunch")
+    }
+    func testFilePreviewAndPlanMode() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--ui-fixture", "--ui-preview-fixture", "-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN"]
+        app.launch()
+        XCTAssertTrue(app.buttons["展开CV"].waitForExistence(timeout: 10))
+        app.buttons["展开CV"].tap()
+        app.buttons.containing(.staticText, identifier: "布局回归 CV").firstMatch.tap()
+        let link = app.links["查看实际界面截图"]
+        XCTAssertTrue(link.waitForExistence(timeout: 10))
+        link.tap()
+        XCTAssertTrue(app.staticTexts["这是内置 Markdown 文档。"].waitForExistence(timeout: 10))
+        snapshot("rendered-markdown-preview")
+        app.buttons["预览图片"].tap()
+        XCTAssertTrue(app.navigationBars["picture.png"].waitForExistence(timeout: 10))
+        snapshot("image-preview")
+        app.buttons["完成"].firstMatch.tap()
+        app.links["打开 HTML"].tap()
+        XCTAssertTrue(app.webViews.staticTexts["HTML 预览成功"].waitForExistence(timeout: 10))
+        app.switches["交互脚本"].tap()
+        XCTAssertTrue(app.webViews.buttons["测试交互"].waitForExistence(timeout: 10))
+        app.webViews.buttons["测试交互"].tap()
+        XCTAssertTrue(app.webViews.staticTexts["交互成功"].waitForExistence(timeout: 5))
+        snapshot("html-preview")
+        app.buttons["完成"].firstMatch.tap()
+        app.links["播放 GIF"].tap()
+        XCTAssertTrue(app.buttons["暂停"].waitForExistence(timeout: 10))
+        app.buttons["暂停"].tap()
+        XCTAssertTrue(app.buttons["播放"].exists)
+        snapshot("gif-preview")
+        app.buttons["完成"].firstMatch.tap()
+        app.links["打开 PPT"].tap()
+        XCTAssertTrue(app.navigationBars["slides.pptx"].waitForExistence(timeout: 10))
+        let slide = app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "Cloudex PPT Preview")).firstMatch
+        XCTAssertTrue(slide.waitForExistence(timeout: 15))
+        snapshot("ppt-preview")
+        app.buttons["完成"].firstMatch.tap()
+        app.buttons["完成"].firstMatch.tap()
+        let model = app.buttons["切换模型和推理强度"]
+        XCTAssertTrue(model.exists); model.tap()
+        let plan = app.buttons["计划模式"]
+        XCTAssertTrue(plan.waitForExistence(timeout: 5)); plan.tap()
+        XCTAssertTrue(app.buttons["按此计划执行"].waitForExistence(timeout: 5))
+        snapshot("plan-mode-menu")
+        app.buttons["按此计划执行"].tap()
+        XCTAssertTrue((app.textViews["message-input"].value as? String)?.contains("请按刚才确认的计划开始执行") == true)
+        XCTAssertFalse(app.buttons["按此计划执行"].exists)
+    }
     func testGlassAppearanceInLightAndDark() {
         continueAfterFailure = false
         for dark in [false, true] {

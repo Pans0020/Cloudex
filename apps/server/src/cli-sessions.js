@@ -1,6 +1,7 @@
 import os from "node:os";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { mediaAttachments } from "./media-attachments.js";
 import crypto from "node:crypto";
 import { config } from "./config.js";
 
@@ -328,7 +329,7 @@ function itemPlainText(item) {
 }
 
 function addUniqueItem(turn, item) {
-  if (!item?.text && item.type !== "userMessage" && item.type !== "commandExecution") return;
+  if (!item?.text && !item?.attachments?.length && item.type !== "userMessage" && item.type !== "commandExecution") return;
   if (turn.items.some((existing) => existing.id === item.id)) return;
   const text = itemPlainText(item).trim();
   const duplicate = text && item.type !== "commandExecution"
@@ -460,6 +461,11 @@ function parseSessionLine(state, record) {
   }
 
   if (record.type === "response_item") {
+    const attachments = mediaAttachments(payload);
+    if (attachments.length) {
+      const turn = getOrCreateTurn(state, state.currentTurnId || payload.internal_chat_message_metadata_passthrough?.turn_id, timestamp);
+      addUniqueItem(turn, { type: "imageArtifact", id: `${payload.call_id || payload.id || turn.id}-images`, attachments, createdAt });
+    }
     const metadataTurnId = payload.internal_chat_message_metadata_passthrough?.turn_id;
     // Model response metadata may carry an internal ID, not an app-server
     // turn ID. Keep those items in the task established by lifecycle events.
@@ -599,6 +605,11 @@ function parseSessionLine(state, record) {
   state.name = threadNameFromPayload(payload) || state.name;
   if (payload.type === "item_completed") {
     const completed = payload.item || {};
+    const attachments = mediaAttachments(completed);
+    if (attachments.length) {
+      const turn = getOrCreateTurn(state, payload.turn_id, timestamp);
+      addUniqueItem(turn, { type: "imageArtifact", id: `${completed.id || turn.id}-images`, attachments, createdAt });
+    }
     if (!["McpToolCall", "FileChange"].includes(completed.type)) return;
     const turn = getOrCreateTurn(state, payload.turn_id, timestamp);
     if (completed.type === "McpToolCall") {

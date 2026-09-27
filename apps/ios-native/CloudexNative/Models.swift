@@ -193,6 +193,41 @@ struct HealthResponse: Codable {
     let codexConnected: Bool?
 }
 
+struct CollaborationModesResponse: Decodable {
+    struct Mode: Decodable { let name: String; let mode: String? }
+    let data: [Mode]
+}
+
+struct QueuedMessage: Codable, Identifiable, Equatable {
+    struct Body: Codable, Equatable {
+        struct File: Codable, Equatable { let path: String }
+        let message: String
+        var files: [File]?
+        var model: String?
+        var effort: String?
+        var collaborationMode: String?
+    }
+    let id: String
+    var body: Body
+    var status: String
+    var error: String?
+    var turnId: String?
+    var statusTitle: String {
+        switch status {
+        case "pending": return "排队中"
+        case "dispatching": return "正在发送"
+        case "running": return "执行中"
+        case "blocked": return "等待写入权"
+        case "unconfirmed": return "发送结果待确认"
+        case "failed": return "执行失败"
+        case "uploading": return "待上传"
+        default: return status
+        }
+    }
+}
+struct MessageQueueSnapshot: Codable { let paused: Bool; let items: [QueuedMessage]; var revision: Int? = nil }
+struct LocalQueueDraft: Codable { let id: String; let payload: Data }
+
 struct ConnectionHistoryItem: Codable, Identifiable, Equatable {
     let id: String
     let serverURL: String
@@ -609,6 +644,7 @@ struct TurnDetailResponse: Codable {
 }
 
 struct TurnItem: Codable, Equatable {
+    var attachments: [MessageAttachment]? = nil
     let type: String
     let id: String?
     let text: String?

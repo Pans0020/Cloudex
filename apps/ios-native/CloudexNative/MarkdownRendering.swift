@@ -10,6 +10,7 @@ final class PreparedMarkdown: Sendable, Equatable {
             case list([Item])
             case code(String, String)
             case table([[AttributedString]])
+            case image(String, String)
         }
         let id: Int
         let content: Content
@@ -51,8 +52,29 @@ enum MarkdownParser {
         if !markdown {
             return PreparedMarkdown(blocks: [.init(id: 0, content: .paragraph(AttributedString(text)))])
         }
-        let prepared = try blocks(from: text).map { block -> PreparedMarkdown.Block in
+        var nextID = 0
+        let prepared = try blocks(from: text).flatMap { block -> [PreparedMarkdown.Block] in
             try Task.checkCancellation()
+            if case let .paragraph(value) = block.content {
+                let pattern = #"!\[([^\]]*)\]\(<?([^\s<>]+|<[^>]+>)>?(?:\s+\"[^\"]*\")?\)"#
+                let regex = try NSRegularExpression(pattern: pattern)
+                let ns = value as NSString
+                let matches = regex.matches(in: value, range: NSRange(location: 0, length: ns.length))
+                if !matches.isEmpty {
+                    var result: [PreparedMarkdown.Block] = []
+                    var start = 0
+                    for match in matches {
+                        if match.range.location > start {
+                            result.append(.init(id: nextID, content: .paragraph(inline(ns.substring(with: NSRange(location: start, length: match.range.location - start)))))); nextID += 1
+                        }
+                        let destination = ns.substring(with: match.range(at: 2)).trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
+                        result.append(.init(id: nextID, content: .image(destination, ns.substring(with: match.range(at: 1))))); nextID += 1
+                        start = NSMaxRange(match.range)
+                    }
+                    if start < ns.length { result.append(.init(id: nextID, content: .paragraph(inline(ns.substring(from: start))))); nextID += 1 }
+                    return result
+                }
+            }
             let content: PreparedMarkdown.Block.Content
             switch block.content {
             case let .paragraph(value): content = .paragraph(inline(value))
@@ -65,7 +87,8 @@ enum MarkdownParser {
                     inline($0.replacingOccurrences(of: #"(?i)<br\s*/?>"#, with: "\n", options: .regularExpression))
                 } })
             }
-            return .init(id: block.id, content: content)
+            defer { nextID += 1 }
+            return [.init(id: nextID, content: content)]
         }
         return PreparedMarkdown(blocks: prepared)
     }

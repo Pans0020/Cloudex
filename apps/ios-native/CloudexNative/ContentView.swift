@@ -19,7 +19,7 @@ private struct ComposerDraftScope<Content: View>: View {
     var body: some View { content() }
 }
 
-private struct AttachmentThumbnail: View {
+struct AttachmentThumbnail: View {
     let path: String
     let server: String
     let client: APIClient
@@ -47,7 +47,13 @@ private struct AttachmentThumbnail: View {
                    let decoded = Data(base64Encoded: String(encoded)) {
                     data = decoded
                 } else {
-                    data = try await client.download("/api/file", queryItems: [URLQueryItem(name: "path", value: path)])
+                    if let url = URL(string: path), ["http", "https"].contains(url.scheme ?? "") {
+                        let (download, response) = try await URLSession.shared.download(from: url)
+                        defer { try? FileManager.default.removeItem(at: download) }
+                        guard let response = response as? HTTPURLResponse, (200..<300).contains(response.statusCode),
+                              (try download.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) <= 50 * 1024 * 1024 else { throw URLError(.cannotDecodeContentData) }
+                        data = try Data(contentsOf: download)
+                    } else { data = try await client.download("/api/file", queryItems: [URLQueryItem(name: "path", value: path)]) }
                 }
                 guard !Task.isCancelled else { return }
                 let prepared = await AttachmentImageCache.prepare(data, path: path, server: server)
@@ -123,6 +129,9 @@ struct ContentView: View {
     let onToggleDirectory: (() -> Void)?
     let showsDirectoryButton: Bool
     @State private var showingFilePicker = false
+    @State private var filePreview: FilePreviewRequest?
+    @State private var editingQueueItem: QueuedMessage?
+    @State private var queueEditText = ""
     @State private var showingPhotosPicker = false
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var isFollowingChatBottom = true
@@ -214,6 +223,17 @@ struct ContentView: View {
         }
         }
         .background(CloudexTheme.canvas)
+        .environment(\.previewClient, viewModel.client)
+        .environment(\.previewRoot, viewModel.selectedThread?.cwd ?? viewModel.selectedProjectCWD ?? "")
+        .environment(\.openURL, OpenURLAction { url in
+            let root = viewModel.selectedThread?.cwd ?? viewModel.selectedProjectCWD ?? ""
+            if let path = FilePreviewRequest.resolve(url, root: root) {
+                filePreview = FilePreviewRequest(path: path, client: viewModel.client, root: root)
+                return .handled
+            }
+            return ["http", "https", "mailto"].contains(url.scheme ?? "") ? .systemAction : .discarded
+        })
+        .sheet(item: $filePreview) { FilePreviewSheet(request: $0) }
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             #if DEBUG
@@ -281,6 +301,27 @@ struct ContentView: View {
             prepareNewChatRouteIfNeeded()
         }
         .onDisappear { speechInput.stop() }
+        .onChange(of: "\(viewModel.serverURL)|\(viewModel.selectedThreadID ?? "new")") { _, _ in editingQueueItem = nil }
+        .task(id: "\(viewModel.serverURL)|\(viewModel.selectedThreadID ?? "new")|\(viewModel.selectedAgentProvider)") {
+            async let queue: Void = viewModel.loadMessageQueue()
+            async let modes: Void = viewModel.loadCollaborationModes()
+            _ = await (queue, modes)
+        }
+        .sheet(item: $editingQueueItem) { item in
+            NavigationStack {
+                TextEditor(text: $queueEditText).padding()
+                    .navigationTitle("修改排队消息")
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) { Button("取消") { editingQueueItem = nil } }
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("保存") {
+                                Task { await viewModel.changeQueue("edit", id: item.id, message: queueEditText) }
+                                editingQueueItem = nil
+                            }
+                        }
+                    }
+            }
+        }
         .alert("语音输入", isPresented: Binding(
             get: { speechInput.errorMessage != nil },
             set: { if !$0 { speechInput.errorMessage = nil } }
@@ -375,7 +416,7 @@ struct ContentView: View {
     private var chat: some View {
         let content = currentChatContent
         let rows = content.messages + [ChatMessage(id: "chat-footer", role: .system,
-            text: "\(viewModel.active)|\(viewModel.isBusy)|\(viewModel.pendingSteerDraft)|\(viewModel.isOpeningThread)|\(viewModel.conversationLoadState)|\(viewModel.visibleApprovals)",
+            text: "\(viewModel.active)|\(viewModel.isBusy)|\(viewModel.pendingSteerDraft)|\(viewModel.isOpeningThread)|\(viewModel.conversationLoadState)|\(viewModel.visibleApprovals)|\(viewModel.queueItems)|\(viewModel.queuePaused)|\(viewModel.queueError ?? "")|\(viewModel.collaborationMode)",
             processItemCount: collapseProcessRequest)]
         return NativeChatList(
             conversationID: "\(viewModel.selectedServerProfileID ?? "")|\(expectedThreadID ?? "")",
@@ -403,6 +444,16 @@ struct ContentView: View {
                     onFloatingStateChange: { floatingCollapseVisible = $0 }
                 )
                 .environmentObject(viewModel)
+                .environment(\.previewClient, viewModel.client)
+                .environment(\.previewRoot, viewModel.selectedThread?.cwd ?? viewModel.selectedProjectCWD ?? "")
+                .environment(\.openURL, OpenURLAction { url in
+                    let root = viewModel.selectedThread?.cwd ?? viewModel.selectedProjectCWD ?? ""
+                    if let path = FilePreviewRequest.resolve(url, root: root) {
+                        filePreview = FilePreviewRequest(path: path, client: viewModel.client, root: root)
+                        return .handled
+                    }
+                    return ["http", "https", "mailto"].contains(url.scheme ?? "") ? .systemAction : .discarded
+                })
                 .accessibilityElement(children: .contain)
                 .accessibilityIdentifier("message-\(message.id)")
             }
@@ -440,6 +491,54 @@ struct ContentView: View {
                     onEdit: { viewModel.editPendingSteer(); composerFocused = true },
                     onDelete: { viewModel.deletePendingSteer() },
                     onSend: { Task { await viewModel.sendPendingSteer() } })
+            }
+            if !viewModel.queueItems.isEmpty {
+                HStack {
+                    Text("待处理消息 · \(viewModel.queueItems.count)").font(.caption.weight(.medium))
+                    Spacer()
+                    Button(cloudexLocalized(viewModel.queuePaused ? "继续队列" : "暂停队列")) {
+                        Task { await viewModel.changeQueue(viewModel.queuePaused ? "resume" : "pause") }
+                    }.font(.caption)
+                }
+                ForEach(viewModel.queueItems) { item in
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text(cloudexLocalized(item.statusTitle)).font(.caption).foregroundStyle(CloudexTheme.accent)
+                            if item.body.collaborationMode == "plan" { Text("计划").font(.caption) }
+                            Spacer()
+                            Menu {
+                                if item.status == "uploading" {
+                                    Button("重试入队") { Task { await viewModel.uploadQueueDraft(id: item.id) } }
+                                    Button("恢复到输入框核对") { viewModel.recoverLocalQueueDraft(id: item.id) }
+                                    Button("取消入队", role: .destructive) { Task { await viewModel.cancelLocalQueueDraft(id: item.id) } }
+                                } else if !["running", "dispatching"].contains(item.status) {
+                                    if !["unconfirmed", "failed"].contains(item.status) {
+                                        Button("修改") { queueEditText = item.body.message; editingQueueItem = item }
+                                        Button("上移") { Task { await viewModel.changeQueue("up", id: item.id) } }
+                                    }
+                                    Button(cloudexLocalized(item.status == "unconfirmed" ? "已核对，停止追踪此消息" : "删除"), role: .destructive) {
+                                        Task { await viewModel.changeQueue("cancel", id: item.id) }
+                                    }
+                                }
+                            } label: { Image(systemName: "ellipsis").frame(width: 44, height: 32) }
+                        }
+                        Text(item.body.message).font(.body).frame(maxWidth: .infinity, alignment: .leading)
+                        if let files = item.body.files, !files.isEmpty {
+                            Text("附件 · \(files.count)").font(.caption).foregroundStyle(.secondary)
+                        }
+                        if let error = item.error { Text(error).font(.caption).foregroundStyle(.red) }
+                    }.padding(12).cloudexSurface(radius: 16)
+                }
+            }
+            if let error = viewModel.queueError, !viewModel.queueItems.isEmpty {
+                Text(error).font(.caption).foregroundStyle(.red)
+            }
+            if !viewModel.active && viewModel.collaborationMode == "plan" && viewModel.selectedThreadID != nil {
+                Button("按此计划执行") {
+                    viewModel.selectCollaborationMode("default")
+                    viewModel.draft = "请按刚才确认的计划开始执行。"
+                    composerFocused = true
+                }.font(.subheadline)
             }
             if viewModel.active || viewModel.isBusy {
                 HStack(spacing: 7) {
@@ -487,6 +586,16 @@ struct ContentView: View {
             HStack(spacing: 7) {
                 attachmentAndVoiceControls
                 Menu {
+                    if viewModel.selectedAgentProvider == .codex {
+                        Picker("工作模式（下条消息生效）", selection: Binding(
+                            get: { viewModel.collaborationMode }, set: { viewModel.selectCollaborationMode($0) }
+                        )) {
+                            ForEach(viewModel.collaborationModes, id: \.self) { mode in
+                                Text(cloudexLocalized(mode == "plan" ? "计划模式" : "普通执行")).tag(mode)
+                            }
+                        }
+                        if let error = viewModel.collaborationModeError { Text(error) }
+                    }
                     Button {
                         Task { await viewModel.loadModelsIfNeeded(force: true) }
                     } label: {
@@ -535,6 +644,9 @@ struct ContentView: View {
                         Text(viewModel.compactModelTitle)
                             .lineLimit(1)
                             .truncationMode(.middle)
+                        if viewModel.selectedAgentProvider == .codex && viewModel.collaborationMode == "plan" {
+                            Text("计划").foregroundStyle(CloudexTheme.accent)
+                        }
                         Text("·")
                             .foregroundStyle(.secondary)
                         Text(viewModel.selectedEffortTitle)
@@ -768,7 +880,7 @@ struct ContentView: View {
                         }
                     }
 
-                if viewModel.active {
+                if viewModel.active || (!viewModel.queueItems.isEmpty && (!viewModel.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !viewModel.attachedFiles.isEmpty)) {
                     if viewModel.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                         && viewModel.attachedFiles.isEmpty {
                         Button { Task { await viewModel.stop() } } label: {
@@ -795,6 +907,11 @@ struct ContentView: View {
                         .buttonStyle(.plain)
                         .background(Color.primary, in: Circle())
                         .accessibilityLabel(cloudexLocalized("等待发送"))
+                        .contextMenu {
+                            if viewModel.active && viewModel.selectedAgentProvider == .codex {
+                                Button("立即补充当前任务") { Task { await viewModel.sendDraftAsSteer() } }
+                            }
+                        }
                     }
                 } else {
                     Button { Task { await viewModel.send() } } label: {
@@ -1119,7 +1236,7 @@ private struct PendingSteerBubble: View {
             Spacer(minLength: 42)
 
             VStack(alignment: .leading, spacing: 8) {
-                Text(cloudexLocalized("等待发送"))
+                Text("旧版待发送草稿 · 请核对所属会话")
                     .font(.caption2.weight(.semibold))
                     .foregroundStyle(.secondary)
 
@@ -1191,9 +1308,6 @@ private struct MessageBubble: View, Equatable {
     let onFloatingStateChange: (Bool) -> Void
     @State private var isPerformingAction = false
     @State private var isErrorExpanded = false
-    @State private var previewItem: EditPreviewItem?
-    @State private var previewLoadingPath: String?
-    @State private var previewError: String?
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.viewModel === rhs.viewModel && lhs.client.serverURL == rhs.client.serverURL
@@ -1220,33 +1334,6 @@ private struct MessageBubble: View, Equatable {
         } else if message.role == .assistant {
             messageContent
             .frame(maxWidth: .infinity, alignment: .leading)
-            .sheet(item: $previewItem) { item in
-                NavigationStack {
-                    Group {
-                        if let code = item.code {
-                            CodePreviewView(source: code, fileName: item.name)
-                        } else {
-                            EditQuickLookPreview(url: item.url)
-                        }
-                    }
-                    .navigationTitle(item.name)
-                    .navigationBarTitleDisplayMode(.inline)
-                    .toolbar {
-                        ToolbarItem(placement: .confirmationAction) {
-                            Button(cloudexLocalized("完成")) { previewItem = nil }
-                        }
-                    }
-                }
-                .presentationDragIndicator(.visible)
-            }
-            .alert(cloudexLocalized("无法预览文件"), isPresented: Binding(
-                get: { previewError != nil },
-                set: { if !$0 { previewError = nil } }
-            )) {
-                Button(cloudexLocalized("好"), role: .cancel) {}
-            } message: {
-                Text(previewError ?? cloudexLocalized("未知错误"))
-            }
         } else if message.role == .error {
             // Errors are status messages like assistant responses: give the
             // bubble the row's proposed width instead of letting its text
@@ -1291,7 +1378,7 @@ private struct MessageBubble: View, Equatable {
                         .lineLimit(isErrorExpanded || !canExpandError ? nil : 2)
                 }
             } else {
-                if message.role == .user, !message.attachments.isEmpty {
+                if !message.attachments.isEmpty {
                     VStack(alignment: .leading, spacing: 6) {
                         ForEach(message.attachments) { attachment in
                             VStack(alignment: .leading, spacing: 6) {
@@ -1306,11 +1393,9 @@ private struct MessageBubble: View, Equatable {
                                     Spacer(minLength: 0)
                                 }
                                 if attachment.kind == .image, let path = attachment.path {
-                                    AttachmentThumbnail(path: path, server: client.serverURL, client: client)
-                                    .frame(maxWidth: 230)
-                                    .frame(height: 160)
-                                        .clipShape(RoundedRectangle(cornerRadius: 12))
-                                        .accessibilityLabel(attachment.name)
+                                    MarkdownImage(destination: path, label: attachment.name)
+                                } else if let path = attachment.path, let url = URL(string: path) {
+                                    Link("浏览文件", destination: url)
                                 }
                             }
                             .padding(.horizontal, 9)
@@ -1325,8 +1410,7 @@ private struct MessageBubble: View, Equatable {
                     MarkdownText(
                         document: message.markdown,
                         fallbackText: message.text,
-                        highlightQuery: highlightQuery,
-                        onFileLink: message.role == .assistant ? { url in previewFile(url) } : nil
+                        highlightQuery: highlightQuery
                     )
                         .font(.body)
                         .foregroundStyle(message.role == .error ? Color.red : Color.primary)
@@ -1367,83 +1451,6 @@ private struct MessageBubble: View, Equatable {
         message.text.count > 100 || message.text.contains("\n")
     }
 
-    private func previewFile(_ url: URL) {
-        guard url.scheme == nil || url.isFileURL else { return }
-        guard previewLoadingPath == nil else { return }
-
-        let candidates = previewPathCandidates(for: url)
-        guard let firstCandidate = candidates.first else { return }
-        previewLoadingPath = firstCandidate
-        Task {
-            var lastError: Error?
-            for path in candidates {
-                do {
-                    let data = try await viewModel.previewFile(path: path)
-                    let name = (path as NSString).lastPathComponent
-                    let directory = FileManager.default.temporaryDirectory
-                        .appendingPathComponent("CloudexPreviews", isDirectory: true)
-                        .appendingPathComponent(UUID().uuidString, isDirectory: true)
-                    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                    let localURL = directory.appendingPathComponent(name)
-                    try data.write(to: localURL, options: .atomic)
-                    previewItem = EditPreviewItem(
-                        name: name,
-                        url: localURL,
-                        code: CodePreviewFile.supports(fileName: name) ? CodePreviewFile.decode(data) : nil
-                    )
-                    previewLoadingPath = nil
-                    return
-                } catch {
-                    lastError = error
-                }
-            }
-            previewError = lastError?.localizedDescription ?? cloudexLocalized("未知错误")
-            previewLoadingPath = nil
-        }
-    }
-
-    private func previewPathCandidates(for url: URL) -> [String] {
-        let rawPath = (url.isFileURL ? url.path : (url.path.isEmpty ? url.absoluteString : url.path))
-            .removingPercentEncoding ?? url.absoluteString
-        let normalizedPath = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalizedPath.isEmpty else { return [] }
-
-        let root = viewModel.selectedThread?.cwd ?? viewModel.selectedProjectCWD
-        let linkedName = (normalizedPath as NSString).lastPathComponent
-        let comparisonPath = normalizedPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        var knownPaths = message.editDiff?.map(\.name) ?? []
-        knownPaths.append(contentsOf: (viewModel.detail?.turns ?? []).flatMap { turn in
-            (turn.items ?? []).flatMap { $0.diff?.map(\.name) ?? [] }
-        })
-
-        let matchingPaths = knownPaths.filter { candidate in
-            let normalizedCandidate = candidate.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            return normalizedCandidate == comparisonPath
-                || (normalizedCandidate as NSString).lastPathComponent == linkedName
-        }
-
-        func resolveAgainstRoot(_ path: String) -> String {
-            guard !path.hasPrefix("/"), let root, !root.isEmpty else { return path }
-            return URL(fileURLWithPath: root, isDirectory: true)
-                .appendingPathComponent(path)
-                .standardizedFileURL.path
-        }
-
-        var candidates = matchingPaths.map(resolveAgainstRoot)
-        candidates.append(resolveAgainstRoot(normalizedPath))
-        // Some summaries use a workspace-relative path beginning with `/`.
-        // Try it as written first, then as a path beneath the active thread.
-        if normalizedPath.hasPrefix("/"), let root, !root.isEmpty {
-            candidates.append(
-                URL(fileURLWithPath: root, isDirectory: true)
-                    .appendingPathComponent(String(normalizedPath.dropFirst()))
-                    .standardizedFileURL.path
-            )
-        }
-        return candidates.reduce(into: [String]()) { result, candidate in
-            if !result.contains(candidate) { result.append(candidate) }
-        }
-    }
 
     private var roleTitle: String {
         switch message.role {
@@ -1632,6 +1639,9 @@ private struct ProcessSummaryBubble: View {
                     updateFloatingState()
                 })
 
+                ForEach(message.attachments) { attachment in
+                    if let path = attachment.path { MarkdownImage(destination: path, label: attachment.name) }
+                }
                 if expanded {
                     VStack(alignment: .leading, spacing: 8) {
                         if (message.processItems ?? []).isEmpty {
@@ -1809,41 +1819,6 @@ private struct EditSummaryCard: View {
 
 }
 
-private struct EditPreviewItem: Identifiable {
-    let id = UUID()
-    let name: String
-    let url: URL
-    let code: String?
-}
-
-private struct EditQuickLookPreview: UIViewControllerRepresentable {
-    let url: URL
-
-    func makeCoordinator() -> Coordinator { Coordinator(url: url) }
-
-    func makeUIViewController(context: Context) -> QLPreviewController {
-        let controller = QLPreviewController()
-        controller.dataSource = context.coordinator
-        return controller
-    }
-
-    func updateUIViewController(_ controller: QLPreviewController, context: Context) {
-        context.coordinator.url = url
-        controller.reloadData()
-    }
-
-    final class Coordinator: NSObject, QLPreviewControllerDataSource {
-        var url: URL
-
-        init(url: URL) { self.url = url }
-
-        func numberOfPreviewItems(in controller: QLPreviewController) -> Int { 1 }
-
-        func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> QLPreviewItem {
-            url as NSURL
-        }
-    }
-}
 
 private struct TurnReviewSheet: View {
     let payloads: [EditDiffPayload]
@@ -1950,11 +1925,10 @@ private struct SystemTimelineBubble: View {
     }
 }
 
-private struct MarkdownText: View {
+struct MarkdownText: View {
     let document: PreparedMarkdown?
     let fallbackText: String
     var highlightQuery: String? = nil
-    var onFileLink: ((URL) -> Void)? = nil
 
     var body: some View {
         Group {
@@ -1983,6 +1957,8 @@ private struct MarkdownText: View {
                             MarkdownCodeBlock(source: value, language: language)
                         case let .table(rows):
                             MarkdownTableView(rows: rows, highlightQuery: highlightQuery)
+                        case let .image(destination, label):
+                            MarkdownImage(destination: destination, label: label)
                         }
                     }
                 }
@@ -1994,11 +1970,6 @@ private struct MarkdownText: View {
         }
         .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
         .fixedSize(horizontal: false, vertical: true)
-        .environment(\.openURL, OpenURLAction { url in
-            guard let onFileLink else { return .systemAction }
-            onFileLink(url)
-            return .handled
-        })
     }
 
     private func styled(_ text: AttributedString) -> AttributedString {
