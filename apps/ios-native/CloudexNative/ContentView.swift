@@ -424,7 +424,7 @@ struct ContentView: View {
             ready: isExpectedChatReady && viewModel.conversationLoadState != .loading,
             hasMore: viewModel.hasMoreHistory,
             loadingOlder: viewModel.isLoadingOlderTurns,
-            presentationKey: "\(viewModel.active)|\(collapseProcessRequest)|\(messageTextHighlight?.messageID ?? "")|\(messageTextHighlight?.query ?? "")|\(viewModel.serverURL)",
+            presentationKey: "\(viewModel.active)|\(collapseProcessRequest)|\(messageTextHighlight?.messageID ?? "")|\(messageTextHighlight?.query ?? "")|\(viewModel.serverURL)|\(viewModel.chatDetails)",
             actions: chatListActions,
             onFollowingChanged: { isFollowingChatBottom = $0 },
             onLoadOlder: { Task { await viewModel.loadOlderTurns() } }
@@ -434,7 +434,7 @@ struct ContentView: View {
             } else {
                 MessageBubble(
                     viewModel: viewModel, client: viewModel.client, isActive: viewModel.active,
-                    message: message,
+                    message: message, preferences: viewModel.chatDetails,
                     highlightQuery: messageTextHighlight?.messageID == message.id ? messageTextHighlight?.query : nil,
                     collapseRequest: $collapseProcessRequest,
                     onQuickFill: { text in viewModel.draft = text; composerFocused = true },
@@ -713,22 +713,24 @@ struct ContentView: View {
                 .layoutPriority(0)
                 .accessibilityLabel("切换执行模式")
 
-                taskTimerBubble
+                if viewModel.chatDetails.statistics {
+                    taskTimerBubble
 
-                Button {
-                    showingTokenUsage = true
-                } label: {
-                    Text(contextRemainingLabel)
-                        .font(.caption2.weight(.semibold))
-                        .lineLimit(1)
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 6)
+                    Button {
+                        showingTokenUsage = true
+                    } label: {
+                        Text(contextRemainingLabel)
+                            .font(.caption2.weight(.semibold))
+                            .lineLimit(1)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 6)
+                    }
+                    .buttonStyle(.plain)
+                    .liquidGlass(in: Capsule(), interactive: true)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .layoutPriority(1)
+                    .accessibilityLabel("查看本轮 Token 使用量")
                 }
-                .buttonStyle(.plain)
-                .liquidGlass(in: Capsule(), interactive: true)
-                .fixedSize(horizontal: true, vertical: false)
-                .layoutPriority(1)
-                .accessibilityLabel("查看本轮 Token 使用量")
             }
             .padding(.horizontal, 20)
             .padding(.vertical, 4)
@@ -1007,7 +1009,7 @@ struct ContentView: View {
     private var currentChatContent: ChatScrollContent {
         guard isExpectedChatReady, viewModel.conversationLoadState != .loading else { return .empty }
         return ChatScrollContent(
-            messages: viewModel.renderedMessages,
+            messages: viewModel.chatDetails.visibleMessages(viewModel.renderedMessages),
             approvals: viewModel.visibleApprovals,
             active: viewModel.active
         )
@@ -1300,6 +1302,7 @@ private struct MessageBubble: View, Equatable {
     let client: APIClient
     let isActive: Bool
     let message: ChatMessage
+    let preferences: ChatDetailPreferences
     let highlightQuery: String?
     @Binding var collapseRequest: Int
     let onQuickFill: (String) -> Void
@@ -1314,13 +1317,14 @@ private struct MessageBubble: View, Equatable {
         lhs.viewModel === rhs.viewModel && lhs.client.serverURL == rhs.client.serverURL
             && lhs.client.token == rhs.client.token && lhs.isActive == rhs.isActive
             && lhs.message == rhs.message && lhs.highlightQuery == rhs.highlightQuery
+            && lhs.preferences == rhs.preferences
             && lhs.collapseRequest == rhs.collapseRequest
     }
 
     @ViewBuilder
     var body: some View {
         if message.role == .execution {
-            ExecutionStepRow(message: message)
+            ExecutionStepRow(message: message, showStatistics: preferences.statistics)
         } else if message.role == .processSummary {
             ProcessSummaryBubble(
                 message: message,
@@ -1420,7 +1424,7 @@ private struct MessageBubble: View, Equatable {
                 }
             }
 
-            if message.role == .assistant,
+            if preferences.tools, message.role == .assistant,
                let editDiff = message.editDiff,
                !editDiff.isEmpty {
                 EditSummaryCard(payloads: editDiff)
@@ -1481,7 +1485,7 @@ private struct MessageBubble: View, Equatable {
     @ViewBuilder
     private var messageFooter: some View {
         HStack(spacing: 6) {
-            if !messageTime.isEmpty {
+            if preferences.statistics, !messageTime.isEmpty {
                 Text(messageTime)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
@@ -1623,7 +1627,7 @@ private struct ProcessSummaryBubble: View {
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(CloudexTheme.accent)
                             .rotationEffect(.degrees(expanded ? 90 : 0))
-                        MarkdownText(document: message.markdown, fallbackText: message.text)
+                        Text(viewModel.chatDetails.statistics ? message.text : cloudexLocalized("查看过程"))
                             .font(.subheadline.weight(.medium))
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.leading)
@@ -1645,12 +1649,15 @@ private struct ProcessSummaryBubble: View {
                 }
                 if expanded {
                     VStack(alignment: .leading, spacing: 8) {
+                        let items = (message.processItems ?? []).filter { viewModel.chatDetails.includes($0) }
                         if (message.processItems ?? []).isEmpty {
                             Text("暂无过程详情").foregroundStyle(.secondary)
+                        } else if items.isEmpty {
+                            Text("过程细节已在设置中隐藏").foregroundStyle(.secondary)
                         }
-                        ForEach(message.processItems ?? []) { item in
+                        ForEach(items) { item in
                             if item.role == .execution {
-                                ExecutionStepRow(message: item)
+                                ExecutionStepRow(message: item, showStatistics: viewModel.chatDetails.statistics)
                                     .id("\(item.id)-\(expansionGeneration)")
                             } else {
                                 VStack(alignment: .leading, spacing: 4) {
@@ -1664,7 +1671,7 @@ private struct ProcessSummaryBubble: View {
                                         .foregroundStyle(.primary)
                                         .textSelection(.enabled)
                                     let time = DateFormatting.messageTime(from: item.createdAt)
-                                    if !time.isEmpty {
+                                    if viewModel.chatDetails.statistics, !time.isEmpty {
                                         Text(time)
                                             .font(.caption2)
                                             .foregroundStyle(.secondary)
@@ -2108,6 +2115,7 @@ private struct MarkdownTableView: View {
 
 private struct ExecutionStepRow: View {
     let message: ChatMessage
+    let showStatistics: Bool
     @State private var expanded = false
 
     var body: some View {
@@ -2223,13 +2231,13 @@ private struct ExecutionStepRow: View {
 
     private var detailText: String? {
         var values: [String] = []
-        if let duration = message.executionDuration, !duration.isEmpty { values.append(duration) }
+        if showStatistics, let duration = message.executionDuration, !duration.isEmpty { values.append(duration) }
         if message.executionStatus == "failed", let code = message.executionExitCode {
             values.append(cloudexLocalized("退出码 %lld", Int64(code)))
         }
         if message.executionStatus == "inProgress" { values.append(cloudexLocalized("运行中")) }
         let time = DateFormatting.messageTime(from: message.createdAt)
-        if !time.isEmpty { values.append(time) }
+        if showStatistics, !time.isEmpty { values.append(time) }
         return values.isEmpty ? nil : values.joined(separator: " · ")
     }
 

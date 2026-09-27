@@ -50,6 +50,14 @@ final class AppViewModel: ObservableObject {
     @Published private(set) var conversationLoadState: ConversationLoadState = .idle
     @Published private(set) var isRefreshing = false
     @Published var expandedProcessIDs: Set<String> = []
+    @Published var chatDetails = ChatDetailPreferences.load() {
+        didSet {
+            guard chatDetails != oldValue else { return }
+            if let data = try? JSONEncoder().encode(chatDetails) {
+                UserDefaults.standard.set(data, forKey: ChatDetailPreferences.storageKey)
+            }
+        }
+    }
     @Published var serverURL: String
     @Published var lanServerURL: String
     @Published var tailscaleServerURL: String
@@ -375,6 +383,7 @@ final class AppViewModel: ObservableObject {
                 }
                 let editDiff = processItems.flatMap { $0.editDiff ?? [] }
                 if var finalMessage {
+                    finalMessage.phase = "final_answer"
                     finalMessage.editDiff = editDiff.isEmpty ? nil : editDiff
                     result.append(finalMessage)
                 }
@@ -506,7 +515,9 @@ final class AppViewModel: ObservableObject {
 
     private func needsMarkdown(_ message: ChatMessage) -> Bool {
         ((!message.text.isEmpty && (message.role == .assistant || message.role == .processSummary)) && message.markdown == nil)
-            || (expandedProcessIDs.contains(message.id) && (message.processItems?.contains(where: needsMarkdown) ?? false))
+            || (message.processItems?.contains {
+                (expandedProcessIDs.contains(message.id) || chatDetails.mustKeep($0)) && needsMarkdown($0)
+            } ?? false)
     }
 
     private func reuseMarkdown(_ message: ChatMessage, previous: ChatMessage?) -> ChatMessage {
@@ -524,9 +535,12 @@ final class AppViewModel: ObservableObject {
         if !message.text.isEmpty && (message.role == .assistant || message.role == .processSummary) && message.markdown == nil {
             result.markdown = try? await MarkdownRenderer.shared.prepare(message.text)
         }
-        if expandedProcessIDs.contains(message.id), let items = message.processItems {
+        if let items = message.processItems {
             var prepared: [ChatMessage] = []
-            for item in items { prepared.append(await prepareMarkdown(item)) }
+            for item in items {
+                prepared.append(expandedProcessIDs.contains(message.id) || chatDetails.mustKeep(item)
+                    ? await prepareMarkdown(item) : item)
+            }
             result.processItems = prepared
         }
         return result
@@ -597,6 +611,7 @@ final class AppViewModel: ObservableObject {
             text: presentation.text,
             createdAt: item.createdAt,
             sourceTurnID: turnID,
+            phase: item.phase,
             attachments: presentation.attachments
         )
     }
@@ -1383,6 +1398,45 @@ final class AppViewModel: ObservableObject {
     // Runs the real disk queue, navigation/restore, reconciliation and render paths.
     // Only the HTTP page is substituted; no Codex sessions or real host connections.
     private func runCacheRegression() async {
+        let defaults = UserDefaults(suiteName: "cloudex-detail-regression")!
+        defer { defaults.removePersistentDomain(forName: "cloudex-detail-regression") }
+        defaults.removePersistentDomain(forName: "cloudex-detail-regression")
+        let quiet = ChatDetailPreferences.load(from: defaults)
+        let all = ChatDetailPreferences(process: true, thinking: true, tools: true, progress: true, statistics: true)
+        let rows: [ChatMessage] = [
+            .init(id: "user", role: .user, text: "question"),
+            .init(id: "thinking", role: .execution, text: "summary", executionKind: "thinking"),
+            .init(id: "tool", role: .execution, text: "pwd", executionKind: "run"),
+            .init(id: "progress", role: .assistant, text: "checking", phase: "commentary"),
+            .init(id: "final", role: .assistant, text: "answer", phase: "final_answer"),
+            .init(id: "legacy", role: .assistant, text: "legacy answer"),
+            .init(id: "failure", role: .execution, text: "failed command", executionStatus: "failed"),
+            .init(id: "error", role: .error, text: "connection lost"),
+            .init(id: "file", role: .assistant, text: "[file](result.md)", phase: "commentary"),
+            .init(id: "duration", role: .taskSummary, text: "12s")
+        ]
+        precondition(quiet.visibleMessages(rows).map(\.id) == ["user", "final", "legacy", "failure", "error", "file"])
+        precondition(all.visibleMessages(rows) == rows)
+        for field in [\ChatDetailPreferences.thinking, \.tools, \.progress, \.statistics] {
+            var single = quiet; single[keyPath: field] = true
+            precondition(single.visibleMessages(rows).count == quiet.visibleMessages(rows).count + 1)
+        }
+        let artifact = MessageAttachment(name: "image", path: "/result.png", kind: .image)
+        let process = ChatMessage(id: "process", role: .processSummary, text: "process",
+            processItems: rows.filter { !["user", "final", "legacy"].contains($0.id) }, attachments: [artifact])
+        var hidden = quiet; hidden.process = false
+        let kept = hidden.visibleMessages([rows[0], process, rows[4]])
+        precondition(kept.map(\.id) == ["user", "process", "failure", "error", "file", "final"])
+        precondition(kept[1].attachments == [artifact])
+        precondition(quiet.visibleMessages([process]) == [process])
+        let preparedProcess = await prepareMarkdown(process)
+        precondition(preparedProcess.processItems?.first(where: { $0.id == "file" })?.markdown != nil,
+                     "Links must remain rendered when the process entry is hidden")
+        defaults.set(try! JSONEncoder().encode(all), forKey: ChatDetailPreferences.storageKey)
+        precondition(ChatDetailPreferences.load(from: defaults) == all)
+        let commentary = TurnItem(type: "agentMessage", id: "commentary", text: "progress", content: nil,
+            command: nil, activity: nil, status: nil, exitCode: nil, duration: nil, phase: "commentary", createdAt: nil, compressed: nil, diff: nil)
+        precondition(timelineMessage(from: commentary, turnID: "test", fallbackIndex: 0)?.phase == "commentary")
         let parsed = try! MarkdownParser.prepare("Before\n\n![图](picture.png)\n\n[文档](guide.md)\n\n```md\n![literal](ignored.png)\n```")
         precondition(parsed.blocks.filter { if case .image = $0.content { return true }; return false }.count == 1)
         precondition(FilePreviewRequest.resolve(URL(string: "images/a%20b.png")!, root: "/workspace") == "/workspace/images/a b.png")
@@ -1600,6 +1654,11 @@ final class AppViewModel: ObservableObject {
 
     // In-memory UI regression data only; never creates Codex sessions or contacts a server.
     private func loadUIFixture(thread: CloudexThread? = nil) async {
+        if thread == nil, !ProcessInfo.processInfo.arguments.contains("--ui-preserve-details") {
+            chatDetails = ProcessInfo.processInfo.arguments.contains("--ui-all-details")
+                ? ChatDetailPreferences(process: true, thinking: true, tools: true, progress: true, statistics: true)
+                : ChatDetailPreferences()
+        }
         if ProcessInfo.processInfo.arguments.contains("--ui-queue-fixture") {
             serverURL = "http://127.0.0.1:18089"
         }
@@ -1675,6 +1734,18 @@ final class AppViewModel: ObservableObject {
                 ["type": "imageArtifact", "id": "process-image", "attachments": [["name": "过程图片", "path": "/ui/picture.png", "kind": "image"]]],
                 ["type": "agentMessage", "id": "preview-answer", "text": "[查看实际界面截图](/ui/guide.md)\n\n![生成图片](/ui/picture.png)\n\n[HTML](/ui/page.html) · [GIF](/ui/animation.gif)"]
             ]]]
+        }
+        if ProcessInfo.processInfo.arguments.contains("--ui-details-fixture") {
+            turns = [["id": "details-turn", "status": "completed", "items": [
+                ["type": "userMessage", "id": "details-user", "content": [["type": "text", "text": "显示设置回归"]]],
+                ["type": "thinking", "id": "details-thinking", "text": "可选思考摘要"],
+                ["type": "commandExecution", "id": "details-tool", "command": "pwd", "status": "completed"],
+                ["type": "agentMessage", "id": "details-progress", "text": "可选中间进展", "phase": "commentary"],
+                ["type": "agentMessage", "id": "details-answer", "text": "最终回答始终可见", "phase": "final_answer"]
+            ]]]
+            if ProcessInfo.processInfo.arguments.contains("--ui-details-active") {
+                turns[0]["status"] = "inProgress"
+            }
         }
         let data = try! JSONSerialization.data(withJSONObject: turns)
         // No real host access: the explicit preview fixture uses a loopback file-only server.

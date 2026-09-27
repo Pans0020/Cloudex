@@ -1,6 +1,68 @@
 import XCTest
 
 final class CloudexUITests: XCTestCase {
+    func testChatDetailSettingsPersistAndRestoreProcessContent() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--ui-fixture", "--ui-details-fixture", "-AppleLanguages", "(zh-Hans)"]
+        app.launch()
+        XCTAssertTrue(app.buttons["打开设置"].waitForExistence(timeout: 10))
+        app.buttons["打开设置"].tap()
+        let labels = ["显示历史过程入口", "显示思考摘要", "显示工具调用与文件改动", "显示中间进展", "显示时间与 Token 用量"]
+        XCTAssertTrue(app.switches[labels[0]].waitForExistence(timeout: 5))
+        app.switches[labels[0]].coordinate(withNormalizedOffset: CGVector(dx: 0.92, dy: 0.5)).tap()
+        let switchedOff = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == '0'"), object: app.switches[labels[0]])
+        wait(for: [switchedOff], timeout: 3)
+        for label in labels { XCTAssertEqual(app.switches[label].value as? String, "0") }
+        snapshot("chat-details-quiet-settings")
+        app.buttons["完成"].tap()
+        app.buttons["展开CV"].tap()
+        app.buttons.containing(.staticText, identifier: "布局回归 CV").firstMatch.tap()
+        XCTAssertTrue(app.staticTexts["最终回答始终可见"].waitForExistence(timeout: 10))
+        XCTAssertFalse(app.buttons["process-toggle-details-turn"].exists)
+        snapshot("chat-details-quiet-answer")
+        app.terminate()
+        app.launchArguments.append("--ui-preserve-details")
+        app.launch()
+        XCTAssertTrue(app.buttons["打开设置"].waitForExistence(timeout: 10))
+        app.buttons["打开设置"].tap()
+        for label in labels {
+            XCTAssertEqual(app.switches[label].value as? String, "0")
+            app.switches[label].coordinate(withNormalizedOffset: CGVector(dx: 0.92, dy: 0.5)).tap()
+        }
+        snapshot("chat-details-full-settings")
+        app.buttons["完成"].tap()
+        app.buttons["展开CV"].tap()
+        app.buttons.containing(.staticText, identifier: "布局回归 CV").firstMatch.tap()
+        let process = app.buttons["process-toggle-details-turn"]
+        XCTAssertTrue(process.waitForExistence(timeout: 10)); process.tap()
+        XCTAssertTrue(app.staticTexts["可选思考摘要"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["可选中间进展"].exists)
+        XCTAssertTrue(app.staticTexts["最终回答始终可见"].exists)
+        snapshot("chat-details-expanded-restored")
+        app.terminate()
+        app.launchArguments.removeAll { $0 == "--ui-preserve-details" }
+        app.launch() // Leave the simulator at the normal defaults for other tests.
+    }
+
+    func testActiveChatDetailVisibility() {
+        continueAfterFailure = false
+        for all in [false, true] {
+            let app = XCUIApplication()
+            app.launchArguments = ["--ui-fixture", "--ui-details-fixture", "--ui-details-active", "-AppleLanguages", "(zh-Hans)"]
+            if all { app.launchArguments.append("--ui-all-details") }
+            app.launch()
+            XCTAssertTrue(app.buttons["展开CV"].waitForExistence(timeout: 10))
+            app.buttons["展开CV"].tap()
+            app.buttons.containing(.staticText, identifier: "布局回归 CV").firstMatch.tap()
+            XCTAssertTrue(app.staticTexts["最终回答始终可见"].waitForExistence(timeout: 10))
+            XCTAssertEqual(app.staticTexts["可选思考摘要"].exists, all)
+            XCTAssertEqual(app.staticTexts["可选中间进展"].exists, all)
+            XCTAssertEqual(app.buttons["查看本轮 Token 使用量"].exists, all)
+            snapshot(all ? "active-details-full" : "active-details-quiet")
+            app.terminate()
+        }
+    }
     @discardableResult
     private func previewFixture(_ options: [String: Any]? = nil) -> [String: Any] {
         let finished = expectation(description: "fixture control")
@@ -227,7 +289,7 @@ final class CloudexUITests: XCTestCase {
     private func verifyProcessPosition(empty: Bool) {
         continueAfterFailure = false
         let app = XCUIApplication()
-        app.launchArguments = ["--ui-fixture", "--ui-process-fixture", "-AppleLanguages", "(zh-Hans)"]
+        app.launchArguments = ["--ui-fixture", "--ui-process-fixture", "--ui-all-details", "-AppleLanguages", "(zh-Hans)"]
         if empty { app.launchArguments.append("--ui-process-empty-fixture") }
         app.launch()
         XCTAssertTrue(app.buttons["展开CV"].waitForExistence(timeout: 10))

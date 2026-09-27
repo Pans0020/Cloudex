@@ -90,6 +90,18 @@ struct SettingsView: View {
                 }
                 .listRowBackground(CloudexTheme.surface.opacity(0.85))
 
+                Section {
+                    Toggle("显示历史过程入口", isOn: $viewModel.chatDetails.process)
+                    Toggle("显示思考摘要", isOn: $viewModel.chatDetails.thinking)
+                    Toggle("显示工具调用与文件改动", isOn: $viewModel.chatDetails.tools)
+                    Toggle("显示中间进展", isOn: $viewModel.chatDetails.progress)
+                    Toggle("显示时间与 Token 用量", isOn: $viewModel.chatDetails.statistics)
+                } header: {
+                    Text("对话显示")
+                } footer: {
+                    Text("即时生效并保存在此设备。仅控制已有过程信息的显示，不改变模型回答。最终回答、图片文件、错误和确认请求始终保留。")
+                }
+
                 Section("当前连接") {
                     LabeledContent("App 构建", value: "\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""))")
                     LabeledContent("代码版本", value: Bundle.main.object(forInfoDictionaryKey: "CloudexSourceRevision") as? String ?? "development")

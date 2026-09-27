@@ -243,3 +243,11 @@
 "已连接 · 实时同步" = "Connected · Live Sync";
 "任务执行失败" = "Task Execution Failed";
 "任务失败：%@" = "Task Failed: %@";
+"对话显示" = "Conversation display";
+"显示历史过程入口" = "Show past process entry";
+"显示思考摘要" = "Show thinking summaries";
+"显示工具调用与文件改动" = "Show tool calls and file changes";
+"显示中间进展" = "Show intermediate progress";
+"显示时间与 Token 用量" = "Show times and Token usage";
+"即时生效并保存在此设备。仅控制已有过程信息的显示，不改变模型回答。最终回答、图片文件、错误和确认请求始终保留。" = "Applies immediately and saves on this device. Controls existing process details only; it does not change model responses. Final answers, images, files, errors and confirmation requests stay visible.";
+"过程细节已在设置中隐藏" = "Process details are hidden in Settings";

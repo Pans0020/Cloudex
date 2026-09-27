@@ -964,6 +964,56 @@ struct MessageAttachment: Identifiable, Equatable, Codable {
     var systemImage: String { kind == .image ? "photo" : "doc" }
 }
 
+struct ChatDetailPreferences: Codable, Equatable {
+    var process = true
+    var thinking = false
+    var tools = false
+    var progress = false
+    var statistics = false
+
+    static let storageKey = "cloudex.chatDetailPreferences"
+    static func load(from defaults: UserDefaults = .standard) -> Self {
+        guard let data = defaults.data(forKey: storageKey),
+              let value = try? JSONDecoder().decode(Self.self, from: data) else { return Self() }
+        return value
+    }
+
+    func includes(_ message: ChatMessage) -> Bool {
+        // Artifacts and failures remain accessible even in the quietest display.
+        if !message.attachments.isEmpty || mustKeep(message) { return true }
+        switch message.role {
+        case .execution: return message.executionKind == "thinking" ? thinking : tools
+        case .assistant: return message.phase != "commentary" || progress
+        case .taskSummary: return statistics
+        default: return true
+        }
+    }
+
+    func mustKeep(_ message: ChatMessage) -> Bool {
+        // Conservatively retain link-bearing commentary, including unloaded Markdown.
+        message.role == .error || message.executionKind == "approval"
+            || ["failed", "declined"].contains(message.executionStatus ?? "")
+            || (message.executionExitCode ?? 0) != 0
+            || (message.role == .assistant && (message.text.contains("](") || message.text.contains("]:")))
+    }
+
+    func visibleMessages(_ messages: [ChatMessage]) -> [ChatMessage] {
+        messages.flatMap { message -> [ChatMessage] in
+            guard message.role == .processSummary, !process else {
+                return includes(message) ? [message] : []
+            }
+            // Keep the original row identity for artifacts; never change cached history.
+            var rows: [ChatMessage] = []
+            if !message.attachments.isEmpty {
+                rows.append(ChatMessage(id: message.id, role: .assistant, text: "",
+                    sourceTurnID: message.sourceTurnID, attachments: message.attachments))
+            }
+            rows += (message.processItems ?? []).filter { mustKeep($0) }
+            return rows
+        }
+    }
+}
+
 struct ChatMessage: Identifiable, Equatable, Codable {
     enum Role: String, Codable {
         case user
