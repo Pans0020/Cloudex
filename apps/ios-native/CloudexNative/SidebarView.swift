@@ -160,6 +160,13 @@ struct CloudexRootView: View {
         let matches = matchesByThreadID
         return NavigationStack(path: $navigationPath) {
             List {
+                Section {
+                    phoneHomeHeader
+                        .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 4, trailing: 0))
+                        .listRowSeparator(.hidden)
+                        .listRowBackground(Color.clear)
+                }
+
                 serverOverviewSection
 
                 if !pinnedConversations.isEmpty {
@@ -176,9 +183,11 @@ struct CloudexRootView: View {
                 ForEach(projects) { project in
                     Section {
                         projectHeader(project)
+                            .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
                             .listRowBackground(projectCardBackground(project, first: true, last: isProjectCollapsed(project)))
                         if !isProjectCollapsed(project) {
                             projectNewConversationButton(project)
+                                .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
                                 .listRowBackground(projectCardBackground(project))
 
                             ForEach(project.threads) { thread in
@@ -193,9 +202,24 @@ struct CloudexRootView: View {
                                         )
                                     }
                                 }
+                                .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
                                 .listRowBackground(projectCardBackground(project, last: thread.id == project.threads.last?.id,
                                                                          selected: thread.id == viewModel.selectedThreadID))
                             }
+                        }
+                    } header: {
+                        if project.id == projects.first?.id {
+                            HStack {
+                                Text("项目")
+                                    .font(.title2.weight(.bold))
+                                    .foregroundStyle(Color.primary)
+                                Spacer()
+                                Text(cloudexLocalized("%lld 个项目", Int64(projects.count)))
+                                    .font(.caption)
+                                    .foregroundStyle(Color(uiColor: .secondaryLabel))
+                            }
+                            .textCase(nil)
+                            .padding(.bottom, 6)
                         }
                     }
                 }
@@ -208,20 +232,13 @@ struct CloudexRootView: View {
                 }
             }
             .listStyle(.insetGrouped)
-            .listSectionSpacing(18)
+            .listSectionSpacing(16)
+            .contentMargins(.top, 8, for: .scrollContent)
             .scrollContentBackground(.hidden)
-            .background(CloudexTheme.canvas)
+            .background(CloudexTheme.homeCanvas)
             .refreshable { await viewModel.refresh() }
             .scrollDismissesKeyboard(.interactively)
-            .navigationTitle("Cloudex")
-            .navigationBarTitleDisplayMode(.inline)
-            .safeAreaInset(edge: .top, spacing: 4) {
-                agentProviderSwitcher
-            }
-            .toolbar {
-                rootToolbar
-                homeTitleToolbar
-            }
+            .toolbar(.hidden, for: .navigationBar)
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 conversationSearchBar
             }
@@ -229,6 +246,36 @@ struct CloudexRootView: View {
                 ContentView(expectedThreadID: threadID)
             }
         }
+    }
+
+    private var phoneHomeHeader: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 16) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Cloudex")
+                        .font(.largeTitle.weight(.bold))
+                        .tracking(-0.6)
+                        .accessibilityAddTraits(.isHeader)
+                    serverMenu
+                        .foregroundStyle(CloudexTheme.accent)
+                        .liquidGlass(in: Capsule(), interactive: true, tint: CloudexTheme.accent.opacity(0.05))
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                Spacer(minLength: 0)
+                Button { showingSettings = true } label: {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 22))
+                        .foregroundStyle(CloudexTheme.accent)
+                        .frame(width: 44, height: 44)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .liquidGlass(in: Circle(), interactive: true)
+                .accessibilityLabel("打开设置")
+            }
+            agentProviderSwitcher
+        }
+        .padding(.top, 4)
     }
 
     private var iPadNavigation: some View {
@@ -445,36 +492,7 @@ struct CloudexRootView: View {
     @ToolbarContentBuilder
     private var rootToolbar: some ToolbarContent {
         ToolbarItem(placement: .topBarLeading) {
-            Menu {
-                if viewModel.serverProfiles.isEmpty {
-                    Text("暂无已保存服务器")
-                } else {
-                    ForEach(viewModel.serverProfiles) { profile in
-                        Button {
-                            Task { await viewModel.switchToServerProfile(profile) }
-                        } label: {
-                            Label(profile.name, systemImage: viewModel.selectedServerProfileID == profile.id ? "checkmark" : "server.rack")
-                        }
-                    }
-                }
-                Divider()
-                Button {
-                    showingSettings = true
-                } label: {
-                    Label("管理服务器", systemImage: "slider.horizontal.3")
-                }
-            } label: {
-                HStack(spacing: 5) {
-                    Image(systemName: "server.rack")
-                    Text(viewModel.serverProfileTitle)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-                .font(.caption.weight(.semibold))
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-            }
-            .accessibilityLabel("切换服务器")
+            serverMenu
         }
         ToolbarItem(placement: .topBarTrailing) {
             Button { showingSettings = true } label: {
@@ -482,6 +500,53 @@ struct CloudexRootView: View {
             }
             .accessibilityLabel("打开设置")
         }
+    }
+
+    private var serverMenu: some View {
+        Menu {
+            if viewModel.serverProfiles.isEmpty {
+                Text("暂无已保存服务器")
+            } else {
+                ForEach(viewModel.serverProfiles) { profile in
+                    Button {
+                        Task { await viewModel.switchToServerProfile(profile) }
+                    } label: {
+                        Label(profile.name, systemImage: viewModel.selectedServerProfileID == profile.id ? "checkmark" : "server.rack")
+                    }
+                }
+            }
+            Divider()
+            Button {
+                showingSettings = true
+            } label: {
+                Label("管理服务器", systemImage: "slider.horizontal.3")
+            }
+        } label: {
+            HStack(spacing: 5) {
+                if usesIPadLayout {
+                    Image(systemName: "server.rack")
+                } else {
+                    Circle()
+                        .fill(viewModel.isConnected ? Color.green : Color.red)
+                        .frame(width: 8, height: 8)
+                        .accessibilityHidden(true)
+                }
+                Text(viewModel.serverProfileTitle)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if !usesIPadLayout {
+                    Text("·")
+                    Text(cloudexLocalized(viewModel.isConnected ? "已连接" : "未连接"))
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+            }
+            .font(.caption.weight(.semibold))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .frame(minHeight: 44)
+        }
+        .accessibilityLabel("切换服务器")
+        .accessibilityValue("\(viewModel.serverProfileTitle)，\(cloudexLocalized(viewModel.isConnected ? "已连接" : "未连接"))")
     }
 
     @ToolbarContentBuilder
@@ -850,10 +915,17 @@ struct CloudexRootView: View {
                 : "new-\(UUID().uuidString)"
             navigationPath.append(route)
         } label: {
-            Label("新对话", systemImage: "square.and.pencil")
+            HStack(spacing: 12) {
+                Image(systemName: "square.and.pencil")
+                    .font(.system(size: 20))
+                    .foregroundStyle(CloudexTheme.accent)
+                    .frame(width: 24)
+                Text("新对话")
+            }
                 .font(.subheadline.weight(.medium))
                 .foregroundStyle(.primary)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(minHeight: 44)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -888,29 +960,35 @@ struct CloudexRootView: View {
                         Image(systemName: "tray").font(.system(size: 18, weight: .medium))
                     } else {
                         Text(String(project.displayName.prefix(2)).uppercased())
-                            .font(.system(.subheadline, design: .rounded).weight(.semibold))
+                            .font(.system(size: 16, weight: .semibold, design: .rounded))
                     }
                 }
                 .foregroundStyle(expanded ? CloudexTheme.accent : .secondary)
                 .frame(width: 44, height: 44)
                 .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(project.displayName).font(.headline).foregroundStyle(.primary)
-                    Text(expanded ? "浏览项目对话" : "轻点展开对话")
-                        .font(.caption2).foregroundStyle(.secondary)
+                    Text(project.displayName)
+                        .font(.headline)
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                    if expanded {
+                        Text("浏览项目对话")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                 }
                 Spacer(minLength: 8)
                 Text("\(project.threads.count)")
                     .font(.caption.weight(.medium).monospacedDigit())
-                    .foregroundStyle(expanded ? CloudexTheme.accent : .secondary)
+                    .foregroundStyle(CloudexTheme.accent)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
                     .background(CloudexTheme.accent.opacity(0.055), in: Capsule())
                 Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                    .font(.caption.weight(.semibold))
+                    .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(Color.secondary)
             }
-            .padding(.vertical, 10)
+            .padding(.vertical, 4)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -1043,12 +1121,12 @@ struct CloudexRootView: View {
             GlassEffectContainer(spacing: 4) {
                 conversationSearchControls(useLiquidGlass: true)
             }
-            .padding(.horizontal, 24)
+            .padding(.horizontal, 20)
             .padding(.top, 10)
             .padding(.bottom, bottomControlPadding(isWindowedIPad: isWindowedIPad, bottomSafeArea: bottomSafeArea))
         } else {
             conversationSearchControls(useLiquidGlass: false)
-                .padding(.horizontal, 24)
+                .padding(.horizontal, 20)
                 .padding(.top, 10)
                 .padding(.bottom, bottomControlPadding(isWindowedIPad: isWindowedIPad, bottomSafeArea: bottomSafeArea))
         }
@@ -1073,9 +1151,12 @@ struct CloudexRootView: View {
         HStack(spacing: 8) {
             HStack(spacing: 10) {
                 Image(systemName: "magnifyingglass")
+                    .font(.system(size: 19))
                     .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
 
-                TextField(cloudexLocalized("搜索对话"), text: $searchQuery)
+                TextField(cloudexLocalized("搜索对话"), text: $searchQuery,
+                          prompt: Text(cloudexLocalized("搜索对话")).foregroundStyle(Color(uiColor: .secondaryLabel)))
                     .focused($searchFieldFocused)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
@@ -1094,8 +1175,9 @@ struct CloudexRootView: View {
                 }
             }
             .padding(.horizontal, 16)
+            .padding(.vertical, 12)
             .frame(maxWidth: .infinity)
-            .frame(height: 52)
+            .frame(minHeight: 52)
             .contentShape(Capsule())
             .modifier(SearchFieldSurface(useLiquidGlass: useLiquidGlass))
 
@@ -1628,13 +1710,13 @@ private struct ThreadRow: View, Equatable {
     let thread: CloudexThread
 
     var body: some View {
-        HStack(alignment: .top, spacing: 11) {
-            RoundedRectangle(cornerRadius: 2)
-                .fill(thread.isActive ? CloudexTheme.accent : CloudexTheme.line.opacity(0.6))
-                .frame(width: 3, height: 28)
-                .padding(.top, 3)
+        HStack(spacing: 12) {
+            Image(systemName: thread.isActive ? "arrow.triangle.2.circlepath" : "doc.text")
+                .font(.system(size: 20))
+                .foregroundStyle(CloudexTheme.accent)
+                .frame(width: 24, height: 28)
                 .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 4) {
             Text(thread.title)
                 .font(.subheadline.weight(.medium))
                 .foregroundStyle(.primary)
@@ -1646,16 +1728,16 @@ private struct ThreadRow: View, Equatable {
                 }
                 Text(DateFormatting.string(from: thread.updatedAt))
             }
-            .font(.caption2)
+            .font(.caption)
             .foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
             Image(systemName: "chevron.right")
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(.tertiary)
-                .padding(.top, 5)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
                 .accessibilityHidden(true)
         }
-        .padding(.vertical, 7)
+        .padding(.vertical, 4)
+        .frame(minHeight: 44)
     }
 }

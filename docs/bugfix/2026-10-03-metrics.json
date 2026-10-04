@@ -1,0 +1,433 @@
+{
+  "before": {
+    "scope": "Read-only runtime diagnosis before current fixes; no source edits, runtime restarts, real conversation writes, or model turns",
+    "versions": {
+      "standaloneCli": "0.160.0",
+      "managedDaemon": "0.160.0",
+      "desktop": "26.924.22138",
+      "desktopBuild": "11645",
+      "desktopBundledCli": "0.158.0-alpha.2.1",
+      "controllerPackage": "0.1.0",
+      "node": "v24.21.0"
+    },
+    "runtime": {
+      "controllerPid": 10705,
+      "controllerStartedLocal": "2026-10-03 02:55:18",
+      "bridgePid": 1183,
+      "daemonPid": 5823,
+      "desktopPid": 12678,
+      "desktopSharedBridgeConnected": true,
+      "codexConnected": true,
+      "historySource": "cli-local",
+      "loadedThreads": 7,
+      "physicalPhoneState": "unavailable",
+      "lastDocumentedPhoneInstalledBuild": 8,
+      "latestPackagedPhoneBuild": 9
+    },
+    "historyMetadata": {
+      "rolloutFiles": 141,
+      "totalMiB": 1264.1,
+      "visibleProjects": 8,
+      "visibleThreads": 37,
+      "visibleActiveThreads": 1,
+      "largestVisibleSourceMiB": [
+        209.46,
+        122.58,
+        89.28,
+        14.33,
+        11.37,
+        6.92
+      ]
+    },
+    "smallRequests": [
+      {
+        "network": "loopback",
+        "operation": "health",
+        "status": 200,
+        "ttfbMs": 4,
+        "totalMs": 5,
+        "bytes": 421
+      },
+      {
+        "network": "loopback",
+        "operation": "projects",
+        "status": 200,
+        "ttfbMs": 6,
+        "totalMs": 7,
+        "bytes": 56071
+      },
+      {
+        "network": "loopback",
+        "operation": "compact-three-turns-small-thread",
+        "status": 200,
+        "ttfbMs": 18,
+        "totalMs": 18,
+        "bytes": 5757
+      },
+      {
+        "network": "loopback",
+        "operation": "models",
+        "status": 200,
+        "ttfbMs": 2,
+        "totalMs": 3,
+        "bytes": 13846
+      },
+      {
+        "network": "public-tunnel",
+        "operation": "health",
+        "status": 200,
+        "ttfbMs": 884,
+        "totalMs": 886,
+        "bytes": 421
+      },
+      {
+        "network": "public-tunnel",
+        "operation": "projects",
+        "status": 200,
+        "ttfbMs": 828,
+        "totalMs": 1121,
+        "bytes": 56071
+      },
+      {
+        "network": "public-tunnel",
+        "operation": "compact-three-turns-small-thread",
+        "status": 200,
+        "ttfbMs": 509,
+        "totalMs": 520,
+        "bytes": 5757
+      },
+      {
+        "network": "public-tunnel",
+        "operation": "models",
+        "status": 200,
+        "ttfbMs": 645,
+        "totalMs": 671,
+        "bytes": 13846
+      }
+    ],
+    "largeRequests": [
+      {
+        "network": "loopback",
+        "sourceMiB": 209.46,
+        "cache": "cold",
+        "limit": 3,
+        "status": 200,
+        "ttfbMs": 579,
+        "totalMs": 588,
+        "bytes": 2801574,
+        "turns": 3,
+        "items": 15
+      },
+      {
+        "network": "loopback",
+        "sourceMiB": 209.46,
+        "cache": "warm",
+        "limit": 3,
+        "status": 200,
+        "ttfbMs": 13,
+        "totalMs": 19,
+        "bytes": 2801574,
+        "turns": 3,
+        "items": 15
+      },
+      {
+        "network": "loopback",
+        "sourceMiB": 122.58,
+        "cache": "cold",
+        "limit": 3,
+        "status": 200,
+        "ttfbMs": 412,
+        "totalMs": 455,
+        "bytes": 16603813,
+        "turns": 3,
+        "items": 66
+      },
+      {
+        "network": "loopback",
+        "sourceMiB": 209.46,
+        "cache": "after-opening-second-large-thread",
+        "limit": 3,
+        "status": 200,
+        "ttfbMs": 498,
+        "totalMs": 503,
+        "bytes": 2801574,
+        "turns": 3,
+        "items": 15
+      },
+      {
+        "network": "public-tunnel",
+        "sourceMiB": 122.58,
+        "limit": 3,
+        "status": 200,
+        "ttfbMs": 1235,
+        "totalMs": 4257,
+        "bytes": 16603813
+      }
+    ],
+    "largeCompactComposition": {
+      "userMessages": 4,
+      "imageArtifacts": 59,
+      "agentMessages": 3,
+      "inlineImageAttachments": 59,
+      "inlineImageCharacters": 16587782
+    },
+    "sseObservation": {
+      "durationMs": 26009,
+      "loopbackHeadersMs": 6,
+      "publicHeadersMs": 798,
+      "publicFirstDataMs": 799,
+      "loopbackNotifications": 96,
+      "publicNotifications": 96,
+      "publicSnapshotDelayMs": [
+        257,
+        238,
+        229,
+        202
+      ],
+      "snapshotReasons": [
+        "poll"
+      ],
+      "keepaliveObservedBothPaths": true
+    },
+    "subscriptionObservation": {
+      "durationMs": 26009,
+      "freshWebSocketInitialized": true,
+      "freshWebSocketThreadNotifications": 0,
+      "freshWebSocketOtherNotifications": {
+        "remoteControl/status/changed": 1
+      },
+      "existingControllerSseThreadStreams": 3,
+      "existingControllerSseReasoningDeltas": 78,
+      "schemaReadonlyThreadObserverMethod": false,
+      "schemaThreadResumeMethod": true,
+      "schemaThreadUnsubscribeMethod": true,
+      "schemaDirectories": [
+        "/private/tmp/cloudex-runtime-schema-0160",
+        "/private/tmp/cloudex-runtime-schema-desktop-0158"
+      ]
+    },
+    "watchObservation": {
+      "durationMs": 18023,
+      "rolloutFilesChanged": 3,
+      "byteGrowth": [
+        5638,
+        15653,
+        5207
+      ],
+      "recursiveWatchEvents": 0,
+      "recursiveWatchErrors": [],
+      "isolatedTemporaryRecursiveWatchEvents": 4,
+      "isolatedTemporaryRecursiveWatchErrors": []
+    },
+    "limitations": [
+      "Single-run timings, not latency percentiles or iPhone measurements",
+      "Public HTTPS diagnostic used the existing endpoint with certificate verification disabled, matching a diagnostic trust exception; phone TLS and network behavior unverified",
+      "No thread/resume calls or thread ownership changes were used",
+      "Fresh initialized WebSocket does not receive arbitrary active-thread events; existing controller SSE may reflect prior controller subscriptions",
+      "Watcher observation isolates missing events on actual session tree but does not establish underlying filesystem/native-watcher cause",
+      "Large-history GET probes affect in-memory cache state only; no user data modified"
+    ]
+  },
+  "offlineAfter": {
+    "scope": "Offline updated-code benchmark; no production listener or runtime reload",
+    "generatedAt": "2026-10-03T08:35:18.193Z",
+    "results": [
+      {
+        "kind": "offlineAfterCompact",
+        "rank": 1,
+        "threadHash": "a8b77852",
+        "sourceMiB": 209.46,
+        "groupSourceMiB": 278.93,
+        "rolloutFilesForThread": 2,
+        "status": 200,
+        "totalMs": 543,
+        "bytes": 6842,
+        "turns": 3,
+        "items": 15
+      },
+      {
+        "kind": "offlineAfterCompact",
+        "rank": 1,
+        "threadHash": "a8b77852",
+        "sourceMiB": 209.46,
+        "groupSourceMiB": 278.93,
+        "rolloutFilesForThread": 2,
+        "status": 200,
+        "totalMs": 7,
+        "bytes": 6842,
+        "turns": 3,
+        "items": 15
+      },
+      {
+        "kind": "offlineAfterCompact",
+        "rank": 2,
+        "threadHash": "1cf09008",
+        "sourceMiB": 122.58,
+        "groupSourceMiB": 154.18,
+        "rolloutFilesForThread": 3,
+        "status": 200,
+        "totalMs": 375,
+        "bytes": 23748,
+        "turns": 3,
+        "items": 66
+      },
+      {
+        "kind": "offlineAfterCompact",
+        "rank": 1,
+        "threadHash": "a8b77852",
+        "sourceMiB": 209.46,
+        "groupSourceMiB": 278.93,
+        "rolloutFilesForThread": 2,
+        "status": 200,
+        "totalMs": 19,
+        "bytes": 6842,
+        "turns": 3,
+        "items": 15
+      },
+      {
+        "kind": "selectedHistoryNotificationFixture",
+        "fiveChangesCoalesced": true,
+        "deliveryMs": 103,
+        "selectedEvents": 1,
+        "unrelatedEvents": 0,
+        "upstreamRpc": "mocked-no-real-codex"
+      }
+    ],
+    "externalizedImagesVerified": 71,
+    "limitations": [
+      "Single-run process timings",
+      "Before measured production HTTP; after measured handle plus serialization without network",
+      "No after public-tunnel or iPhone performance measurement"
+    ],
+    "retainedDetailCacheBudgetMiB": 128,
+    "maxRetainedHistories": 4,
+    "beforeAlternatingReopenMs": 498,
+    "intermediate64MiBReopenMs": 519,
+    "controllerReloadReadOnlyAssessment": {
+      "pendingApprovals": 0,
+      "pendingInputs": 0,
+      "queueJournalExists": false,
+      "activeVisibleThreads": 1,
+      "activeCreationOriginatorCategory": "Desktop",
+      "desktopSharedBridgeConnected": true,
+      "phoneState": "unavailable",
+      "perTurnCloudexDirectOwnershipObservable": false,
+      "restartsPerformed": false
+    }
+  },
+  "productionAfter": {
+    "scope": "Read-only deployed backend/public validation; no user content, credentials, upstream model turns, resume, or restart",
+    "generatedAt": "2026-10-03T08:39:30.230Z",
+    "results": [
+      {
+        "kind": "deployedPublicLargeCompact",
+        "network": "public-tunnel",
+        "status": 200,
+        "ttfbMs": 1238,
+        "totalMs": 1386,
+        "bytes": 23217,
+        "turns": 3,
+        "items": 66,
+        "inlineImagePaths": 0
+      },
+      {
+        "kind": "selectedActiveInitialDetail",
+        "network": "loopback",
+        "status": 200,
+        "ttfbMs": 55,
+        "totalMs": 55,
+        "bytes": 40166,
+        "turns": 3
+      },
+      {
+        "kind": "deployedSelectedHistorySSE",
+        "durationMs": 14001,
+        "status": 200,
+        "headersMs": 3,
+        "firstDataMs": 3,
+        "eventCounts": {
+          "ready": 1,
+          "replay-start": 1,
+          "replay-complete": 1,
+          "read-only": 1,
+          "history/changed": 3
+        },
+        "historyEventCount": 3,
+        "fileGrowthCount": 5,
+        "fileGrowthEventPairs": [
+          {
+            "fileObservationMs": 4674,
+            "sourceBytes": 3272,
+            "followingHistoryEventMs": 4854,
+            "observationToEventMs": 180
+          },
+          {
+            "fileObservationMs": 5792,
+            "sourceBytes": 3820,
+            "followingHistoryEventMs": 5857,
+            "observationToEventMs": 65
+          },
+          {
+            "fileObservationMs": 5895,
+            "sourceBytes": 15194,
+            "followingHistoryEventMs": 5857,
+            "observationToEventMs": -38
+          },
+          {
+            "fileObservationMs": 5997,
+            "sourceBytes": 20546,
+            "followingHistoryEventMs": 6110,
+            "observationToEventMs": 113
+          },
+          {
+            "fileObservationMs": 6099,
+            "sourceBytes": 21254,
+            "followingHistoryEventMs": 6110,
+            "observationToEventMs": 11
+          }
+        ],
+        "initialDetailMs": 55
+      }
+    ],
+    "limitations": [
+      "Single-run network sample, not latency percentiles",
+      "Selected stream observes naturally occurring changes only",
+      "File observation uses100ms metadata sampling so precise writer-to-event latency is approximate",
+      "Public diagnostic used certificate verification exception; phone TLS path unverified"
+    ]
+  },
+  "subagentHierarchy11": {
+    "scope": "Read-only authenticated deployed hierarchy validation plus isolated fixtures; no real model turns or user conversation writes",
+    "live": {
+      "rootCount": 29,
+      "subagentCount": 16,
+      "agentStatusCounts": {
+        "completed": 16
+      },
+      "projectsMs": 9,
+      "flatChildCount": 0,
+      "detailTurns": 3
+    },
+    "tests": {
+      "serverPassed": 83,
+      "relatedIOSCasesWithPassRecords": 6,
+      "finalNavigationBundle": "/tmp/cloudex-build11-verified-ui.xcresult",
+      "finalNavigationPassed": 1,
+      "cacheUpgradePassed": 1
+    },
+    "delivery": {
+      "build": 11,
+      "sourceRevision": "working-20261003-subagents11",
+      "signedIPABytes": 8481776,
+      "installedPhoneBuild": 11,
+      "phoneLaunchSucceeded": true,
+      "phoneHierarchyFeatureInstalled": true,
+      "phoneFinalCacheUpgradeInstalled": false,
+      "finalInstallFailure": "CoreDevice error 4016; phone unavailable"
+    },
+    "limitations": [
+      "Single-run warmed loopback timings, not iPhone latency percentiles",
+      "Simulator fixture navigation verified; full physical touch/network stress acceptance not performed"
+    ]
+  }
+}

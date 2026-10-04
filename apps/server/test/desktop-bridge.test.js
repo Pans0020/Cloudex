@@ -8,9 +8,12 @@ import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 
-test("desktop bridge accepts only the paired local WebSocket and forwards frames", async () => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudex-desktop-bridge-"));
-  const upstreamPath = path.join(dir, "upstream.sock");
+for (const useCodexHome of [false, true]) {
+test(`desktop bridge authenticates and forwards using ${useCodexHome ? "CODEX_HOME" : "an explicit socket"}`, async () => {
+  // macOS Unix socket paths must stay below 104 bytes, including the filename.
+  const dir = await fs.mkdtemp(path.join(process.platform === "darwin" ? "/tmp" : os.tmpdir(), "cloudex-db-"));
+  const upstreamPath = useCodexHome ? path.join(dir, "app-server-control", "app-server-control.sock") : path.join(dir, "upstream.sock");
+  await fs.mkdir(path.dirname(upstreamPath), { recursive: true });
   const token = crypto.randomBytes(32).toString("base64url");
   await fs.writeFile(path.join(dir, "desktop-bridge-token"), token);
   const upstreamSockets = new Set();
@@ -41,7 +44,7 @@ test("desktop bridge accepts only the paired local WebSocket and forwards frames
   await new Promise((resolve) => reserve.close(resolve));
   const bridge = spawn(process.execPath, [new URL("../bin/desktop-bridge.js", import.meta.url).pathname], {
     cwd: dir,
-    env: { ...process.env, CLOUDEX_STATE_DIR: dir, CODEX_CONTROL_SOCKET: upstreamPath,
+    env: { ...process.env, CLOUDEX_STATE_DIR: dir, CODEX_HOME: dir, CODEX_CONTROL_SOCKET: useCodexHome ? "" : upstreamPath,
       CLOUDEX_DESKTOP_BRIDGE_PORT: String(port), CLOUDEX_BRIDGE_SETENV: "0" },
   });
   try {
@@ -63,7 +66,10 @@ test("desktop bridge accepts only the paired local WebSocket and forwards frames
     ws.close();
   } finally {
     bridge.kill("SIGTERM");
+    if (bridge.exitCode === null && bridge.signalCode === null) await once(bridge, "exit");
     for (const socket of upstreamSockets) socket.destroy();
-    upstream.close();
+    await new Promise(resolve => upstream.close(resolve));
+    await fs.rm(dir, { recursive: true, force: true });
   }
 });
+}

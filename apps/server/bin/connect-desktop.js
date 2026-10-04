@@ -55,7 +55,7 @@ async function isConnected() {
 
 if (mode === '--check') {
   const connected = await isConnected();
-  console.log(connected ? 'Desktop 已连接本机共享服务。' : 'Desktop 尚未连接共享服务；仅切换对话不会生效，需要完整重启 Desktop。');
+  console.log(connected ? 'Desktop 已连接本机共享服务。' : 'Desktop 尚未连接共享服务。结束 Desktop 中的任务后，在仓库根目录运行 node apps/server/bin/connect-desktop.js --restart 重新接入；仅切换对话不会生效。');
   process.exitCode = connected ? 0 : 2;
 } else {
   // Never force-kill: a failed/refused quit must not discard in-flight work.

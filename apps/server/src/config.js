@@ -3,7 +3,8 @@ import path from "node:path";
 import crypto from "node:crypto";
 import fs from "node:fs";
 
-const standaloneCodexBin = path.join(os.homedir(), ".codex", "packages", "standalone", "current", "bin", "codex");
+const codexHome = path.resolve(process.env.CODEX_HOME || path.join(os.homedir(), ".codex"));
+const standaloneCodexBin = path.join(codexHome, "packages", "standalone", "current", "bin", "codex");
 function codexFromPath() {
   const executable = process.platform === "win32" ? "codex.exe" : "codex";
   for (const directory of (process.env.PATH || "").split(path.delimiter)) {
@@ -96,6 +97,7 @@ export const config = {
   host,
   port: Number(process.env.PORT || 8890),
   authToken,
+  codexHome,
   codexBin: process.env.CODEX_BIN || defaultCodexBin,
   qwenBin: defaultQwenBin,
   claudeBin: defaultClaudeBin,
@@ -114,15 +116,15 @@ export const config = {
   claudeCommandArgs: process.env.CLAUDE_COMMAND_ARGS || "--print --output-format stream-json --verbose",
   claudeResumeArgs: process.env.CLAUDE_RESUME_ARGS || "--resume {sessionId}",
   codexConfigPath: process.env.CODEX_CONFIG_PATH
-    || path.join(os.homedir(), ".codex", "config.toml"),
+    || path.join(codexHome, "config.toml"),
   historySource: process.env.CLOUDEX_HISTORY_SOURCE || "cli-local",
   includeSubagents: process.env.CLOUDEX_INCLUDE_SUBAGENTS === "true",
   activeStaleSeconds: Number(process.env.CLOUDEX_ACTIVE_STALE_SECONDS || 4 * 60 * 60),
   codexSessionsDir: process.env.CODEX_SESSIONS_DIR
-    || path.join(os.homedir(), ".codex", "sessions"),
+    || path.join(codexHome, "sessions"),
   stateDir: process.env.CLOUDEX_STATE_DIR || path.join(process.cwd(), ".cloudex-state"),
   controlSocketPath: process.env.CODEX_CONTROL_SOCKET
-    || path.join(os.homedir(), ".codex", "app-server-control", "app-server-control.sock"),
+    || path.join(codexHome, "app-server-control", "app-server-control.sock"),
   fileRoots,
   defaultCwd: path.resolve(process.env.DEFAULT_CWD || process.cwd()),
   isLoopback: host === "127.0.0.1" || host === "localhost" || host === "::1",

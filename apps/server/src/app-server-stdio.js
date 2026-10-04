@@ -8,6 +8,21 @@ function protocolError(message, details = {}) {
   return error;
 }
 
+export async function listAllModels(request) {
+  const data = [];
+  const cursors = new Set();
+  let cursor;
+  let result;
+  do {
+    result = await request("model/list", { limit: 100, ...(cursor ? { cursor } : {}) });
+    data.push(...(result?.data || result?.models || []));
+    cursor = result?.nextCursor;
+    if (cursor && cursors.has(cursor)) throw protocolError("Codex model list repeated its pagination cursor");
+    if (cursor) cursors.add(cursor);
+  } while (cursor);
+  return { ...result, data, nextCursor: null };
+}
+
 export async function listModelsViaStdio({
   codexBin,
   commandArgs = ["app-server"],
@@ -24,9 +39,10 @@ export async function listModelsViaStdio({
   let nextRequestID = 1;
   let stdoutBuffer = "";
   let stderrBuffer = "";
-  let settled = false;
+  let terminalError;
 
   const rejectPending = (error) => {
+    terminalError ||= error;
     for (const { reject } of pending.values()) reject(error);
     pending.clear();
   };
@@ -39,7 +55,7 @@ export async function listModelsViaStdio({
     } catch {
       return;
     }
-    if (message.id === undefined || !pending.has(String(message.id))) return;
+    if (!message || typeof message !== "object" || message.id === undefined || message.method || !pending.has(String(message.id))) return;
     const request = pending.get(String(message.id));
     pending.delete(String(message.id));
     if (message.error) {
@@ -52,24 +68,28 @@ export async function listModelsViaStdio({
     }
   };
 
+  child.stdout.setEncoding("utf8");
   child.stdout.on("data", (chunk) => {
-    stdoutBuffer += chunk.toString();
+    stdoutBuffer += chunk;
     let newlineIndex;
     while ((newlineIndex = stdoutBuffer.indexOf("\n")) >= 0) {
       handleLine(stdoutBuffer.slice(0, newlineIndex));
       stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
     }
   });
+  child.stdout.on("end", () => { if (stdoutBuffer.trim()) handleLine(stdoutBuffer); });
+  child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk) => {
-    stderrBuffer += chunk.toString();
+    stderrBuffer = (stderrBuffer + chunk).slice(-16_384);
   });
+  child.stdin.on("error", (error) => rejectPending(error));
   child.on("error", (error) => rejectPending(error));
-  child.on("exit", (code, signal) => {
-    if (pending.size === 0) return;
+  child.on("close", (code, signal) => {
     rejectPending(protocolError(`Codex app-server exited (${code ?? signal})${stderrBuffer ? `: ${stderrBuffer.trim()}` : ""}`));
   });
 
   const request = (method, params) => new Promise((resolve, reject) => {
+    if (terminalError) return reject(terminalError);
     const id = nextRequestID;
     nextRequestID += 1;
     pending.set(String(id), { resolve, reject });
@@ -94,13 +114,10 @@ export async function listModelsViaStdio({
       },
     });
     child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "initialized", params: {} })}\n`);
-    return await request("model/list", { limit: 100 });
+    return await listAllModels(request);
   } finally {
     clearTimeout(timeout);
-    if (!settled) {
-      settled = true;
-      rejectPending(protocolError("Codex app-server model request closed"));
-      if (!child.killed) child.kill();
-    }
+    rejectPending(protocolError("Codex app-server model request closed"));
+    if (!child.killed) child.kill();
   }
 }

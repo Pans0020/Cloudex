@@ -37,7 +37,8 @@ await once(reserve, 'listening');
 const port = reserve.address().port;
 await new Promise(r => reserve.close(r));
 const token = crypto.randomBytes(32).toString('base64url');
-const url = `ws://127.0.0.1:${port}/${token}`;
+const listenURL = `ws://127.0.0.1:${port}`;
+const url = useBridge ? `${listenURL}/${token}` : listenURL;
 async function connect(name) {
   const ws = new WebSocket(url);
   await new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = () => reject(new Error('connect')); });
@@ -71,7 +72,7 @@ async function terminal(client, turnId) {
 try {
   await fs.mkdir(path.join(root, 'codex'));
   const unixPath = path.join(root, 'rpc.sock');
-  child = spawn(binary, ['-c', 'model_provider="probe"', '-c', 'model="probe"', '-c', `model_providers.probe={name="probe",base_url="http://127.0.0.1:${mock.address().port}/v1",wire_api="responses",requires_openai_auth=false}`, 'app-server', '--listen', useBridge ? `unix://${unixPath}` : url], {
+  child = spawn(binary, ['-c', 'model_provider="probe"', '-c', 'model="probe"', '-c', `model_providers.probe={name="probe",base_url="http://127.0.0.1:${mock.address().port}/v1",wire_api="responses",requires_openai_auth=false}`, 'app-server', '--listen', useBridge ? `unix://${unixPath}` : listenURL], {
     env: { ...process.env, CODEX_HOME: path.join(root, 'codex'), OPENAI_API_KEY: '', RUST_LOG: 'error' }, stdio: ['ignore', 'pipe', 'pipe']
   });
   let stderr = ''; child.stderr.on('data', d => { stderr += d; }); child.stdout.resume();

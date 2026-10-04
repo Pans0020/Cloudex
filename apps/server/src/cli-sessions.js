@@ -1,25 +1,40 @@
 import os from "node:os";
 import fs from "node:fs/promises";
+import { watch } from "node:fs";
 import path from "node:path";
 import { mediaAttachments } from "./media-attachments.js";
 import crypto from "node:crypto";
 import { config } from "./config.js";
+import { agentStatus, threadRelationship } from "./thread-hierarchy.js";
 
 const UUID_RE = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 const SESSION_FILE_RE = new RegExp(`^rollout-.*-(${UUID_RE})(?:_(${UUID_RE}))?\\.jsonl$`, "i");
 const ARCHIVE_FILE = path.join(config.stateDir, "archived-cli-threads.json");
-const SESSION_INDEX_FILE = path.join(os.homedir(), ".codex", "session_index.jsonl");
+const SESSION_INDEX_FILE = path.join(config.codexHome || path.join(os.homedir(), ".codex"), "session_index.jsonl");
+const ARCHIVED_SESSION_DIR = process.env.CODEX_ARCHIVED_SESSIONS_DIR || path.join(path.dirname(config.codexSessionsDir), "archived_sessions");
 const threadSummaryCache = new Map();
-let detailCache = null;
-let detailReadQueue = Promise.resolve();
+const detailCaches = new Map();
+const detailReads = new Map();
+const summaryReads = new Map();
+let sessionFileSnapshot = null;
+let sessionScan = null;
+let sessionInventoryVersion = 0;
+let sessionWatchCount = 0;
 let archiveWrite = Promise.resolve();
 let sessionIndexSignature = "";
 let sessionIndexNames = new Map();
+let sessionIndexRead = null;
 
 async function readSessionIndexNames() {
+  if (sessionIndexRead) return sessionIndexRead;
+  sessionIndexRead = loadSessionIndexNames().finally(() => { sessionIndexRead = null; });
+  return sessionIndexRead;
+}
+
+async function loadSessionIndexNames() {
   try {
     const stat = await fs.stat(SESSION_INDEX_FILE);
-    const signature = `${stat.mtimeMs}:${stat.size}`;
+    const signature = `${stat.dev}:${stat.ino}:${stat.ctimeMs}:${stat.mtimeMs}:${stat.size}`;
     if (signature === sessionIndexSignature) return sessionIndexNames;
 
     const names = new Map();
@@ -441,6 +456,10 @@ function parseSessionLine(state, record) {
     return;
   }
   if (record.type === "session_meta") {
+    // fork_turns=all copies the ancestor's session_meta after the new child's
+    // own metadata. Its messages remain history, but its identity is not ours.
+    if (payload.id && state.id && payload.id !== state.id) return;
+    state.identityCreatedAt ||= createdAt;
     state.sessionId = payload.session_id || payload.id || state.sessionId || state.id;
     state.cwd = payload.cwd || state.cwd;
     state.name = threadNameFromPayload(payload) || state.name;
@@ -449,6 +468,7 @@ function parseSessionLine(state, record) {
     state.modelProvider = payload.model_provider || payload.modelProvider || state.modelProvider;
     state.historyMode = payload.history_mode || payload.historyMode || state.historyMode;
     state.threadSource = payload.thread_source || payload.threadSource || state.threadSource;
+    Object.assign(state, threadRelationship({ ...payload, source: state.source, threadSource: state.threadSource }));
     return;
   }
 
@@ -457,6 +477,10 @@ function parseSessionLine(state, record) {
     const turn = getOrCreateTurn(state, turnId, timestamp);
     state.cwd = payload.cwd || state.cwd;
     turn.startedAt ||= timestamp;
+    if (!state.isSubagent || createdAt >= state.identityCreatedAt) {
+      state.agentLastTurnId = turn.id;
+      state.agentStatusUpdatedAt = createdAt;
+    }
     return;
   }
 
@@ -605,6 +629,17 @@ function parseSessionLine(state, record) {
   state.name = threadNameFromPayload(payload) || state.name;
   if (payload.type === "item_completed") {
     const completed = payload.item || {};
+    if (["SubAgentActivity", "subAgentActivity", "CollabAgentToolCall", "collabAgentToolCall"].includes(completed.type)) {
+      state.subagentStates ||= {};
+      const childId = completed.agent_thread_id || completed.agentThreadId;
+      if (childId && ["started", "completed"].includes(completed.kind)) {
+        state.subagentStates[childId] = { status: agentStatus(completed.kind), updatedAt: createdAt, evidence: "activity" };
+      }
+      for (const [id, value] of Object.entries(completed.agents_states || completed.agentsStates || {})) {
+        state.subagentStates[id] = { status: agentStatus(value.status), updatedAt: createdAt };
+      }
+      return;
+    }
     const attachments = mediaAttachments(completed);
     if (attachments.length) {
       const turn = getOrCreateTurn(state, payload.turn_id, timestamp);
@@ -655,6 +690,10 @@ function parseSessionLine(state, record) {
   }
   if (payload.type === "task_started") {
     const turn = getOrCreateTurn(state, payload.turn_id, timestampSeconds(payload.started_at) || timestamp);
+    if (!state.isSubagent || createdAt >= state.identityCreatedAt) {
+      state.agentLastTurnId = turn.id;
+      state.agentStatusUpdatedAt = createdAt;
+    }
     turn.status = "inProgress";
     turn.startedAt = timestampSeconds(payload.started_at) || turn.startedAt || timestamp;
     turn.completedAt = null;
@@ -663,6 +702,10 @@ function parseSessionLine(state, record) {
   }
   if (payload.type === "task_complete") {
     const turn = getOrCreateTurn(state, payload.turn_id, timestampSeconds(payload.started_at) || timestamp);
+    if (!state.isSubagent || createdAt >= state.identityCreatedAt) {
+      state.agentLastTurnId = turn.id;
+      state.agentStatusUpdatedAt = timestampPrecise(payload.completed_at) || createdAt;
+    }
     turn.completedAt = timestampSeconds(payload.completed_at) || timestamp;
     turn.durationMs = payload.duration_ms ?? turn.durationMs;
     turn.error = errorFromPayload(payload.error);
@@ -680,6 +723,10 @@ function parseSessionLine(state, record) {
   }
   if (payload.type === "turn_aborted") {
     const turn = getOrCreateTurn(state, payload.turn_id, timestampSeconds(payload.started_at) || timestamp);
+    if (!state.isSubagent || createdAt >= state.identityCreatedAt) {
+      state.agentLastTurnId = turn.id;
+      state.agentStatusUpdatedAt = timestampPrecise(payload.completed_at) || createdAt;
+    }
     turn.completedAt = timestampSeconds(payload.completed_at) || timestamp;
     turn.durationMs = payload.duration_ms ?? turn.durationMs;
     turn.status = "interrupted";
@@ -718,6 +765,18 @@ export function isContinuationPath(filePath) {
 }
 
 export async function findSessionFiles(root = config.codexSessionsDir) {
+  const cached = root === config.codexSessionsDir && sessionWatchCount > 0;
+  if (cached && sessionFileSnapshot?.version === sessionInventoryVersion
+    && Date.now() - sessionFileSnapshot.scannedAt < 1000) return [...sessionFileSnapshot.files];
+  if (root === config.codexSessionsDir && sessionScan) return sessionScan;
+  const scanning = scanSessionFiles(root);
+  if (root !== config.codexSessionsDir) return scanning;
+  sessionScan = scanning.finally(() => { sessionScan = null; });
+  return sessionScan;
+}
+
+async function scanSessionFiles(root) {
+  const version = sessionInventoryVersion;
   const results = [];
   async function walk(dir) {
     let entries = [];
@@ -728,40 +787,134 @@ export async function findSessionFiles(root = config.codexSessionsDir) {
       if (entry.isFile() && entry.name.endsWith(".jsonl") && threadIdFromPath(fullPath)) results.push(fullPath);
     }));
   }
-  await walk(root);
+  await Promise.all([walk(root), ...(root === config.codexSessionsDir ? [walk(ARCHIVED_SESSION_DIR)] : [])]);
+  if (root === config.codexSessionsDir) {
+    const byId = new Map();
+    for (const file of results) {
+      const id = threadIdFromPath(file);
+      if (!byId.has(id)) byId.set(id, []);
+      byId.get(id).push(file);
+    }
+    sessionFileSnapshot = { version, scannedAt: Date.now(), files: new Set(results), byId };
+  }
   return results;
 }
 
 export async function readCliThread(filePath, { includeTurns = true } = {}) {
-  const files = (Array.isArray(filePath) ? filePath : [filePath]).sort();
-  if (!includeTurns) return readCliThreadUnqueued(files, false);
-  const reading = detailReadQueue.then(() => readCliThreadUnqueued(files, true));
-  detailReadQueue = reading.catch(() => {});
+  const files = [...(Array.isArray(filePath) ? filePath : [filePath])]
+    .sort((left, right) => path.basename(left).localeCompare(path.basename(right)) || left.localeCompare(right));
+  const reads = includeTurns ? detailReads : summaryReads;
+  const key = files[0];
+  const signature = files.join("\n");
+  const previous = reads.get(key);
+  if (previous?.signature === signature) return previous.reading;
+  const reading = (previous?.reading.catch(() => {}) || Promise.resolve())
+    .then(() => readCliThreadUnqueued(files, includeTurns))
+    .finally(() => { if (reads.get(key)?.reading === reading) reads.delete(key); });
+  reads.set(key, { signature, reading });
   return reading;
 }
 
-async function parseSessionFile(state, filePath, stat, start) {
-  const bytes = Buffer.allocUnsafe(stat.size - start);
+function parseSummaryLine(state, record) {
+  const payload = record?.payload || {};
+  if (record?.type === "response_item") {
+    if (payload.type !== "message") return;
+    if (payload.role === "user" && state.userPreview) return;
+    if (payload.role === "assistant" && (state.userPreview || state.agentPreview)) return;
+  } else if (record?.type === "event_msg") {
+    if (payload.type === "item_completed" && !["SubAgentActivity", "subAgentActivity", "CollabAgentToolCall", "collabAgentToolCall"].includes(payload.item?.type)) return;
+    if (payload.type === "user_message" && state.userPreview) return;
+    if (payload.type === "agent_message" && (state.userPreview || state.agentPreview)) return;
+  }
+  parseSessionLine(state, record);
+  const turn = state.turnMap.get(state.currentTurnId);
+  for (const item of turn?.items || []) {
+    if (item.type === "userMessage") state.userPreview ||= textFromContent(item.content).trim().slice(0, 180);
+    if (item.type === "agentMessage") state.agentPreview ||= item.text?.slice(0, 180);
+  }
+  // Lists need metadata and lifecycle state, not retained tool output or message bodies.
+  if (turn) turn.items = [];
+}
+
+// Only skip headers whose canonical structure is already complete. Unusual key
+// orders and message records still go through JSON.parse below.
+function skipSummaryRecord(bytes) {
+  const header = bytes.subarray(0, 1024).toString("utf8").match(
+    /^\s*\{\s*"timestamp"\s*:\s*"(?:\\.|[^"\\])*"\s*,\s*"type"\s*:\s*"([^"\\]*)"\s*,\s*"payload"\s*:\s*\{\s*"type"\s*:\s*"([^"\\]*)"/);
+  return header?.[1] === "response_item" && header[2] !== "message"
+    || header?.[1] === "event_msg" && header[2] === "item_completed"
+      && !/"item"\s*:\s*\{\s*"type"\s*:\s*"(?:SubAgentActivity|subAgentActivity|CollabAgentToolCall|collabAgentToolCall)"/.test(bytes.subarray(0, 1024).toString("utf8"));
+}
+
+async function appendMatches(filePath, previous) {
+  // ponytail: sample the original header and append boundary. Detect arbitrary
+  // edits in the middle only if the writer supplies a revision or an index.
   const handle = await fs.open(filePath, "r");
   try {
-    let read = 0;
-    while (read < bytes.length) {
-      const result = await handle.read(bytes, read, bytes.length - read, start + read);
-      if (result.bytesRead === 0) break;
-      read += result.bytesRead;
+    for (const [position, expected] of [[0, previous.head], [previous.position - previous.tail.length, previous.tail]]) {
+      const actual = Buffer.allocUnsafe(expected.length);
+      const { bytesRead } = await handle.read(actual, 0, actual.length, position);
+      if (bytesRead !== actual.length || !actual.equals(expected)) return false;
     }
-    let offset = start;
-    for (const line of bytes.subarray(0, read).toString("utf8").split(/(?<=\n)/)) {
-      if (!line) continue;
-      const record = safeJson(line);
-      if (record) {
-        parseSessionLine(state, record);
-        offset += Buffer.byteLength(line);
-      } else if (line.endsWith("\n")) {
-        offset += Buffer.byteLength(line);
+    return true;
+  } finally { await handle.close(); }
+}
+
+async function parseSessionFile(state, filePath, stat, previous, includeTurns) {
+  const start = previous?.position || 0;
+  const bytes = Buffer.allocUnsafe(Math.min(256 * 1024, Math.max(1, stat.size - start)));
+  const handle = await fs.open(filePath, "r");
+  try {
+    let position = start;
+    let offset = previous?.offset || 0;
+    let fragments = previous?.fragments || [];
+    let fragmentBytes = previous?.fragmentBytes || 0;
+    let skipping = previous?.skipping || false;
+    let head = previous?.head;
+    let tail = previous?.tail;
+    const parse = includeTurns ? parseSessionLine : parseSummaryLine;
+    while (position < stat.size) {
+      const result = await handle.read(bytes, 0, Math.min(bytes.length, stat.size - position), position);
+      if (result.bytesRead === 0) break;
+      position += result.bytesRead;
+      const chunk = bytes.subarray(0, result.bytesRead);
+      head ||= Buffer.from(chunk.subarray(0, 4096));
+      tail = Buffer.from(chunk.subarray(Math.max(0, chunk.length - 256)));
+      let from = 0;
+      let newline;
+      while ((newline = chunk.indexOf(10, from)) >= 0) {
+        const end = chunk.subarray(from, newline);
+        if (!skipping && (includeTurns || fragments.length || !skipSummaryRecord(end))) {
+          const line = fragments.length ? Buffer.concat([...fragments, end], fragmentBytes + end.length) : end;
+          parse(state, safeJson(line.toString("utf8")));
+        }
+        offset = position - chunk.length + newline + 1;
+        fragments = [];
+        fragmentBytes = 0;
+        skipping = false;
+        from = newline + 1;
+      }
+      if (from < chunk.length) {
+        if (!includeTurns && !fragmentBytes && !skipping) skipping = skipSummaryRecord(chunk.subarray(from));
+        if (!skipping) {
+          fragments.push(Buffer.from(chunk.subarray(from)));
+          fragmentBytes += chunk.length - from;
+        }
       }
     }
-    return offset;
+    // Some complete rollouts omit the final newline. A partial JSON record
+    // (including a split UTF-8 character) stays uncommitted until the next read.
+    if (fragmentBytes && /}\s*$/.test(fragments.at(-1).toString("utf8"))) {
+      const record = safeJson(Buffer.concat(fragments, fragmentBytes).toString("utf8"));
+      if (record) {
+        parse(state, record);
+        offset = position;
+        fragments = [];
+        fragmentBytes = 0;
+      }
+    }
+    return { offset, position, fragments, fragmentBytes, skipping,
+      head: head || Buffer.alloc(0), tail: tail || Buffer.alloc(0) };
   } finally {
     await handle.close();
   }
@@ -773,22 +926,21 @@ async function readCliThreadUnqueued(files, includeTurns) {
     filePath, stat: await fs.stat(filePath),
   })));
   const latest = fileStats.at(-1);
+  const indexedNames = await readSessionIndexNames();
   const updatedAt = Math.max(...fileStats.map(({ stat }) => stat.mtimeMs / 1000));
-  const cacheKey = fileStats.map(({ filePath, stat }) => `${filePath}:${stat.mtimeMs}:${stat.size}`).join("|");
-  const syncRevision = fileStats.map(({ stat }) => `${stat.mtimeMs}:${stat.size}`).join("|");
-  if (!includeTurns) {
-    const cached = threadSummaryCache.get(files[0]);
-    if (cached?.key === cacheKey) return { thread: cached.thread, turns: [] };
-  }
-  // ponytail: Codex rollouts grow by append; rewriting a longer file in place requires a fresh parse.
-  const reusable = includeTurns && detailCache?.files.length === files.length
-    && fileStats.every(({ filePath, stat }, index) => {
-      const cached = detailCache.files[index];
+  const syncRevision = fileStats.map(({ stat }) => `${stat.dev}:${stat.ino}:${stat.ctimeMs}:${stat.mtimeMs}:${stat.size}`).join("|");
+  const detailCache = (includeTurns ? detailCaches : threadSummaryCache).get(files[0]);
+  let reusable = detailCache?.files.length <= files.length
+    && detailCache.files.every((cached, index) => {
+      const { filePath, stat } = fileStats[index];
       return cached.filePath === filePath && cached.ino === stat.ino && cached.dev === stat.dev
-        && (index === files.length - 1
-          ? stat.size > cached.size || (stat.size === cached.size && stat.mtimeMs === cached.mtimeMs)
-          : stat.size === cached.size && stat.mtimeMs === cached.mtimeMs);
+        && (index === detailCache.files.length - 1 && stat.size > cached.size
+          || stat.size === cached.size && stat.mtimeMs === cached.mtimeMs && stat.ctimeMs === cached.ctimeMs);
     });
+  if (reusable) {
+    const growing = fileStats.find(({ stat }, index) => detailCache.files[index] && stat.size > detailCache.files[index].size);
+    if (growing) reusable = await appendMatches(growing.filePath, detailCache.files[fileStats.indexOf(growing)]);
+  }
   const state = reusable ? detailCache.state : {
     id: idFromPath,
     cwd: null,
@@ -811,25 +963,39 @@ async function readCliThreadUnqueued(files, includeTurns) {
   const cachedFiles = [];
   for (const [index, { filePath, stat }] of fileStats.entries()) {
     const previous = reusable ? detailCache.files[index] : null;
-    const start = previous?.offset || 0;
-    const offset = !previous || stat.size > previous.size
-      ? await parseSessionFile(state, filePath, stat, start)
-      : start;
-    cachedFiles.push({ filePath, ino: stat.ino, dev: stat.dev,
-      size: stat.size, mtimeMs: stat.mtimeMs, offset });
+    const parsed = !previous || stat.size > previous.size
+      ? await parseSessionFile(state, filePath, stat, previous, includeTurns)
+      : previous;
+    cachedFiles.push({ ...parsed, filePath, ino: stat.ino, dev: stat.dev,
+      size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs });
   }
-  if (includeTurns) detailCache = { files: cachedFiles, state };
-  const indexedName = (await readSessionIndexNames()).get(state.id);
-  if (indexedName) state.name = indexedName;
+  const cache = includeTurns ? detailCaches : threadSummaryCache;
+  cache.delete(files[0]);
+  const unchanged = reusable && cachedFiles.every((file, index) => file.size === detailCache.files[index]?.size);
+  const retainedBytes = includeTurns ? unchanged ? detailCache.retainedBytes
+    : historyBytes(state.turns) + state.toolCallMap.size * 128 + cachedFiles.reduce((sum, file) => sum + file.fragmentBytes, 0) : 0;
+  cache.set(files[0], { files: cachedFiles, state, retainedBytes });
+  if (includeTurns) {
+    // ponytail: four histories / about 128 MiB of retained items, keeping at least the
+    // current history so a large active thread still gets incremental reads.
+    // Use an indexed store if one parsed history becomes too large for memory.
+    let bytes = [...cache.values()].reduce((sum, entry) => sum + entry.retainedBytes, 0);
+    while (cache.size > 1 && (cache.size > 4 || bytes > 128 * 1024 * 1024)) {
+      const key = cache.keys().next().value;
+      bytes -= cache.get(key).retainedBytes;
+      cache.delete(key);
+    }
+  }
   const createdAt = state.createdAt || fileStats[0].stat.birthtimeMs / 1000 || state.updatedAt;
   const recencyAt = Math.max(state.updatedAt || 0, updatedAt);
+  const activityTurns = state.isSubagent ? state.agentLastTurnId ? [state.turnMap.get(state.agentLastTurnId)] : [] : state.turns;
   const thread = {
     id: state.id,
     extra: null,
     sessionId: state.sessionId || state.id,
     forkedFromId: null,
-    parentThreadId: null,
-    preview: previewFromTurns(state.turns),
+    parentThreadId: state.parentThreadId || null,
+    preview: includeTurns ? previewFromTurns(state.turns) : state.userPreview || state.agentPreview || "未命名对话",
     ephemeral: false,
     isPinned: false,
     historyMode: state.historyMode,
@@ -839,22 +1005,36 @@ async function readCliThreadUnqueued(files, includeTurns) {
     updatedAt: recencyAt,
     syncRevision,
     recencyAt,
-    status: statusFromTurns(state.turns, recencyAt),
+    status: statusFromTurns(activityTurns, recencyAt),
     path: latest.filePath,
     cwd: state.cwd || "未指定项目目录",
     cliVersion: state.cliVersion,
     source: state.source || "codex-cli",
-    canAcceptDirectInput: true,
+    canAcceptDirectInput: !state.isSubagent,
     threadSource: state.threadSource || "cli-local",
-    agentNickname: null,
-    agentRole: null,
+    agentNickname: state.agentNickname || null,
+    agentRole: state.agentRole || null,
+    agentPath: state.agentPath || null,
+    ...(state.isSubagent ? {
+      agentStatus: activityTurns.at(-1)?.status === "inProgress"
+        ? statusFromTurns(activityTurns, recencyAt).type === "active" ? "active" : "unknown"
+        : activityTurns.length ? agentStatus(activityTurns.at(-1).status) : "pending",
+      _agentStatusUpdatedAt: state.agentStatusUpdatedAt || state.updatedAt || createdAt,
+    } : {}),
+    _subagentStates: state.subagentStates || {},
+    _statusFromHistory: true,
     gitInfo: null,
-    name: state.name || null,
+    name: indexedNames.get(state.id) || state.name || null,
     usage: state.usage,
     ...(includeTurns ? { turns: state.turns } : {}),
   };
-  if (!includeTurns) threadSummaryCache.set(files[0], { key: cacheKey, thread });
   return { thread, turns: includeTurns ? state.turns : [] };
+}
+
+function historyBytes(value) {
+  if (typeof value === "string") return value.length * 2;
+  if (!value || typeof value !== "object") return 0;
+  return 64 + Object.values(value).reduce((bytes, child) => bytes + historyBytes(child), 0);
 }
 
 export async function readArchiveSet() {
@@ -892,22 +1072,144 @@ export async function archiveCliThread(threadId) {
   return operation;
 }
 
-export async function listCliThreads({ archived = false } = {}) {
+export async function listCliThreads({ archived = false, includeSubagents = config.includeSubagents, includeArchivedSubagents = false } = {}) {
   const archiveSet = await readArchiveSet();
   const files = await findSessionFiles();
+  for (const file of files) {
+    const relative = path.relative(ARCHIVED_SESSION_DIR, file);
+    if (relative && !relative.startsWith("..") && !path.isAbsolute(relative)) archiveSet.add(threadIdFromPath(file));
+  }
   const groups = new Map();
   for (const file of files) {
     const id = threadIdFromPath(file);
     if (!groups.has(id)) groups.set(id, []);
     groups.get(id).push(file);
   }
-  const settled = await Promise.allSettled([...groups.values()].map((group) => readCliThread(group, { includeTurns: false })));
+  const presentFiles = new Set(files);
+  for (const key of threadSummaryCache.keys()) if (!presentFiles.has(key)) threadSummaryCache.delete(key);
+  const groupedFiles = [...groups.entries()]
+    .filter(([id]) => archived === null || includeArchivedSubagents || (archived ? archiveSet.has(id) : !archiveSet.has(id)))
+    .map(([, group]) => group);
+  const settled = [];
+  // Bound concurrent buffers when histories contain large inline images.
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(4, groupedFiles.length) }, async () => {
+    while (next < groupedFiles.length) {
+      const group = groupedFiles[next++];
+      const [result] = await Promise.allSettled([readCliThread(group, { includeTurns: false })]);
+      settled.push(result);
+    }
+  }));
   return settled
     .filter((item) => item.status === "fulfilled")
     .map((item) => item.value.thread)
-    .filter((thread) => config.includeSubagents || thread.threadSource !== "subagent")
-    .filter((thread) => archived ? archiveSet.has(thread.id) : !archiveSet.has(thread.id))
+    .filter((thread) => includeSubagents || !threadRelationship(thread).isSubagent)
+    .filter((thread) => archived === null || includeArchivedSubagents && threadRelationship(thread).isSubagent || (archived ? archiveSet.has(thread.id) : !archiveSet.has(thread.id)))
     .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+}
+
+export function watchCliSessions(onChange, { getObservedThreadIds = () => [] } = {}) {
+  const watchers = new Map();
+  const sessionDir = path.resolve(config.codexSessionsDir);
+  let stopped = false;
+  const changed = (event, candidate) => {
+    if (!candidate || event === "rename" || !sessionFileSnapshot?.files.has(candidate)) sessionInventoryVersion += 1;
+    onChange(candidate);
+  };
+  function attach(directory, recursive, listener) {
+    try {
+      const watcher = watch(directory, { recursive, persistent: false }, (event, filename) => {
+        listener(event, filename ? path.join(directory, String(filename)) : null);
+      });
+      watchers.set(watcher, recursive && directory === sessionDir);
+      if (watchers.get(watcher)) sessionWatchCount += 1;
+      watcher.on("error", () => { close(watcher); changed("rename", null); });
+      return watcher;
+    } catch { return null; }
+  }
+  function close(watcher) {
+    if (!watchers.has(watcher)) return;
+    if (watchers.get(watcher)) sessionWatchCount -= 1;
+    watchers.delete(watcher);
+    watcher.close();
+  }
+  let sessionWatcher;
+  let archiveSessionWatcher;
+  function attachSessions() {
+    if (sessionWatcher) close(sessionWatcher);
+    if (archiveSessionWatcher) close(archiveSessionWatcher);
+    if (!stopped) sessionWatcher = attach(sessionDir, true, changed);
+    if (!stopped) archiveSessionWatcher = attach(ARCHIVED_SESSION_DIR, true, changed);
+  }
+  sessionInventoryVersion += 1;
+  attachSessions();
+  const directories = new Set([path.dirname(sessionDir), path.dirname(ARCHIVED_SESSION_DIR), path.dirname(SESSION_INDEX_FILE), path.dirname(ARCHIVE_FILE)]);
+  for (const directory of directories) {
+    const listener = (event, candidate) => {
+      if (!candidate || candidate === sessionDir || candidate === ARCHIVED_SESSION_DIR) {
+        attachSessions();
+        changed(event, candidate);
+      } else if (candidate === SESSION_INDEX_FILE || candidate === ARCHIVE_FILE) onChange(candidate);
+    };
+    let parent = directory;
+    // A missing sessions/state directory can appear after startup. Watching the
+    // nearest existing ancestor observes its creation as well as its contents.
+    while (!attach(parent, parent !== directory, listener) && path.dirname(parent) !== parent) parent = path.dirname(parent);
+  }
+  let pollInFlight = false;
+  let signatures = new Map();
+  const signature = (stat) => stat ? `${stat.dev}:${stat.ino}:${stat.ctimeMs}:${stat.mtimeMs}:${stat.size}` : "missing";
+  async function pollObservedFiles() {
+    if (stopped || pollInFlight) return;
+    pollInFlight = true;
+    try {
+      const observed = [...new Set(getObservedThreadIds())];
+      const known = new Map();
+      const candidates = new Set([SESSION_INDEX_FILE, ARCHIVE_FILE]);
+      for (const id of observed) {
+        const files = [...(sessionFileSnapshot?.byId.get(id) || [])]
+          .sort((left, right) => path.basename(left).localeCompare(path.basename(right)) || left.localeCompare(right));
+        const cached = detailCaches.get(files[0]) || threadSummaryCache.get(files[0]);
+        for (const file of files) { candidates.add(file); candidates.add(path.dirname(file)); }
+        for (const file of cached?.files || []) known.set(file.filePath, signature(file));
+      }
+      candidates.add(sessionDir);
+      candidates.add(ARCHIVED_SESSION_DIR);
+      const now = new Date();
+      for (const date of [
+        [now.getUTCFullYear(), now.getUTCMonth() + 1, now.getUTCDate()],
+        [now.getFullYear(), now.getMonth() + 1, now.getDate()],
+      ]) {
+        let directory = sessionDir;
+        for (const part of date) {
+          directory = path.join(directory, String(part).padStart(2, "0"));
+          candidates.add(directory);
+        }
+      }
+      const next = new Map();
+      await Promise.all([...candidates].map(async candidate => {
+        const stat = await fs.stat(candidate).catch(() => null);
+        const current = signature(stat);
+        next.set(candidate, current);
+        const previous = signatures.get(candidate) ?? known.get(candidate);
+        if (previous !== undefined && previous !== current && !stopped) {
+          changed(stat?.isDirectory() || !stat ? "rename" : "change", candidate);
+        }
+      }));
+      signatures = next;
+    } finally { pollInFlight = false; }
+  }
+  // Recursive fs.watch can silently stall on existing macOS session trees.
+  // Stat only observed rollouts and the few directories that can gain a new
+  // thread or continuation; the regular server poll reconciles the full list.
+  const pollTimer = setInterval(() => { void pollObservedFiles().catch(() => {}); }, 250);
+  pollTimer.unref();
+  void pollObservedFiles().catch(() => {});
+  return () => {
+    stopped = true;
+    clearInterval(pollTimer);
+    for (const watcher of [...watchers.keys()]) close(watcher);
+  };
 }
 
 export async function readCliThreadById(threadId) {

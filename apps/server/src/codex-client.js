@@ -4,6 +4,7 @@ import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
 import { promisify } from "node:util";
 import { config } from "./config.js";
+import { listAllModels } from "./app-server-stdio.js";
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -60,36 +61,40 @@ export class CodexError extends Error {
 // `codex app-server proxy` is intentionally a byte proxy. The app-server
 // control socket speaks WebSocket, so this small transport performs the
 // standard client handshake/framing without adding a third-party dependency.
-class ProxyWebSocket extends EventEmitter {
-  constructor(child) {
+export class ProxyWebSocket extends EventEmitter {
+  constructor(child, timeoutMs = 5_000) {
     super();
     this.child = child;
     this.buffer = Buffer.alloc(0);
     this.handshakeDone = false;
     this.closed = false;
     this.fragments = [];
+    this.timeoutMs = timeoutMs;
   }
 
   connect() {
     return new Promise((resolve, reject) => {
       const fail = (error) => {
         if (this.handshakeDone || this.closed) return;
-        this.closed = true;
+        clearTimeout(timeout);
         reject(error);
+        this.close(error);
       };
-      this.once("open", resolve);
+      const timeout = setTimeout(() => fail(new CodexError("Timed out upgrading Codex control socket")), this.timeoutMs);
+      this.once("open", () => { clearTimeout(timeout); resolve(); });
+      this.once("close", (error) => { clearTimeout(timeout); reject(error || new CodexError("Control socket closed during upgrade")); });
       this.once("handshakeError", fail);
       this.child.stdout.on("data", (chunk) => this.receive(Buffer.from(chunk)));
-      this.child.on("error", fail);
+      this.child.on("error", (error) => { fail(error); this.close(error); });
       this.child.on("exit", (code, signal) => {
         const error = new CodexError(`Codex proxy exited (${code ?? signal})`);
         if (!this.handshakeDone) fail(error);
-        this.closed = true;
-        this.emit("close", error);
+        this.close(error);
       });
-      this.child.stdin.on("error", (error) => this.emit("close", error));
+      this.child.stdin.on("error", (error) => { fail(error); this.close(error); });
 
       const key = crypto.randomBytes(16).toString("base64");
+      this.expectedAccept = crypto.createHash("sha1").update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64");
       const request = [
         "GET / HTTP/1.1",
         "Host: localhost",
@@ -108,11 +113,24 @@ class ProxyWebSocket extends EventEmitter {
     this.buffer = Buffer.concat([this.buffer, chunk]);
     if (!this.handshakeDone) {
       const headerEnd = this.buffer.indexOf("\r\n\r\n");
-      if (headerEnd === -1) return;
+      if (headerEnd === -1) {
+        if (this.buffer.length > 16_384) this.emit("handshakeError", new CodexError("Control socket upgrade header is too large"));
+        return;
+      }
       const header = this.buffer.subarray(0, headerEnd).toString("utf8");
       this.buffer = this.buffer.subarray(headerEnd + 4);
       if (!/^HTTP\/1\.1 101\b/m.test(header)) {
         this.emit("handshakeError", new CodexError(`Control socket rejected WebSocket upgrade: ${header.split("\r\n")[0]}`));
+        return;
+      }
+      const headers = new Map(header.split("\r\n").slice(1).map((line) => {
+        const colon = line.indexOf(":");
+        return [line.slice(0, colon).trim().toLowerCase(), line.slice(colon + 1).trim()];
+      }));
+      if (headers.get("sec-websocket-accept") !== this.expectedAccept
+        || headers.get("upgrade")?.toLowerCase() !== "websocket"
+        || !headers.get("connection")?.toLowerCase().split(/\s*,\s*/).includes("upgrade")) {
+        this.emit("handshakeError", new CodexError("Control socket returned an invalid WebSocket upgrade"));
         return;
       }
       this.handshakeDone = true;
@@ -206,7 +224,7 @@ class ProxyWebSocket extends EventEmitter {
 }
 
 export class CodexClient extends EventEmitter {
-  constructor() {
+  constructor({ requestTimeoutMs = 30_000, connectTimeoutMs = 5_000 } = {}) {
     super();
     this.socket = null;
     this.child = null;
@@ -218,26 +236,34 @@ export class CodexClient extends EventEmitter {
     this.subscribedThreads = new Set();
     this.subscriptionRequests = new Map();
     this.unsubscribeRequests = new Map();
+    this.requestTimeoutMs = requestTimeoutMs;
+    this.connectTimeoutMs = connectTimeoutMs;
+    this.stopped = false;
   }
 
   async start() {
+    this.stopped = false;
     await this.ensureConnected();
   }
 
   async ensureConnected() {
-    if (this.socket && !this.socket.closed) return;
+    if (this.stopped) throw new CodexError("Controller shutting down");
     if (this.connecting) return this.connecting;
+    if (this.socket && !this.socket.closed) return;
     this.connecting = this.connectWithRetry().finally(() => { this.connecting = null; });
     return this.connecting;
   }
 
   async connectWithRetry() {
-    await bootstrapManagedAppServer();
     let lastError;
-    for (let attempt = 0; attempt < 30; attempt += 1) {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
+        if (this.stopped) throw new CodexError("Controller shutting down");
+        // Reuse the running CLI/Desktop server before installing or starting a daemon.
+        if (attempt === 1) await bootstrapManagedAppServer();
+        if (this.stopped) throw new CodexError("Controller shutting down");
         await this.connectProxy();
-        await this.request("initialize", {
+        await this.sendRequest("initialize", {
           clientInfo: { name: "cloudex-codex-control", title: "Cloudex local controller", version: "0.2.0" },
           capabilities: { experimentalApi: true },
         });
@@ -247,7 +273,8 @@ export class CodexClient extends EventEmitter {
       } catch (error) {
         lastError = error;
         this.closeProxy();
-        await sleep(Math.min(1000, 150 + attempt * 50));
+        if (this.stopped) throw error;
+        if (attempt < 2) await sleep(150 * (attempt + 1));
       }
     }
     throw new CodexError(`Unable to connect to managed Codex app-server: ${lastError?.message || "unknown error"}`);
@@ -260,7 +287,7 @@ export class CodexClient extends EventEmitter {
       windowsHide: true,
     });
     this.child.stderr.on("data", (chunk) => this.emit("log", chunk.toString()));
-    const socket = new ProxyWebSocket(this.child);
+    const socket = new ProxyWebSocket(this.child, this.connectTimeoutMs);
     socket.on("message", (raw) => this.onMessage(raw));
     socket.on("close", () => {
       if (this.socket !== socket) return;
@@ -273,13 +300,14 @@ export class CodexClient extends EventEmitter {
       this.rejectPending(new CodexError("Managed Codex app-server connection closed"));
       this.emit("disconnected");
     });
-    await socket.connect();
     this.socket = socket;
+    await socket.connect();
   }
 
   onMessage(raw) {
     let message;
     try { message = JSON.parse(String(raw)); } catch { return; }
+    if (!message || typeof message !== "object") return;
     if (message.id !== undefined && message.method) {
       this.pendingServerRequests.set(String(message.id), message);
       this.emit("serverRequest", message);
@@ -288,7 +316,7 @@ export class CodexClient extends EventEmitter {
     if (message.id !== undefined && this.pending.has(String(message.id))) {
       const pending = this.pending.get(String(message.id));
       this.pending.delete(String(message.id));
-      if (message.error) pending.reject(new CodexError(message.error.message || "Codex request failed", { error: message.error }));
+      if (message.error) pending.reject(new CodexError(message.error.message || "Codex request failed", { error: message.error, code: message.error.code, data: message.error.data }));
       else pending.resolve(message.result);
       return;
     }
@@ -305,7 +333,7 @@ export class CodexClient extends EventEmitter {
   trackNotification(message) {
     const params = message.params || {};
     const threadId = params.threadId || params.thread?.id;
-    if (message.method === "thread/closed" && threadId) {
+    if ((message.method === "thread/closed" || message.method === "thread/status/changed" && params.status?.type === "notLoaded") && threadId) {
       this.subscribedThreads.delete(threadId);
       this.activeTurns.delete(threadId);
     }
@@ -315,16 +343,35 @@ export class CodexClient extends EventEmitter {
       "turn/failed",
       "turn/interrupted",
       "turn/cancelled",
-    ].includes(message.method) && threadId) this.activeTurns.delete(threadId);
+    ].includes(message.method) && threadId) {
+      const turnId = params.turn?.id || params.turnId;
+      if (!turnId || this.activeTurns.get(threadId) === turnId) this.activeTurns.delete(threadId);
+    }
   }
 
   request(method, params = {}) {
-    return this.ensureConnected().then(() => new Promise((resolve, reject) => {
+    return this.ensureConnected().then(() => this.sendRequest(method, params));
+  }
+
+  sendRequest(method, params = {}) {
+    return new Promise((resolve, reject) => {
       const id = String(this.nextId++);
-      this.pending.set(id, { resolve, reject });
+      const timeout = setTimeout(() => {
+        this.pending.delete(id);
+        // A timed-out write may still finish upstream; never replay it automatically.
+        reject(new CodexError(`Codex ${method} timed out; its result is unconfirmed`, { code: "CODEX_REQUEST_TIMEOUT" }));
+      }, this.requestTimeoutMs);
+      this.pending.set(id, {
+        resolve: (result) => { clearTimeout(timeout); resolve(result); },
+        reject: (error) => { clearTimeout(timeout); reject(error); },
+      });
       try { this.socket.send(JSON.stringify({ id, method, params })); }
-      catch (error) { this.pending.delete(id); reject(error); }
-    }));
+      catch (error) { clearTimeout(timeout); this.pending.delete(id); reject(error); }
+    });
+  }
+
+  listModels() {
+    return listAllModels((method, params) => this.request(method, params));
   }
 
   notify(method, params = {}) {
@@ -346,7 +393,7 @@ export class CodexClient extends EventEmitter {
     await this.unsubscribeRequests.get(threadId)?.catch(() => {});
     if (this.subscribedThreads.has(threadId)) return;
     if (this.subscriptionRequests.has(threadId)) return this.subscriptionRequests.get(threadId);
-    const request = this.request("thread/resume", { threadId })
+    const request = this.request("thread/resume", { threadId, excludeTurns: true })
       .then((result) => {
         this.subscribedThreads.add(threadId);
         return result;
@@ -404,6 +451,7 @@ export class CodexClient extends EventEmitter {
   }
 
   async stop() {
+    this.stopped = true;
     this.rejectPending(new CodexError("Controller shutting down"));
     this.closeProxy();
   }

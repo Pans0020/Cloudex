@@ -1,6 +1,68 @@
 import XCTest
 
 final class CloudexUITests: XCTestCase {
+    func testSubagentsStayInsideParentAndOpenReadOnlyHistory() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--ui-fixture", "--ui-subagents-fixture", "--ui-all-details", "-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN"]
+        app.launch()
+        XCTAssertTrue(app.buttons["展开CV"].waitForExistence(timeout: 10))
+        app.buttons["展开CV"].tap()
+        XCTAssertFalse(app.buttons["subagent-row-ui-agent-research"].exists)
+        XCTAssertFalse(app.staticTexts["探索"].exists, "Children must not appear as independent home conversations")
+        app.buttons.containing(.staticText, identifier: "布局回归 CV").firstMatch.tap()
+        let input = app.textViews["message-input"]
+        XCTAssertTrue(input.waitForExistence(timeout: 10))
+        input.tap(); input.typeText("parent draft stays here")
+        let summary = app.buttons["subagent-summary"]
+        XCTAssertTrue(summary.waitForExistence(timeout: 5))
+        XCTAssertTrue(summary.label.contains("1 运行中"))
+        XCTAssertTrue(summary.label.contains("2 已完成"))
+        XCTAssertTrue(summary.label.contains("1 失败"))
+        XCTAssertTrue(summary.label.contains("1 已中断"))
+        snapshot("subagents-parent-summary")
+        summary.tap()
+        XCTAssertTrue(app.buttons["subagent-row-ui-agent-research"].waitForExistence(timeout: 5))
+        XCTAssertEqual(app.staticTexts["subagent-status-ui-agent-research"].label, "运行中")
+        XCTAssertEqual(app.staticTexts["subagent-status-ui-agent-audit"].label, "失败")
+        XCTAssertEqual(app.staticTexts["subagent-status-ui-agent-stop"].label, "已中断")
+        snapshot("subagents-directory-statuses")
+        app.buttons["subagent-row-ui-agent-research"].tap()
+        let childActivity = app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "子智能体活动过程：探索")).firstMatch
+        XCTAssertTrue(childActivity.waitForExistence(timeout: 10))
+        XCTAssertFalse(app.textViews["message-input"].isHittable)
+        XCTAssertFalse(app.buttons["发送消息"].isHittable)
+        XCTAssertFalse(app.buttons["切换模型和推理强度"].isHittable)
+        XCTAssertTrue(app.staticTexts["子智能体思考摘要"].isHittable)
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "pwd")).allElementsBoundByIndex.contains { $0.isHittable })
+        snapshot("subagents-child-readonly-history")
+        let childSummary = app.buttons.matching(identifier: "subagent-summary").allElementsBoundByIndex.first { $0.isHittable }
+        XCTAssertNotNil(childSummary); childSummary?.tap()
+        XCTAssertTrue(app.buttons["subagent-row-ui-agent-nested"].waitForExistence(timeout: 5))
+        app.buttons["subagent-row-ui-agent-nested"].tap()
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "子智能体活动过程：资料整理")).firstMatch.waitForExistence(timeout: 10))
+        XCTAssertFalse(app.textViews["message-input"].isHittable)
+        let process = app.buttons["process-toggle-ui-agent-nested-turn"]
+        XCTAssertTrue(process.waitForExistence(timeout: 5)); process.tap()
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "pwd")).allElementsBoundByIndex.contains { $0.isHittable })
+        snapshot("subagents-nested-readonly-history")
+        let nestedClose = app.buttons.matching(identifier: "subagents-close").allElementsBoundByIndex.first { $0.isHittable }
+        XCTAssertNotNil(nestedClose); nestedClose?.tap()
+        XCTAssertTrue(childActivity.waitForExistence(timeout: 5))
+        let parentClose = app.buttons.matching(identifier: "subagents-close").allElementsBoundByIndex.first { $0.isHittable }
+        XCTAssertNotNil(parentClose); parentClose?.tap()
+        XCTAssertTrue(input.waitForExistence(timeout: 5))
+        XCTAssertEqual(input.value as? String, "parent draft stays here")
+        app.buttons["subagents-complete-fixture"].tap()
+        let completed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label CONTAINS %@ AND NOT label CONTAINS %@", "3 已完成", "运行中"), object: summary)
+        wait(for: [completed], timeout: 5)
+        summary.tap()
+        XCTAssertEqual(app.staticTexts["subagent-status-ui-agent-research"].label, "已完成")
+        snapshot("subagents-completed-update")
+        app.buttons["subagents-close"].tap()
+        XCTAssertEqual(input.value as? String, "parent draft stays here")
+    }
+
     func testChatDetailSettingsPersistAndRestoreProcessContent() {
         continueAfterFailure = false
         let app = XCUIApplication()

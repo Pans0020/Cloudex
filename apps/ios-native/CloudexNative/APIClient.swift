@@ -27,7 +27,10 @@ struct APIClient {
     }
 
     func makeURL(path: String, queryItems: [URLQueryItem] = []) throws -> URL {
-        guard var components = URLComponents(string: normalizedBaseURL + path) else {
+        guard let base = URLComponents(string: normalizedBaseURL),
+              ["http", "https"].contains(base.scheme?.lowercased() ?? ""),
+              let host = base.host, !host.isEmpty, base.query == nil, base.fragment == nil,
+              var components = URLComponents(string: normalizedBaseURL + path) else {
             throw APIClientError.invalidServerURL
         }
         if !queryItems.isEmpty { components.queryItems = queryItems }
@@ -56,10 +59,40 @@ struct APIClient {
         return "/api/approvals/\(encoded)/respond"
     }
 
-    func get<T: Decodable>(_ path: String, queryItems: [URLQueryItem] = []) async throws -> T {
+    func get<T: Decodable>(_ path: String, queryItems: [URLQueryItem] = [], timeout: TimeInterval = 15) async throws -> T {
         var request = URLRequest(url: try makeURL(path: path, queryItems: queryItems))
         request.httpMethod = "GET"
-        return try await send(request)
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        return try await send(request, timeout: timeout)
+    }
+
+    // Reads can race routes safely; a dead LAN must not delay a working VPN.
+    static func getFirstAvailable<T: Decodable>(_ path: String, servers: [String], token: String,
+                                                timeout: TimeInterval = 15) async throws -> (APIClient, T) {
+        try await withThrowingTaskGroup(of: (APIClient, Result<T, Error>).self) { group in
+            for (index, server) in servers.enumerated() {
+                group.addTask {
+                    let client = APIClient(serverURL: server, token: token)
+                    do {
+                        // Keep a healthy route stable; fall back promptly when it stalls.
+                        if index > 0 { try await Task.sleep(for: .milliseconds(250)) }
+                        try Task.checkCancellation()
+                        return (client, .success(try await client.get(path, timeout: timeout)))
+                    }
+                    catch { return (client, .failure(error)) }
+                }
+            }
+            var lastError: Error = APIClientError.invalidServerURL
+            for try await (client, result) in group {
+                switch result {
+                case .success(let value):
+                    group.cancelAll()
+                    return (client, value)
+                case .failure(let error): lastError = error
+                }
+            }
+            throw lastError
+        }
     }
 
     func post<T: Decodable>(_ path: String, json: [String: Any] = [:]) async throws -> T {
@@ -102,9 +135,10 @@ struct APIClient {
         return try JSONDecoder().decode(RemoteFileEntry.self, from: responseData)
     }
 
-    private func send<T: Decodable>(_ requestValue: URLRequest) async throws -> T {
+    private func send<T: Decodable>(_ requestValue: URLRequest, timeout: TimeInterval? = nil) async throws -> T {
         var request = requestValue
-        request.timeoutInterval = 6
+        // A cold history read and the server's 30-second write RPC can exceed 6s.
+        request.timeoutInterval = timeout ?? (request.httpMethod == "GET" ? 15 : 45)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         if !token.isEmpty {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")

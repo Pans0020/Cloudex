@@ -38,7 +38,9 @@ struct AttachmentThumbnail: View {
             }
         }
         .task(id: "\(server)|\(path)") {
-            image = AttachmentImageCache.image(path: path, server: server)
+            let cached = await AttachmentImageCache.cachedImage(path: path, server: server)
+            guard !Task.isCancelled else { return }
+            image = cached
             failed = false
             guard image == nil else { return }
             do {
@@ -128,6 +130,7 @@ struct ContentView: View {
     let expectedThreadID: String?
     let onToggleDirectory: (() -> Void)?
     let showsDirectoryButton: Bool
+    let onClose: (() -> Void)?
     @State private var showingFilePicker = false
     @State private var filePreview: FilePreviewRequest?
     @State private var editingQueueItem: QueuedMessage?
@@ -147,19 +150,32 @@ struct ContentView: View {
     @State private var taskTimerCompletedAt: Double?
     @State private var taskTimerHidden = true
     @State private var composerFocused = false
+    @State private var showingSubagents = false
 
     init(
         expectedThreadID: String? = nil,
         onToggleDirectory: (() -> Void)? = nil,
-        showsDirectoryButton: Bool = true
+        showsDirectoryButton: Bool = true,
+        onClose: (() -> Void)? = nil
     ) {
         self.expectedThreadID = expectedThreadID
         self.onToggleDirectory = onToggleDirectory
         self.showsDirectoryButton = showsDirectoryButton
+        self.onClose = onClose
     }
 
     var body: some View {
         VStack(spacing: 0) {
+        if !viewModel.selectedSubagents.isEmpty {
+            Button { showingSubagents = true } label: {
+                SubagentSummary(agents: viewModel.selectedSubagents)
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("subagent-summary")
+            .padding(.horizontal, 14)
+            .padding(.top, 8)
+            .padding(.bottom, 4)
+        }
         ZStack {
             liquidBackground
             chat
@@ -218,8 +234,10 @@ struct ContentView: View {
             .animation(.easeInOut(duration: 0.18), value: isFollowingChatBottom)
         }
         .clipped()
-        ComposerDraftScope(draft: viewModel.composerDraft) {
-            composer
+        if !viewModel.isReadOnlyConversation {
+            ComposerDraftScope(draft: viewModel.composerDraft) {
+                composer
+            }
         }
         }
         .background(CloudexTheme.canvas)
@@ -234,16 +252,37 @@ struct ContentView: View {
             return ["http", "https", "mailto"].contains(url.scheme ?? "") ? .systemAction : .discarded
         })
         .sheet(item: $filePreview) { FilePreviewSheet(request: $0) }
+        .sheet(isPresented: $showingSubagents) {
+            SubagentDirectoryView(parent: viewModel)
+        }
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            if let onClose {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(action: onClose) {
+                        Image(systemName: "xmark")
+                            .frame(width: 44, height: 44)
+                            .contentShape(Rectangle())
+                    }
+                    .accessibilityLabel(cloudexLocalized("关闭"))
+                    .accessibilityIdentifier("subagents-close")
+                }
+            }
             #if DEBUG
+            if !viewModel.isReadOnlyConversation, ProcessInfo.processInfo.arguments.contains("--ui-subagents-fixture") {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("模拟子智能体完成") { viewModel.completeUISubagentFixture() }
+                        .accessibilityIdentifier("subagents-complete-fixture")
+                }
+            }
             if ProcessInfo.processInfo.arguments.contains("--ui-stream-fixture") {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button(viewModel.liveRunning ? "流式进行中" : "模拟连续回复") { viewModel.startUIFixtureStream() }
                 }
             }
             #endif
-            if let input = viewModel.pendingInputs.first(where: { $0.threadId == viewModel.selectedThreadID }) {
+            if !viewModel.isReadOnlyConversation,
+               let input = viewModel.pendingInputs.first(where: { $0.threadId == viewModel.selectedThreadID }) {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         viewModel.presentedInput = input
@@ -262,12 +301,17 @@ struct ContentView: View {
                         Circle()
                             .fill(viewModel.isConnected ? Color.green : Color.red)
                             .frame(width: 7, height: 7)
-                        Text(cloudexLocalized(viewModel.isConnected ? "已连接" : "未连接"))
+                        Text(viewModel.isReadOnlyConversation
+                             ? (viewModel.selectedThreadSnapshot ?? viewModel.selectedThread)?.agentActivityTitle ?? cloudexLocalized("状态未知")
+                             : cloudexLocalized(viewModel.isConnected ? "已连接" : "未连接"))
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
                     .accessibilityElement(children: .combine)
-                    .accessibilityLabel(cloudexLocalized(viewModel.isConnected ? "已连接" : "未连接"))
+                    .accessibilityLabel(viewModel.isReadOnlyConversation
+                                        ? (viewModel.selectedThreadSnapshot ?? viewModel.selectedThread)?.agentActivityTitle ?? cloudexLocalized("状态未知")
+                                        : cloudexLocalized(viewModel.isConnected ? "已连接" : "未连接"))
+                    .accessibilityValue(viewModel.isReadOnlyConversation ? cloudexLocalized(viewModel.isConnected ? "已连接" : "未连接") : "")
                 }
                 .frame(maxWidth: 220)
             }
@@ -303,6 +347,7 @@ struct ContentView: View {
         .onDisappear { speechInput.stop() }
         .onChange(of: "\(viewModel.serverURL)|\(viewModel.selectedThreadID ?? "new")") { _, _ in editingQueueItem = nil }
         .task(id: "\(viewModel.serverURL)|\(viewModel.selectedThreadID ?? "new")|\(viewModel.selectedAgentProvider)") {
+            guard !viewModel.isReadOnlyConversation else { return }
             async let queue: Void = viewModel.loadMessageQueue()
             async let modes: Void = viewModel.loadCollaborationModes()
             _ = await (queue, modes)
@@ -434,6 +479,7 @@ struct ContentView: View {
             } else {
                 MessageBubble(
                     viewModel: viewModel, client: viewModel.client, isActive: viewModel.active,
+                    allowsConversationActions: !viewModel.isReadOnlyConversation,
                     message: message, preferences: viewModel.chatDetails,
                     highlightQuery: messageTextHighlight?.messageID == message.id ? messageTextHighlight?.query : nil,
                     collapseRequest: $collapseProcessRequest,
@@ -474,7 +520,7 @@ struct ContentView: View {
                 } else {
                     CloudexEmptyState(symbol: "bubble.left.and.text.bubble.right",
                         title: viewModel.isCreatingNew ? "准备好，开始新的想法" : "这段对话还没有消息",
-                        detail: "写下指令，或添加图片和文件。")
+                        detail: viewModel.isReadOnlyConversation ? "子智能体开始活动后，过程会显示在这里。" : "写下指令，或添加图片和文件。")
                 }
             }
         }
@@ -483,6 +529,7 @@ struct ContentView: View {
 
     private var chatFooter: some View {
         VStack(spacing: 12) {
+            if !viewModel.isReadOnlyConversation {
             ForEach(viewModel.visibleApprovals) { approval in
                 ApprovalBubble(approval: approval).environmentObject(viewModel)
             }
@@ -540,6 +587,7 @@ struct ContentView: View {
                     viewModel.draft = "请按刚才确认的计划开始执行。"
                     composerFocused = true
                 }.font(.subheadline)
+            }
             }
             if viewModel.active || viewModel.isBusy {
                 HStack(spacing: 7) {
@@ -993,6 +1041,7 @@ struct ContentView: View {
     }
 
     private func prepareNewChatRouteIfNeeded() {
+        guard !viewModel.isReadOnlyConversation else { return }
         guard expectedThreadID?.hasPrefix("new-") == true else { return }
         let isNoProjectRoute = expectedThreadID?.hasPrefix("new-no-project-") == true
         // Navigation can render the destination before the sidebar action's
@@ -1296,11 +1345,164 @@ private struct PendingSteerBubble: View {
     }
 }
 
+private struct SubagentSummary: View {
+    let agents: [CloudexThread]
+
+    private var allAgents: [CloudexThread] { agents.flatMap { [$0] + $0.descendants } }
+    private var summary: String {
+        let all = allAgents
+        let order = ["active", "waiting", "pending", "completed", "failed", "interrupted", "closed", "unknown"]
+        return order.compactMap { activity in
+            let matching = all.filter { $0.agentActivity == activity }
+            guard let first = matching.first else { return nil }
+            return cloudexLocalized("%lld %@", Int64(matching.count), first.agentActivityTitle)
+        }.joined(separator: " · ")
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            HStack(spacing: -8) {
+                ForEach(Array(allAgents.prefix(3))) { SubagentAvatar(agent: $0) }
+            }
+            .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(cloudexLocalized("子智能体") + " · \(allAgents.count)")
+                    .font(.subheadline.weight(.semibold))
+                Text(summary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.tertiary)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, minHeight: 52, alignment: .leading)
+        .cloudexSurface(radius: 16)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(cloudexLocalized("子智能体") + " · \(allAgents.count) · " + summary)
+        .accessibilityHint(cloudexLocalized("查看子智能体的状态与活动过程"))
+    }
+}
+
+private struct SubagentAvatar: View {
+    let agent: CloudexThread
+    private var color: Color {
+        let colors: [Color] = [.purple, .orange, .teal, .indigo, .pink, .blue]
+        return colors[agent.id.utf8.reduce(0) { ($0 + Int($1)) % colors.count }]
+    }
+    var body: some View {
+        Image(systemName: "sparkle")
+            .font(.system(size: 16, weight: .semibold))
+            .foregroundStyle(color)
+            .frame(width: 30, height: 30)
+            .background(color.opacity(0.12), in: Circle())
+            .overlay(Circle().stroke(CloudexTheme.canvas, lineWidth: 2))
+            .accessibilityHidden(true)
+    }
+}
+
+private struct SubagentDirectoryView: View {
+    @ObservedObject var parent: AppViewModel
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if parent.selectedSubagents.isEmpty {
+                    Text("暂无子智能体").foregroundStyle(.secondary)
+                } else {
+                    Section {
+                        SubagentSummary(agents: parent.selectedSubagents)
+                            .listRowInsets(EdgeInsets())
+                    }
+                    Section {
+                        ForEach(parent.selectedSubagents) { agent in
+                            NavigationLink {
+                                SubagentConversationView(thread: agent, parent: parent, onClose: { dismiss() })
+                            } label: {
+                                HStack(alignment: .top, spacing: 12) {
+                                    SubagentAvatar(agent: agent).padding(.top, 3)
+                                    VStack(alignment: .leading, spacing: 5) {
+                                        Text(agent.agentTitle).font(.body.weight(.medium))
+                                        HStack(spacing: 6) {
+                                            Image(systemName: agent.agentActivity == "active" ? "circle.fill" : "circle")
+                                                .font(.system(size: 7))
+                                            Text(agent.agentActivityTitle)
+                                                .accessibilityIdentifier("subagent-status-\(agent.id)")
+                                            if let role = agent.agentRole, !role.isEmpty {
+                                                Text("· " + role).foregroundStyle(.secondary)
+                                            }
+                                        }
+                                        .font(.caption)
+                                        .foregroundStyle(agent.agentActivity == "failed" ? Color.red : agent.agentActivity == "active" ? Color.green : Color.secondary)
+                                        if let preview = agent.preview, !preview.isEmpty {
+                                            Text(preview).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                                        }
+                                        if !agent.descendants.isEmpty {
+                                            Text(cloudexLocalized("子智能体") + " · \(agent.descendants.count)")
+                                                .font(.caption2).foregroundStyle(.secondary)
+                                        }
+                                    }
+                                }
+                                .padding(.vertical, 4)
+                            }
+                            .accessibilityIdentifier("subagent-row-\(agent.id)")
+                        }
+                    }
+                }
+            }
+            .navigationTitle(cloudexLocalized("子智能体"))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar(.visible, for: .navigationBar)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button { dismiss() } label: {
+                        Image(systemName: "xmark")
+                            .frame(width: 44, height: 44)
+                            .contentShape(Rectangle())
+                    }
+                    .accessibilityLabel(cloudexLocalized("关闭"))
+                    .accessibilityIdentifier("subagents-close")
+                }
+            }
+        }
+    }
+}
+
+private struct SubagentConversationView: View {
+    let thread: CloudexThread
+    let onClose: () -> Void
+    @StateObject private var viewModel: AppViewModel
+    @Environment(\.scenePhase) private var scenePhase
+
+    init(thread: CloudexThread, parent: AppViewModel, onClose: @escaping () -> Void) {
+        self.thread = thread
+        self.onClose = onClose
+        _viewModel = StateObject(wrappedValue: AppViewModel(readOnlyParent: parent))
+    }
+
+    var body: some View {
+        ContentView(expectedThreadID: thread.id, onClose: onClose)
+            .environmentObject(viewModel)
+            .task { await viewModel.startReadOnlyViewer(thread) }
+            .onDisappear { viewModel.closeReadOnlyViewer() }
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active {
+                    Task { await viewModel.resumeFromForeground() }
+                } else if phase == .background {
+                    viewModel.suspendForBackground()
+                }
+            }
+    }
+}
+
 private struct MessageBubble: View, Equatable {
     // Used for user actions only; unrelated model publications must not invalidate every row.
     let viewModel: AppViewModel
     let client: APIClient
     let isActive: Bool
+    let allowsConversationActions: Bool
     let message: ChatMessage
     let preferences: ChatDetailPreferences
     let highlightQuery: String?
@@ -1316,6 +1518,7 @@ private struct MessageBubble: View, Equatable {
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.viewModel === rhs.viewModel && lhs.client.serverURL == rhs.client.serverURL
             && lhs.client.token == rhs.client.token && lhs.isActive == rhs.isActive
+            && lhs.allowsConversationActions == rhs.allowsConversationActions
             && lhs.message == rhs.message && lhs.highlightQuery == rhs.highlightQuery
             && lhs.preferences == rhs.preferences
             && lhs.collapseRequest == rhs.collapseRequest
@@ -1523,7 +1726,7 @@ private struct MessageBubble: View, Equatable {
                 .foregroundStyle(.secondary)
                 .accessibilityLabel("复制消息")
 
-                if message.role == .user {
+                if allowsConversationActions, message.role == .user {
                     Button {
                         onQuickFill(message.text)
                     } label: {
@@ -1534,7 +1737,7 @@ private struct MessageBubble: View, Equatable {
                     .foregroundStyle(.secondary)
                     .disabled(isPerformingAction)
                     .accessibilityLabel("填充到输入框")
-                } else if !isActive {
+                } else if allowsConversationActions, !isActive {
                     Button {
                         Task {
                             isPerformingAction = true
