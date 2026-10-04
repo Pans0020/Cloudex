@@ -88,9 +88,9 @@ function tokenFilePath() {
   return process.env.CLOUDEX_AUTH_TOKEN_FILE || path.join(stateDir(), "auth-token");
 }
 
-function fileExists(file) {
+function pathExists(file, kind = "isFile") {
   try {
-    return fs.statSync(file).isFile();
+    return fs.statSync(file)[kind]();
   } catch {
     return false;
   }
@@ -181,17 +181,17 @@ async function cmdAbout({ json }) {
     platform: `${process.platform} ${process.arch}`,
     machine: config.machine,
     codexBin: config.codexBin,
-    codexExists: fileExists(config.codexBin),
+    codexExists: pathExists(config.codexBin),
     codexVersion: await detectCodexVersion(config.codexBin),
     controlSocket: config.controlSocketPath,
-    controlSocketExists: fileExists(config.controlSocketPath),
+    controlSocketExists: pathExists(config.controlSocketPath, "isSocket"),
     configFile: config.codexConfigPath,
-    configFileExists: fileExists(config.codexConfigPath),
+    configFileExists: pathExists(config.codexConfigPath),
     sessionsDir: config.codexSessionsDir,
-    sessionsDirExists: fileExists(config.codexSessionsDir),
+    sessionsDirExists: pathExists(config.codexSessionsDir, "isDirectory"),
     stateDir: config.stateDir,
     authFile,
-    authEnabled: Boolean(process.env.AUTH_TOKEN || fileExists(authFile)),
+    authEnabled: Boolean(process.env.AUTH_TOKEN || pathExists(authFile)),
     defaultUrl: `http://${config.host}:${serverPort}`,
     daemonPid: daemon?.pid || null,
     daemonPort: daemon?.port || null,

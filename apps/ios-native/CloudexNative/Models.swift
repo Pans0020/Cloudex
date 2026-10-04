@@ -462,6 +462,15 @@ struct CloudexThread: Codable, Identifiable, Equatable {
     let updatedAt: Double?
     let usage: CloudexUsage?
     let provider: String?
+    var syncRevision: String? = nil
+    var parentThreadId: String? = nil
+    var agentNickname: String? = nil
+    var agentRole: String? = nil
+    var agentPath: String? = nil
+    var agentStatus: String? = nil
+    var threadSource: String? = nil
+    var canAcceptDirectInput: Bool? = nil
+    var subagents: [CloudexThread]? = nil
 
     var title: String {
         let value = name?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -472,6 +481,52 @@ struct CloudexThread: Codable, Identifiable, Equatable {
     }
 
     var isActive: Bool { status?.type == "active" }
+
+    var isSubagent: Bool { parentThreadId != nil || threadSource == "subagent" }
+    var agentTitle: String {
+        for value in [agentNickname, agentPath, name, agentRole] {
+            if let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty { return value }
+        }
+        return title
+    }
+    var agentActivity: String {
+        switch agentStatus {
+        case "running": return "active"
+        case "pendingInit": return "pending"
+        case "errored": return "failed"
+        case "shutdown": return "closed"
+        case "notFound": return "unknown"
+        default: break
+        }
+        if let agentStatus {
+            return ["active", "completed", "failed", "interrupted", "waiting", "pending", "closed", "unknown"].contains(agentStatus) ? agentStatus : "unknown"
+        }
+        return isActive ? "active" : "unknown"
+    }
+    var agentActivityTitle: String {
+        switch agentActivity {
+        case "active": return cloudexLocalized("运行中")
+        case "completed": return cloudexLocalized("已完成")
+        case "failed": return cloudexLocalized("失败")
+        case "interrupted": return cloudexLocalized("已中断")
+        case "waiting": return cloudexLocalized("等待中")
+        case "pending": return cloudexLocalized("准备中")
+        case "closed": return cloudexLocalized("已关闭")
+        default: return cloudexLocalized("状态未知")
+        }
+    }
+
+    var descendants: [CloudexThread] {
+        (subagents ?? []).flatMap { [$0] + $0.descendants }
+    }
+
+    func descendant(withID threadID: String) -> CloudexThread? {
+        if id == threadID { return self }
+        for child in subagents ?? [] {
+            if let found = child.descendant(withID: threadID) { return found }
+        }
+        return nil
+    }
 
     var agentProvider: AgentProvider {
         AgentProvider(rawValue: provider ?? "") ?? .codex
@@ -645,6 +700,7 @@ struct TurnDetailResponse: Codable {
 
 struct TurnItem: Codable, Equatable {
     var attachments: [MessageAttachment]? = nil
+    var summary: [String]? = nil
     let type: String
     let id: String?
     let text: String?
@@ -659,7 +715,13 @@ struct TurnItem: Codable, Equatable {
     let compressed: Bool?
     let diff: [EditDiffPayload]?
 
+    private enum CodingKeys: String, CodingKey {
+        case attachments, summary, type, id, text, content, command, activity, status
+        case exitCode, duration, phase, createdAt, compressed, diff
+    }
+
     var renderedText: String {
+        if type == "reasoning", let summary, !summary.isEmpty { return summary.joined(separator: "\n\n") }
         if type == "userMessage" {
             return (content ?? []).compactMap { $0.text ?? $0.value }.joined()
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -674,6 +736,29 @@ struct TurnItem: Codable, Equatable {
         if compressed == true { return true }
         let normalized = type.lowercased()
         return normalized.contains("compressed") || normalized.contains("compaction") || normalized.contains("compact")
+    }
+}
+
+extension TurnItem {
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let rawType = try values.decode(String.self, forKey: .type)
+        // Native plans share the existing answer, reconciliation and cache path.
+        type = rawType == "plan" ? "agentMessage" : rawType
+        phase = (try? values.decode(String.self, forKey: .phase)) ?? (rawType == "plan" ? "final_answer" : nil)
+        id = try? values.decode(String.self, forKey: .id)
+        text = try? values.decode(String.self, forKey: .text)
+        content = try? values.decode([TurnContent].self, forKey: .content)
+        summary = try? values.decode([String].self, forKey: .summary)
+        attachments = try? values.decode([MessageAttachment].self, forKey: .attachments)
+        command = try? values.decode(String.self, forKey: .command)
+        activity = try? values.decode(String.self, forKey: .activity)
+        status = try? values.decode(String.self, forKey: .status)
+        exitCode = try? values.decode(Int.self, forKey: .exitCode)
+        duration = try? values.decode(String.self, forKey: .duration)
+        createdAt = try? values.decode(Double.self, forKey: .createdAt)
+        compressed = try? values.decode(Bool.self, forKey: .compressed)
+        diff = try? values.decode([EditDiffPayload].self, forKey: .diff)
     }
 }
 
@@ -701,6 +786,26 @@ struct TurnContent: Codable, Equatable {
     let filename: String?
     let mimeType: String?
     let url: String?
+
+    private enum CodingKeys: String, CodingKey { case type, text, value, path, name, filename, mimeType, url }
+}
+
+extension TurnContent {
+    init(from decoder: Decoder) throws {
+        if let text = try? decoder.singleValueContainer().decode(String.self) {
+            self.init(type: "text", text: text, value: nil, path: nil, name: nil, filename: nil, mimeType: nil, url: nil)
+            return
+        }
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(type: try? values.decode(String.self, forKey: .type),
+                  text: try? values.decode(String.self, forKey: .text),
+                  value: try? values.decode(String.self, forKey: .value),
+                  path: try? values.decode(String.self, forKey: .path),
+                  name: try? values.decode(String.self, forKey: .name),
+                  filename: try? values.decode(String.self, forKey: .filename),
+                  mimeType: try? values.decode(String.self, forKey: .mimeType),
+                  url: try? values.decode(String.self, forKey: .url))
+    }
 }
 
 struct TurnErrorPayload: Codable, Equatable {
@@ -954,6 +1059,11 @@ struct MessageAttachment: Identifiable, Equatable, Codable {
     enum Kind: String, Equatable, Codable {
         case image
         case file
+
+        init(from decoder: Decoder) throws {
+            let value = try decoder.singleValueContainer().decode(String.self)
+            self = Self(rawValue: value) ?? .file
+        }
     }
 
     let name: String

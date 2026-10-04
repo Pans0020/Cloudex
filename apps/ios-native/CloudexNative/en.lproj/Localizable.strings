@@ -251,3 +251,16 @@
 "显示时间与 Token 用量" = "Show times and Token usage";
 "即时生效并保存在此设备。仅控制已有过程信息的显示，不改变模型回答。最终回答、图片文件、错误和确认请求始终保留。" = "Applies immediately and saves on this device. Controls existing process details only; it does not change model responses. Final answers, images, files, errors and confirmation requests stay visible.";
 "过程细节已在设置中隐藏" = "Process details are hidden in Settings";
+"项目" = "Projects";
+"%lld 个项目" = "%lld projects";
+"子智能体" = "Subagents";
+"失败" = "Failed";
+"已中断" = "Interrupted";
+"等待中" = "Waiting";
+"准备中" = "Starting";
+"已关闭" = "Closed";
+"状态未知" = "Unknown status";
+"%lld %@" = "%lld %@";
+"暂无子智能体" = "No subagents";
+"查看子智能体的状态与活动过程" = "View subagent status and activity";
+"子智能体开始活动后，过程会显示在这里。" = "Activity will appear here when this subagent starts.";

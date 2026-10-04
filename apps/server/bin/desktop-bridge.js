@@ -8,7 +8,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const socketPath = process.env.CODEX_CONTROL_SOCKET
-  || path.join(os.homedir(), ".codex", "app-server-control", "app-server-control.sock");
+  || path.join(path.resolve(process.env.CODEX_HOME || path.join(os.homedir(), ".codex")), "app-server-control", "app-server-control.sock");
 const stateDir = process.env.CLOUDEX_STATE_DIR || path.resolve(".cloudex-state");
 const port = Number(process.env.CLOUDEX_DESKTOP_BRIDGE_PORT || 8891);
 const tokenFile = path.join(stateDir, "desktop-bridge-token");

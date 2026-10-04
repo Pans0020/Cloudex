@@ -9,7 +9,7 @@ import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { config } from "./config.js";
 import { CodexClient, CodexError } from "./codex-client.js";
-import { archiveCliThread, listCliThreads, readCliThreadById } from "./cli-sessions.js";
+import { archiveCliThread, listCliThreads, readCliThreadById, threadIdFromPath, watchCliSessions } from "./cli-sessions.js";
 import {
   isWindowsPlatform,
   resumeThread as resumeWindowsThread,
@@ -24,6 +24,8 @@ import { ClaudeProvider } from "./claude-provider.js";
 import { mediaAttachments } from "./media-attachments.js";
 import { collaborationModeParams } from "./collaboration-mode.js";
 import { MessageQueue } from "./message-queue.js";
+import { createInlineMediaCache } from "./inline-media.js";
+import { agentStatus, flattenThreads, observedThreadIds, threadAgentStatus, threadRelationship, threadsWithHierarchy } from "./thread-hierarchy.js";
 
 const client = new CodexClient();
 const qwenProvider = new QwenProvider();
@@ -40,6 +42,9 @@ const pendingInputs = new Map();
 const EVENT_HISTORY_LIMIT = 250;
 const APPROVAL_HISTORY_FILE = path.join(config.stateDir, "approval-history.json");
 const UPLOAD_ROOT = path.join(config.stateDir, "uploads");
+const INLINE_MEDIA_ROOT = path.join(config.stateDir, "inline-media");
+const inlineMedia = createInlineMediaCache(INLINE_MEDIA_ROOT);
+const eventEpoch = crypto.randomUUID();
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const messageQueue = new MessageQueue({
   file: path.join(config.stateDir, "message-queue.json"),
@@ -57,7 +62,13 @@ let syncInFlight = false;
 let syncAgainReason = null;
 let syncTimer = null;
 let syncInterval = null;
+let stopWatchingSessions = null;
 let archiveRevision = 0;
+let historyChangeTimer = null;
+const changedHistoryThreads = new Set();
+let latestThreadHierarchy = [];
+const apiAgentStatusCache = new Map();
+const runtimeSubagentStates = new Map();
 
 async function loadApprovalHistory() {
   if (approvalHistory) return approvalHistory;
@@ -250,7 +261,7 @@ async function listModels() {
       (async () => normalizeModelsResponse(
         usesWindowsCliFallback()
           ? await listModelsViaStdio({ codexBin: config.codexBin })
-          : await client.request("model/list", { limit: 100 }),
+          : await client.listModels(),
         configuredDefault,
       ))(),
       qwenProvider.listModels(),
@@ -262,7 +273,8 @@ async function listModels() {
   }
   if (usesAllProviders()) {
     const [codexResult, qwenResult, claudeResult] = await Promise.allSettled([
-      listModelsViaStdio({ codexBin: config.codexBin }).then((result) => normalizeModelsResponse(result, configuredCodexReasoningEffort())),
+      (usesWindowsCliFallback() ? listModelsViaStdio({ codexBin: config.codexBin }) : client.listModels())
+        .then((result) => normalizeModelsResponse(result, configuredCodexReasoningEffort())),
       qwenProvider.listModels(),
       claudeProvider.listModels(),
     ]);
@@ -276,7 +288,7 @@ async function listModels() {
     return normalizeModelsResponse(await listModelsViaStdio({ codexBin: config.codexBin }), configuredCodexReasoningEffort());
   }
   return normalizeModelsResponse(
-    await client.request("model/list", { limit: 100 }),
+    await client.listModels(),
     configuredCodexReasoningEffort(),
   );
 }
@@ -314,8 +326,9 @@ function fileContentType(filePath) {
 
 async function sendFilePreview(res, candidate, previewRoot = null) {
   const filePath = await normalizeWorkspacePath(candidate);
+  await inlineMedia.wait(filePath);
   const realFile = await fs.realpath(filePath);
-  const roots = [...config.fileRoots, UPLOAD_ROOT, ...(latestProjectSnapshot?.projects || []).map(project => project.cwd).filter(Boolean)];
+  const roots = [...config.fileRoots, UPLOAD_ROOT, INLINE_MEDIA_ROOT, ...(latestProjectSnapshot?.projects || []).map(project => project.cwd).filter(Boolean)];
   const withinRealRoots = async values => {
     for (const root of values) {
       try { if (isPathInside(await fs.realpath(root), realFile)) return true; } catch {}
@@ -446,6 +459,10 @@ function getThreadId(message) {
 }
 
 function writeSse(res, event, data, id = null) {
+  if (res.destroyed || res.writableEnded) return;
+  // A stalled phone reconnects and reconciles history instead of retaining an
+  // unbounded queue of token events in the controller.
+  if (res.writableLength > 1024 * 1024) { res.destroy(); return; }
   res.write(`${id === null ? "" : `id: ${id}\n`}event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
@@ -457,20 +474,38 @@ function remember(message) {
   const threadId = getThreadId(message);
   if (!threadId) return null;
   const history = eventHistory.get(threadId) || [];
-  const record = { id: ++eventSequence, message };
+  const record = { id: `${eventEpoch}:${++eventSequence}`, message };
   history.push(record);
   if (history.length > EVENT_HISTORY_LIMIT) history.splice(0, history.length - EVENT_HISTORY_LIMIT);
   eventHistory.set(threadId, history);
   return record;
 }
 
+function withMediaReferences(item) {
+  const images = mediaAttachments(item);
+  if (images.length) {
+    const { result: _result, output: _output, ...metadata } = item;
+    return { ...metadata, id: `${item.id}-images`, type: "imageArtifact", attachments: inlineMedia.externalize(images) };
+  }
+  return item.attachments?.length ? { ...item, attachments: inlineMedia.externalize(item.attachments) } : item;
+}
+
 function publish(message) {
   if (message.params?.item) {
-    const attachments = mediaAttachments(message.params.item);
-    if (attachments.length) message = { ...message, params: { ...message.params, item: { ...message.params.item,
-      id: `${message.params.item.id}-images`, type: "imageArtifact", attachments } } };
+    message = { ...message, params: { ...message.params, item: withMediaReferences(message.params.item) } };
   }
   const threadId = getThreadId(message);
+  if (threadId && ["turn/started", "turn/completed", "turn/failed", "turn/interrupted", "turn/cancelled", "turn/canceled", "thread/status/changed"].includes(message.method)) apiAgentStatusCache.delete(threadId);
+  const activity = message.params?.item;
+  if (threadId && activity?.type === "collabAgentToolCall") {
+    const states = runtimeSubagentStates.get(threadId) || {};
+    for (const [id, value] of Object.entries(activity.agentsStates || {})) {
+      states[id] = { status: agentStatus(value.status), updatedAt: Date.now() / 1000 };
+      apiAgentStatusCache.delete(id);
+    }
+    runtimeSubagentStates.set(threadId, states);
+    scheduleThreadSync("subagent-status", 100);
+  }
   const record = remember(message);
   if (threadId && ["turn/completed", "turn/failed", "turn/interrupted", "turn/cancelled", "turn/canceled"].includes(message.method)) {
     ownedRunningThreads.delete(threadId);
@@ -485,6 +520,9 @@ function publish(message) {
   if ([
     "thread/started",
     "thread/archived",
+    "thread/unarchived",
+    "thread/status/changed",
+    "thread/metadata/updated",
     "thread/name/updated",
     "turn/started",
     "turn/completed",
@@ -541,7 +579,7 @@ function approvalFromRequest(message) {
 }
 
 client.on("serverRequest", (message) => {
-  if (["item/tool/requestUserInput", "mcpServer/elicitation/request"].includes(message.method)) {
+  if (["item/tool/requestUserInput", "tool/requestUserInput", "mcpServer/elicitation/request"].includes(message.method)) {
     const params = message.params || {};
     const fields = Object.entries(params.requestedSchema?.properties || {}).map(([key, value]) => {
       const schema = value && typeof value === "object" ? value : {};
@@ -555,7 +593,8 @@ client.on("serverRequest", (message) => {
         required: params.requestedSchema?.required?.includes(key) || false,
       };
     });
-    const input = { ...params, id: String(message.id), method: message.method, fields };
+    const method = message.method === "tool/requestUserInput" ? "item/tool/requestUserInput" : message.method;
+    const input = { ...params, id: String(message.id), method, fields };
     pendingInputs.set(input.id, input);
     broadcastGlobal("input/requested", input);
     return;
@@ -595,6 +634,8 @@ client.on("disconnected", () => {
   ownedRunningThreads.clear();
   for (const id of pendingInputs.keys()) broadcastGlobal("input/resolved", { id });
   pendingInputs.clear();
+  for (const id of pendingApprovals.keys()) broadcastGlobal("approval/resolved", { id });
+  pendingApprovals.clear();
 });
 
 export function scheduleThreadUnsubscribe(threadId, delay = 250) {
@@ -646,14 +687,22 @@ function subscribeGlobal(res) {
   return cleanup;
 }
 
-function replayEvents(threadId, res) {
-  for (const record of eventHistory.get(threadId) || []) {
+function replayEvents(threadId, res, cursor) {
+  const history = eventHistory.get(threadId) || [];
+  const cursorIndex = cursor ? history.findIndex(record => record.id === cursor) : -1;
+  const resetRequired = Boolean(cursor && cursorIndex < 0);
+  writeSse(res, "replay-start", { threadId, resumed: Boolean(cursor), resetRequired });
+  const records = resetRequired ? [] : cursor ? history.slice(cursorIndex + 1) : history;
+  for (const record of records) {
     const { message } = record;
     writeSse(res, "notification", message, record.id);
     if (message.method === "item/agentMessage/delta") {
       writeSse(res, "delta", { delta: message.params?.delta || "", raw: message }, record.id);
     }
   }
+  if (resetRequired) writeSse(res, "history/changed", { threadId, reason: "replay-gap" });
+  const latestEventId = history.at(-1)?.id || null;
+  writeSse(res, "replay-complete", { threadId, resetRequired, latestEventId }, latestEventId);
 }
 
 async function fileListing(candidate) {
@@ -858,7 +907,70 @@ async function projectReview(candidate) {
 
 async function listAllThreads(archived = false) {
   // Share visibility across projects, search, thread lists and SSE snapshots.
-  return (await listProviderThreads(archived)).filter((thread) => projectCwdForThread(thread) !== null);
+  const threads = threadsWithHierarchy(await listProviderThreads(archived)).filter((thread) => projectCwdForThread(thread) !== null);
+  if (!archived) latestThreadHierarchy = threads;
+  return threads;
+}
+
+const CODEX_SOURCE_KINDS = ["cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview", "subAgentCompact", "subAgentThreadSpawn", "subAgentOther", "unknown"];
+const SUBAGENT_SOURCE_KINDS = CODEX_SOURCE_KINDS.filter(source => source.startsWith("subAgent"));
+
+async function listCodexThreads(archived) {
+  if (config.historySource === "cli-local") return listCliThreads({ archived, includeSubagents: true, includeArchivedSubagents: true });
+  const list = async (archiveFilter, sourceKinds) => {
+    const threads = [];
+    let cursor = null;
+    do {
+      const result = await client.request("thread/list", { limit: 100, archived: archiveFilter, cursor, sortDirection: "desc", sourceKinds });
+      threads.push(...(result.data || []));
+      cursor = result.nextCursor || null;
+    } while (cursor);
+    return threads;
+  };
+  // Completed child threads may be archived independently of their parent.
+  const [current, otherChildren, local] = await Promise.all([
+    list(archived, CODEX_SOURCE_KINDS), list(!archived, SUBAGENT_SOURCE_KINDS),
+    listCliThreads({ archived: null, includeSubagents: true }).catch(() => []),
+  ]);
+  const localById = new Map(local.map(thread => [thread.id, thread]));
+  const merged = new Map([...current, ...otherChildren].map(thread => {
+    const persisted = localById.get(thread.id);
+    if (!persisted) return [thread.id, { ...thread, _subagentStates: runtimeSubagentStates.get(thread.id) || {}, _statusFromHistory: false }];
+    const relationship = threadRelationship(thread);
+    return [thread.id, { ...persisted, ...thread,
+      parentThreadId: relationship.parentThreadId || persisted.parentThreadId,
+      agentNickname: relationship.agentNickname || persisted.agentNickname,
+      agentRole: relationship.agentRole || persisted.agentRole,
+      agentPath: relationship.agentPath || persisted.agentPath,
+      agentStatus: thread.status?.type === "idle" && persisted.agentStatus === "active" ? "unknown" : persisted.agentStatus,
+      syncRevision: persisted.syncRevision,
+      _subagentStates: { ...persisted._subagentStates, ...runtimeSubagentStates.get(thread.id) },
+      _agentStatusUpdatedAt: persisted._agentStatusUpdatedAt,
+      _statusFromHistory: false,
+    }];
+  }));
+  for (const thread of local) if (!merged.has(thread.id) && threadRelationship(thread).isSubagent) merged.set(thread.id, thread);
+  const visibleChildren = flattenThreads(threadsWithHierarchy([...merged.values()])).filter(thread => thread.parentThreadId);
+  const needsLifecycle = visibleChildren.filter(thread => ["unknown", "pending"].includes(thread.agentStatus) && thread.status?.type !== "active");
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(4, needsLifecycle.length) }, async () => {
+    while (next < needsLifecycle.length) {
+      const summary = needsLifecycle[next++];
+      const thread = merged.get(summary.id);
+      const revision = `${thread.updatedAt || 0}:${thread.status?.type || ""}`;
+      let cached = apiAgentStatusCache.get(thread.id);
+      if (!cached || cached.revision !== revision || cached.failed && Date.now() - cached.loadedAt > 30_000) {
+        cached = { revision, loadedAt: Date.now(), failed: false };
+        cached.reading = client.request("thread/turns/list", { threadId: thread.id, limit: 1, sortDirection: "desc", itemsView: "notLoaded" })
+          .then(result => threadAgentStatus({ turns: result.data || [] }))
+          .catch(() => { cached.failed = true; return "unknown"; });
+        apiAgentStatusCache.set(thread.id, cached);
+      }
+      thread.agentStatus = await cached.reading;
+    }
+  }));
+  for (const id of apiAgentStatusCache.keys()) if (!merged.has(id)) apiAgentStatusCache.delete(id);
+  return [...merged.values()];
 }
 
 async function listProviderThreads(archived = false) {
@@ -866,7 +978,7 @@ async function listProviderThreads(archived = false) {
   if (usesClaudeProvider()) return claudeProvider.listThreads({ archived });
   if (usesBothProviders()) {
     const [codexResult, qwenResult] = await Promise.allSettled([
-      config.historySource === "cli-local" ? listCliThreads({ archived }) : client.request("thread/list", { limit: 100, archived, sortDirection: "desc" }).then((result) => result.data || []),
+      listCodexThreads(archived),
       qwenProvider.listThreads({ archived }),
     ]);
     const codexThreads = codexResult.status === "fulfilled"
@@ -877,26 +989,13 @@ async function listProviderThreads(archived = false) {
   }
   if (usesAllProviders()) {
     const [codexResult, qwenResult, claudeResult] = await Promise.allSettled([
-      listCliThreads({ archived }), qwenProvider.listThreads({ archived }), claudeProvider.listThreads({ archived }),
+      listCodexThreads(archived), qwenProvider.listThreads({ archived }), claudeProvider.listThreads({ archived }),
     ]);
     const codexThreads = codexResult.status === "fulfilled" ? codexResult.value.map((thread) => ({ ...thread, provider: "codex" })) : [];
     return [...codexThreads, ...(qwenResult.status === "fulfilled" ? qwenResult.value : []), ...(claudeResult.status === "fulfilled" ? claudeResult.value : [])]
       .sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0));
   }
-  if (config.historySource === "cli-local") return listCliThreads({ archived });
-  const threads = [];
-  let cursor = null;
-  do {
-    const result = await client.request("thread/list", {
-      limit: 100,
-      archived,
-      cursor,
-      sortDirection: "desc",
-    });
-    threads.push(...(result.data || []));
-    cursor = result.nextCursor || null;
-  } while (cursor);
-  return threads;
+  return listCodexThreads(archived);
 }
 
 async function readThreadDetail(threadId, { limit = Number.MAX_SAFE_INTEGER, before = null, around = null } = {}) {
@@ -910,12 +1009,7 @@ async function readThreadDetail(threadId, { limit = Number.MAX_SAFE_INTEGER, bef
         const thread = result.thread || result;
         return { thread, turns: thread.turns || [] };
       });
-  const turns = await mergeApprovalHistory(threadId, (fullDetail.turns || []).map(turn => ({
-    ...turn, items: (turn.items || []).map(item => {
-      const attachments = mediaAttachments(item);
-      return attachments.length ? { ...item, id: `${item.id}-images`, type: "imageArtifact", attachments } : item;
-    }),
-  })));
+  const turns = fullDetail.turns || [];
   const aroundIndex = around ? turns.findIndex((turn) => turn.id === around) : -1;
   const beforeIndex = before ? turns.findIndex((turn) => turn.id === before) : turns.length;
   let end = beforeIndex >= 0 ? beforeIndex : turns.length;
@@ -925,9 +1019,24 @@ async function readThreadDetail(threadId, { limit = Number.MAX_SAFE_INTEGER, bef
     end = Math.min(turns.length, start + limit);
     start = Math.max(0, end - limit);
   }
-  const page = turns.slice(start, end);
+  const page = await mergeApprovalHistory(threadId, turns.slice(start, end).map(turn => ({
+    ...turn, items: (turn.items || []).map(withMediaReferences),
+  })));
+  const { turns: _allTurns, ...thread } = fullDetail.thread;
+  const known = flattenThreads(latestThreadHierarchy).find(summary => summary.id === threadId);
+  const localHierarchy = known ? [] : threadsWithHierarchy(await listCliThreads({ archived: null, includeSubagents: true }).catch(() => []));
+  const summary = known || flattenThreads(localHierarchy).find(summary => summary.id === threadId);
+  const { isSubagent, ...relationship } = threadRelationship({ ...summary, ...thread, parentThreadId: thread.parentThreadId || summary?.parentThreadId });
+  const useKnownAgentStatus = summary && thread.status?.type !== "active" && (summary.updatedAt || 0) >= (thread.updatedAt || 0)
+    && summary.status?.type === thread.status?.type && !["unknown", "pending"].includes(summary.agentStatus);
+  delete thread._subagentStates;
+  delete thread._agentStatusUpdatedAt;
+  delete thread._statusFromHistory;
   return {
-    thread: fullDetail.thread,
+    thread: { ...thread, ...relationship,
+      ...(isSubagent ? { canAcceptDirectInput: false, agentStatus: useKnownAgentStatus ? summary.agentStatus : threadAgentStatus(fullDetail.thread) } : {}),
+      subagents: summary?.subagents || [],
+    },
     turns: page,
     hasMoreBefore: start > 0,
     nextBefore: start > 0 ? page[0]?.id || null : null,
@@ -951,9 +1060,9 @@ function searchableConversationMessages(turns = []) {
   const data = [];
   for (const turn of turns) {
     const items = turn.items || [];
-    const finalAgentIndex = items.findLastIndex((item) => item.type === "agentMessage" && item.phase === "final_answer") >= 0
-      ? items.findLastIndex((item) => item.type === "agentMessage" && item.phase === "final_answer")
-      : items.findLastIndex((item) => item.type === "agentMessage");
+    const finalAgentIndex = items.findLastIndex((item) => (item.type === "plan" || item.type === "agentMessage" && item.phase === "final_answer")) >= 0
+      ? items.findLastIndex((item) => (item.type === "plan" || item.type === "agentMessage" && item.phase === "final_answer"))
+      : items.findLastIndex((item) => ["agentMessage", "plan"].includes(item.type));
     items.forEach((item, index) => {
       if (item.type !== "userMessage" && index !== finalAgentIndex) return;
       const text = itemText(item);
@@ -983,29 +1092,37 @@ async function searchConversationMessages(query) {
   const trimmed = String(query || "").trim();
   if (!trimmed) return [];
   const threads = await listAllThreads(false);
-  const settled = await Promise.allSettled(threads.map(async (thread) => {
-    const turns = Array.isArray(thread.turns)
-      ? thread.turns
-      : (await readThreadDetail(thread.id)).turns;
-    return searchableConversationMessages(turns).flatMap((item) => {
-      const snippet = searchSnippet(item.text, trimmed);
-      if (!snippet) return [];
-      return [{
-        id: `${thread.id}:${item.id}`,
-        threadId: thread.id,
-        messageId: item.id,
-        turnId: item.turnId,
-        role: item.role,
-        text: item.text.slice(0, 240),
-        snippet,
-        createdAt: item.createdAt,
-      }];
-    });
+  const results = new Array(threads.length);
+  let next = 0;
+  let count = 0;
+  // Background search must leave disk capacity for opening the selected chat.
+  await Promise.all(Array.from({ length: Math.min(2, threads.length) }, async () => {
+    while (next < threads.length && count < 500) {
+      const index = next++;
+      const thread = threads[index];
+      try {
+        const turns = Array.isArray(thread.turns) ? thread.turns
+          : config.historySource === "cli-local" && !await isQwenThread(thread.id) && !await isClaudeThread(thread.id)
+          ? (await readCliThreadById(thread.id)).turns : (await readThreadDetail(thread.id)).turns;
+        results[index] = searchableConversationMessages(turns).flatMap((item) => {
+          const snippet = searchSnippet(item.text, trimmed);
+          if (!snippet) return [];
+          return [{
+            id: `${thread.id}:${item.id}`,
+            threadId: thread.id,
+            messageId: item.id,
+            turnId: item.turnId,
+            role: item.role,
+            text: item.text.slice(0, 240),
+            snippet,
+            createdAt: item.createdAt,
+          }];
+        });
+        count += results[index].length;
+      } catch { results[index] = []; }
+    }
   }));
-  return settled
-    .filter((result) => result.status === "fulfilled")
-    .flatMap((result) => result.value)
-    .slice(0, 500);
+  return results.flat().slice(0, 500);
 }
 
 function compactTurn(turn) {
@@ -1023,9 +1140,9 @@ function compactTurn(turn) {
       detailsLoaded: true,
     };
   }
-  const finalAgentIndex = items.findLastIndex((item) => item.type === "agentMessage" && item.phase === "final_answer") >= 0
-    ? items.findLastIndex((item) => item.type === "agentMessage" && item.phase === "final_answer")
-    : items.findLastIndex((item) => item.type === "agentMessage");
+  const finalAgentIndex = items.findLastIndex((item) => (item.type === "plan" || item.type === "agentMessage" && item.phase === "final_answer")) >= 0
+    ? items.findLastIndex((item) => (item.type === "plan" || item.type === "agentMessage" && item.phase === "final_answer"))
+    : items.findLastIndex((item) => ["agentMessage", "plan"].includes(item.type));
   const visibleItems = items.filter((item, index) => item.type === "userMessage" || index === finalAgentIndex || item.attachments?.length);
   const processItemCount = Math.max(0, items.length - visibleItems.length);
   return {
@@ -1040,8 +1157,8 @@ function compactThreadDetail(detail) {
   return {
     thread: detail.thread,
     turns: (detail.turns || []).map(compactTurn),
-    hasMoreBefore: false,
-    nextBefore: null,
+    hasMoreBefore: detail.hasMoreBefore,
+    nextBefore: detail.nextBefore,
   };
 }
 
@@ -1087,7 +1204,7 @@ function projectCwdForThread(thread) {
 
 export function projectsFromThreads(threads) {
   const projects = new Map();
-  for (const thread of threads) {
+  for (const thread of threadsWithHierarchy(threads)) {
     const cwd = projectCwdForThread(thread);
     if (cwd === null) continue;
     if (!projects.has(cwd)) {
@@ -1119,6 +1236,8 @@ function projectRootsFromThreads(threads) {
 
 async function normalizeWorkspacePath(candidate) {
   if (isUploadedImagePath(candidate)) return path.resolve(candidate);
+  if (candidate && path.dirname(path.resolve(candidate)) === INLINE_MEDIA_ROOT
+      && /^[a-f0-9]{64}\.(png|jpg|gif|webp)$/.test(path.basename(candidate))) return path.resolve(candidate);
   try {
     return normalizePath(candidate);
   } catch (error) {
@@ -1151,7 +1270,7 @@ function isUploadedImagePath(candidate) {
 }
 
 function threadSignature(threads) {
-  return JSON.stringify(threads.map((thread) => ({
+  return JSON.stringify(flattenThreads(threads).map((thread) => ({
     id: thread.id,
     cwd: thread.cwd || "",
     name: thread.name || "",
@@ -1160,6 +1279,11 @@ function threadSignature(threads) {
     syncRevision: thread.syncRevision || "",
     status: thread.status?.type || "",
     activeFlags: thread.status?.activeFlags || [],
+    parentThreadId: thread.parentThreadId || null,
+    agentStatus: thread.agentStatus || "",
+    agentNickname: thread.agentNickname || "",
+    agentRole: thread.agentRole || "",
+    agentPath: thread.agentPath || "",
   })));
 }
 
@@ -1173,7 +1297,7 @@ function snapshotFromThreads(threads) {
 }
 
 function scheduleThreadSync(reason = "manual", delay = 0) {
-  if (syncTimer) clearTimeout(syncTimer);
+  if (syncTimer) return;
   syncTimer = setTimeout(() => {
     syncTimer = null;
     syncThreads(reason).catch((error) => console.warn(`Cloudex sync failed: ${error.message}`));
@@ -1210,16 +1334,39 @@ async function syncThreads(reason = "manual") {
   }
 }
 
+export function notifyHistoryChanged(file) {
+  const threadId = file ? threadIdFromPath(file) : null;
+  for (const id of threadId ? [threadId] : subscribers.keys()) changedHistoryThreads.add(id);
+  if (!historyChangeTimer) historyChangeTimer = setTimeout(() => {
+    historyChangeTimer = null;
+    for (const id of changedHistoryThreads) {
+      for (const res of subscribers.get(id) || []) writeSse(res, "history/changed", { threadId: id });
+    }
+    changedHistoryThreads.clear();
+  }, 100);
+  scheduleThreadSync("session-changed", 100);
+}
+
 function startThreadSync() {
   scheduleThreadSync("startup", 0);
+  if (hasCodexProvider() && config.historySource === "cli-local") {
+    stopWatchingSessions = watchCliSessions(notifyHistoryChanged, {
+      getObservedThreadIds: () => observedThreadIds((latestProjectSnapshot?.projects || []).flatMap(project => project.threads || []), subscribers.keys()),
+    });
+  }
   syncInterval = setInterval(() => scheduleThreadSync("poll", 0), 3000);
 }
 
 function stopThreadSync() {
+  stopWatchingSessions?.();
+  stopWatchingSessions = null;
   if (syncTimer) clearTimeout(syncTimer);
   if (syncInterval) clearInterval(syncInterval);
   syncTimer = null;
   syncInterval = null;
+  clearTimeout(historyChangeTimer);
+  historyChangeTimer = null;
+  changedHistoryThreads.clear();
 }
 
 async function normalizeThreadCwd(candidate) {
@@ -1277,7 +1424,7 @@ async function resolveActiveTurn(threadId, { refresh = false } = {}) {
   if (cachedTurnId && !refresh) return { turnId: cachedTurnId, source: "cache" };
   const result = await readThreadDetail(threadId);
   const thread = result.thread || result;
-  const turnId = thread?.status?.type === "idle" ? null : findActiveTurnId(thread);
+  const turnId = thread?.status?.type === "idle" ? null : findActiveTurnId(result);
   if (turnId) client.setActiveTurn(threadId, turnId);
   else client.clearActiveTurn(threadId);
   return {
@@ -1412,6 +1559,9 @@ export async function handle(req, res, url) {
       port: config.port,
       fileRoots: config.fileRoots,
       messageQueue: true,
+      ownedRunningThreadCount: ownedRunningThreads.size,
+      pendingApprovalCount: pendingApprovals.size,
+      pendingInputCount: pendingInputs.size,
     });
   }
   if (req.method === "GET" && url.pathname === "/api/models") {
@@ -1452,7 +1602,8 @@ export async function handle(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/events") {
     res.writeHead(200, {
       "content-type": "text/event-stream; charset=utf-8",
-      "cache-control": "no-cache",
+      "cache-control": "no-cache, no-transform",
+      "x-accel-buffering": "no",
       connection: "keep-alive",
       "access-control-allow-origin": "*",
     });
@@ -1491,7 +1642,7 @@ export async function handle(req, res, url) {
     const input = pendingInputs.get(id);
     if (!input) return json(res, 409, { error: "Input request is no longer pending" });
     const response = await body(req);
-    if (input.method === "item/tool/requestUserInput") {
+    if (["item/tool/requestUserInput", "tool/requestUserInput"].includes(input.method)) {
       if (!response.answers || typeof response.answers !== "object" || Array.isArray(response.answers)) {
         return json(res, 422, { error: "answers must be an object" });
       }
@@ -1568,7 +1719,7 @@ export async function handle(req, res, url) {
   if (req.method === "GET" && turnDetailMatch) {
     const threadId = decodeURIComponent(turnDetailMatch[1]);
     const turnId = decodeURIComponent(turnDetailMatch[2]);
-    const detail = await readThreadDetail(threadId);
+    const detail = await readThreadDetail(threadId, { limit: 1, around: turnId });
     const turn = detail.turns.find((candidate) => candidate.id === turnId);
     if (!turn) {
       const error = new Error("Turn not found");
@@ -1595,15 +1746,14 @@ export async function handle(req, res, url) {
     const claudeThread = await isClaudeThread(threadId);
     res.writeHead(200, {
       "content-type": "text/event-stream; charset=utf-8",
-      "cache-control": "no-cache",
+      "cache-control": "no-cache, no-transform",
+      "x-accel-buffering": "no",
       connection: "keep-alive",
       "access-control-allow-origin": "*",
     });
     const cleanup = subscribe(threadId, res, url.searchParams.get("lease") === "1");
     writeSse(res, "ready", { threadId, mode: "api-only" });
-    replayEvents(threadId, res);
-    // Let clients distinguish replayed history from newly arriving events.
-    writeSse(res, "replay-complete", { threadId });
+    replayEvents(threadId, res, req.headers["last-event-id"]);
     if (qwenThread) {
       writeSse(res, "subscribed", { threadId, provider: "qwen" });
     } else if (claudeThread) {

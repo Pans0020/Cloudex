@@ -6,6 +6,7 @@ import UIKit
 enum CloudexTheme {
     static let canvasUI = adaptive(light: (0.955, 0.963, 0.959), dark: (0.067, 0.080, 0.086))
     static let canvas = Color(canvasUI)
+    static let homeCanvas = Color(adaptive(light: (0.982, 0.984, 0.980), dark: (0.067, 0.080, 0.086)))
     static let surface = Color(adaptive(light: (1, 1, 1), dark: (0.12, 0.14, 0.15)))
     static let accent = Color(adaptive(light: (0.08, 0.40, 0.37), dark: (0.49, 0.83, 0.77)))
     static let userBubble = Color(adaptive(light: (0.89, 0.95, 0.93), dark: (0.12, 0.23, 0.22)))

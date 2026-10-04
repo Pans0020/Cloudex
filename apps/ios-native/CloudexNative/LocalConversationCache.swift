@@ -34,7 +34,9 @@ final class LocalConversationCache {
 
     private func projectsFileURL(profileID: String) -> URL {
         let safeID = profileID.replacingOccurrences(of: "/", with: "_")
-        return rootURL.appendingPathComponent("projects-\(safeID).json")
+        // Older project snapshots flattened subagents and lost their parent IDs.
+        // Refresh that index while preserving all existing conversation caches.
+        return rootURL.appendingPathComponent("projects-v2-\(safeID).json")
     }
 
     func loadThread(threadID: String, profileID: String) -> CachedThreadDetail? {
@@ -79,10 +81,10 @@ final class LocalConversationCache {
                     detailsLoaded: true
                 )
             }
-            let finalAgentIndex = items.lastIndex { $0.type == "agentMessage" && $0.phase == "final_answer" }
-                ?? items.lastIndex { $0.type == "agentMessage" }
+            let finalAgentIndex = items.lastIndex { $0.type == "agentMessage" && $0.phase == "final_answer" || $0.type == "plan" }
+                ?? items.lastIndex { $0.type == "agentMessage" || $0.type == "plan" }
             let visibleItems = items.enumerated().compactMap { index, item in
-                item.type == "userMessage" || index == finalAgentIndex ? item : nil
+                item.type == "userMessage" || index == finalAgentIndex || !(item.attachments ?? []).isEmpty ? item : nil
             }
             let processItemCount = max(turn.processItemCount ?? 0, items.count - visibleItems.count)
             return CloudexTurn(

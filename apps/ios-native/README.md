@@ -9,6 +9,7 @@
 - 新建、继续、停止、归档对话
 - 模型读取与选择
 - SSE 实时任务状态和流式回复
+- 子智能体归入主会话，显示运行、完成、失败等状态；点开可查看只读历史和嵌套子智能体
 - 错误信息同步显示
 - 浏览并附加电脑端文件
 - 打开对话后自动定位到最新记录
@@ -16,12 +17,12 @@
 - 输入栏可选手机照片并上传为附件，麦克风可将语音转成可编辑草稿
 - 从系统分享菜单将截图、照片、网页或文字加入待分享收件箱；打开 Cloudex 后选择主机和会话，再检查并发送
 - 主屏幕和锁屏小组件显示最近一次 App 同步的主机与运行任务（不是后台实时状态）
-- 手机退出或切到后台时断开会话订阅，服务端释放对 Codex Desktop 的占用
+- 手机退出或切到后台时断开自身会话订阅；查看主会话或子智能体历史使用只读连接
 
 ## 运行
 
 1. 先在项目根目录运行 `./start-cloudex.sh`，确保本地服务器的 `8890` 端口可访问。
-2. 用本机可用的 `Xcode-beta.app` 打开 `CloudexNative.xcodeproj`。
+2. 用本机安装的 Xcode 打开 `CloudexNative.xcodeproj`。
 3. 选择模拟器或已签名的真机，运行 `CloudexNative` Scheme。
 4. 在 App 右上角设置中填写：
    - 局域网：`http://电脑局域网IP:8890`
@@ -34,7 +35,7 @@
 ## 命令行编译检查
 
 ```bash
-DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer \
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   xcodebuild \
   -project CloudexNative.xcodeproj \
   -scheme CloudexNative \
