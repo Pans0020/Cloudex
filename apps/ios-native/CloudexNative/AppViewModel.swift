@@ -214,6 +214,7 @@ final class AppViewModel: ObservableObject {
     private var detailPageTask: Task<ThreadDetail, Error>?
     private var searchReturnDetail: ThreadDetail?
     private var sendingRequestID: UUID?
+    private var forkRequestID: UUID?
     private var refreshGeneration: Int?
     private var initialCacheLoadGeneration: Int?
     private var pollTask: Task<Void, Never>?
@@ -532,7 +533,7 @@ final class AppViewModel: ObservableObject {
             ))
         }
         if let pendingOutgoing {
-            let persisted = pendingOutgoing.executionStatus == "sent" && (detail?.turns ?? []).contains { turn in
+            let persisted = ["sent", "unconfirmed"].contains(pendingOutgoing.executionStatus ?? "") && (detail?.turns ?? []).contains { turn in
                 (pendingOutgoing.sourceTurnID == nil
                     ? (turn.startedAt ?? 0) >= (pendingOutgoing.createdAt ?? 0) - 30
                     : turn.id == pendingOutgoing.sourceTurnID)
@@ -723,7 +724,7 @@ final class AppViewModel: ObservableObject {
 
     private func userMessagePresentation(for item: TurnItem) -> (text: String, attachments: [MessageAttachment]) {
         let source = item.renderedText
-        var attachments: [MessageAttachment] = []
+        var attachments: [MessageAttachment] = item.attachments ?? []
 
         func appendAttachment(name: String?, path: String?, image: Bool) {
             let trimmedPath = path?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1507,6 +1508,9 @@ final class AppViewModel: ObservableObject {
     private var uiCacheReadDelay: Duration = .zero
     private var uiPageDelay: Duration = .zero
     private var uiSubmitResult: Task<Data, Error>?
+    private var uiForkResult: Task<Data, Error>?
+    private var uiEditAttempts = 0
+    private var uiEditedFork: ThreadDetail?
     private var uiProcessAttempts = 0
     private var uiPageReads = 0
 
@@ -1622,6 +1626,42 @@ final class AppViewModel: ObservableObject {
         precondition(!readerSent && !readerForked && model.selectedThreadID == "native" && model.draft == parentDraft)
         precondition(protectedKeys.map { UserDefaults.standard.object(forKey: $0) as? NSObject } == protectedValues,
                      "Inspecting a subagent changed the parent's persisted composer or settings")
+        let editCheck = AppViewModel(conversationCache: cache)
+        editCheck.selectedAgentProvider = .codex
+        editCheck.selectedThreadID = "editable"
+        let editable = try! JSONDecoder().decode(ThreadDetail.self, from: Data(#"{"thread":{"id":"editable","provider":"codex","cwd":"/edit"},"turns":[{"id":"edit-turn","items":[{"id":"edit-user","type":"userMessage","content":[{"type":"text","text":"original"},{"type":"image","url":"data:image/png;base64,YQ=="}]}]}]}"#.utf8))
+        editCheck.detail = editable
+        let editableMessage = editCheck.timelineMessage(from: editable.turns[0].items![0], turnID: "edit-turn", fallbackIndex: 0)!
+        precondition(editCheck.canEditUserMessage(editableMessage) && editableMessage.attachments.count == 1)
+        var optimistic = editableMessage; optimistic.id = "outgoing-pending"
+        precondition(!editCheck.canEditUserMessage(optimistic), "An unconfirmed outgoing row must not fork a persisted message")
+        for unsafe in [#"{"type":"image","fileId":"file-hidden"}"#, #"{"type":"skill","name":"skill","path":"/skill"}"#,
+                       #"{"type":"text","text":"mention","text_elements":[{"byteRange":{"start":0,"end":3}}]}"#] {
+            let part = try! JSONDecoder().decode(TurnContent.self, from: Data(unsafe.utf8))
+            precondition(!part.canResend, "Editing must not silently discard unsupported rich input")
+            let restored = try! JSONDecoder().decode(TurnContent.self, from: JSONEncoder().encode(part))
+            precondition(!restored.canResend, "Offline input eligibility must match the original protocol input")
+        }
+        let editContext = editCheck.sentMessageEditContext(editableMessage)!
+        let unchangedDraft = editCheck.draft
+        editCheck.uiForkResult = Task { Data(#"{"thread":{"id":"retained-fork","provider":"codex","cwd":"/edit"},"sendError":"known rejection","sendUnconfirmed":false}"#.utf8) }
+        let editResult = await editCheck.editUserMessage(editContext, replacement: "  indented\n", attachments: editableMessage.attachments)
+        if case let .failed(_, fork, unknown) = editResult {
+            precondition(fork?.id == "retained-fork" && !unknown && editCheck.allThreads.contains { $0.id == "retained-fork" })
+        } else { preconditionFailure("A created fork with a rejected turn must remain recoverable") }
+        precondition(editCheck.selectedThreadID == "editable" && editCheck.draft == unchangedDraft)
+        editCheck.uiForkResult = Task {
+            try await Task.sleep(for: .milliseconds(40))
+            return Data(#"{"thread":{"id":"late-fork","provider":"codex","cwd":"/edit"},"sendError":"known rejection","sendUnconfirmed":false}"#.utf8)
+        }
+        let delayedEdit = Task { await editCheck.editUserMessage(editContext, replacement: "late", attachments: []) }
+        await Task.yield()
+        let duplicate = await editCheck.editUserMessage(editContext, replacement: "duplicate", attachments: [])
+        if case .sent = duplicate { preconditionFailure("A second edit submitted while one is pending") }
+        editCheck.selectedThreadID = "another-conversation"
+        _ = await delayedEdit.value
+        precondition(editCheck.selectedThreadID == "another-conversation" && editCheck.threadNavigationRequest == nil
+                     && !editCheck.allThreads.contains { $0.id == "late-fork" }, "A late edit response navigated the wrong conversation")
         func nativeEvent(_ method: String, _ params: [String: Any]) {
             let data = try! JSONSerialization.data(withJSONObject: ["method": method, "params": params])
             model.handleThreadEvent(SSEEvent(id: nil, name: "notification", data: data), expectedThreadID: model.selectedThreadID ?? "native")
@@ -1926,6 +1966,56 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    private func mockEditedMessage(context: SentMessageEditContext, retryFork: CloudexThread?,
+                                   payload: [String: Any]) async throws -> ForkThreadResponse {
+        uiEditAttempts += 1
+        let attempt = uiEditAttempts
+        if ProcessInfo.processInfo.arguments.contains("--ui-edit-message-fail-once"), attempt > 1 {
+            precondition(retryFork?.id == "ui-edit-fork", "A retry must send to the retained fork without creating another fork")
+        }
+        try await Task.sleep(for: .milliseconds(250))
+        if ProcessInfo.processInfo.arguments.contains("--ui-edit-message-reject-before-fork"), attempt == 1 {
+            throw APIClientError.submission(message: "模拟分叉失败，修改内容已保留", unconfirmed: false)
+        }
+        let thread = retryFork ?? CloudexThread(id: "ui-edit-fork", name: "修改后的分支", preview: payload["message"] as? String,
+            cwd: context.projectCWD, status: ThreadStatus(type: "active", activeFlags: []), model: "gpt-6-sol",
+            createdAt: Date().timeIntervalSince1970, updatedAt: Date().timeIntervalSince1970, usage: nil, provider: "codex")
+        let sourceTurns = detail?.turns ?? []
+        let cutoff = sourceTurns.firstIndex { $0.id == context.turnID } ?? 0
+        let prefix = Array(sourceTurns.prefix(cutoff))
+        uiEditedFork = ThreadDetail(thread: thread, turns: prefix)
+        if ProcessInfo.processInfo.arguments.contains("--ui-edit-message-fail-once"), attempt == 1 {
+            return ForkThreadResponse(thread: thread, sendError: "模拟发送失败，修改内容已保留", sendUnconfirmed: false)
+        }
+        let files = payload["files"] as? [[String: String]] ?? []
+        let text = payload["message"] as? String ?? ""
+        let content: [[String: Any]] = [["type": "text", "text": text]] + files.map {
+            ["type": $0["kind"] == "image" ? "localImage" : "file", "path": $0["path"] ?? "", "name": "原消息图片.png"]
+        }
+        let turn: [String: Any] = ["id": "ui-edit-turn", "status": "completed", "items": [
+            ["id": "ui-edited-user", "type": "userMessage", "content": content],
+            ["id": "ui-edited-answer", "type": "agentMessage", "text": "修改后的回复：\(text)\n保留附件：\(files.count)"]]]
+        let decoded = try JSONDecoder().decode(CloudexTurn.self, from: JSONSerialization.data(withJSONObject: turn))
+        uiEditedFork = ThreadDetail(thread: thread, turns: prefix + [decoded])
+        if ProcessInfo.processInfo.arguments.contains("--ui-edit-message-unconfirmed") {
+            return ForkThreadResponse(thread: thread, sendError: "模拟发送结果待确认", sendUnconfirmed: true)
+        }
+        return ForkThreadResponse(thread: thread, turn: SubmittedTurn(id: "ui-edit-turn"))
+    }
+
+    private func startUIEditedReply(threadID: String) {
+        guard ProcessInfo.processInfo.arguments.contains("--ui-edit-message-fixture"),
+              let snapshot = uiEditedFork, snapshot.thread.id == threadID else { return }
+        uiFixtureStreamTask?.cancel()
+        uiFixtureStreamTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(400))
+            guard !Task.isCancelled, let self, self.selectedThreadID == threadID else { return }
+            self.detail = snapshot
+            self.pendingOutgoing = nil
+            self.liveRunning = false
+        }
+    }
+
     // In-memory UI regression data only; never creates Codex sessions or contacts a server.
     private func loadUIFixture(thread: CloudexThread? = nil) async {
         if thread == nil, !ProcessInfo.processInfo.arguments.contains("--ui-preserve-details") {
@@ -1964,7 +2054,8 @@ final class AppViewModel: ObservableObject {
         }
         if !isReadOnlyViewer {
             projects = fixtureThreads.map {
-                CloudexProject(id: $0.id, name: String($0.id.dropFirst(3)), cwd: $0.cwd!, threads: [$0], updatedAt: nil)
+                CloudexProject(id: $0.id, name: String($0.id.dropFirst(3)), cwd: $0.cwd!,
+                    threads: [$0] + (uiEditedFork?.thread.cwd == $0.cwd ? [uiEditedFork!.thread] : []), updatedAt: nil)
             }
         }
         let scrollingFixture = ProcessInfo.processInfo.arguments.contains("--ui-scroll-fixture")
@@ -2042,11 +2133,18 @@ final class AppViewModel: ObservableObject {
                           ["type": "commandExecution", "id": "\(thread.id)-tool", "command": "pwd", "status": "completed", "aggregatedOutput": "子智能体工具详情"],
                           ["type": "agentMessage", "id": "\(thread.id)-answer", "text": "子智能体活动过程：\(thread.agentTitle)", "phase": thread.isActive ? "commentary" : "final_answer"]]]]
         }
+        if ProcessInfo.processInfo.arguments.contains("--ui-edit-message-fixture"), thread.id == "ui-CV",
+           var items = turns.last?["items"] as? [[String: Any]] {
+            items[0]["content"] = [["type": "text", "text": "检查第 6 轮消息"],
+                ["type": "localImage", "path": "/ui-fixture.png", "name": "原消息图片.png"]]
+            turns[turns.count - 1]["items"] = items
+        }
         let data = try! JSONSerialization.data(withJSONObject: turns)
         // No real host access: the explicit preview fixture uses a loopback file-only server.
         let paginated = ProcessInfo.processInfo.arguments.contains("--ui-pagination-fixture")
         detail = ThreadDetail(thread: thread, turns: try! JSONDecoder().decode([CloudexTurn].self, from: data),
                               hasMoreBefore: paginated, nextBefore: paginated ? "ui-older" : nil)
+        if let edited = uiEditedFork, thread.id == edited.thread.id { detail = edited }
         let renderer = UIGraphicsImageRenderer(size: CGSize(width: 200, height: 130))
         let image = renderer.image { context in
             UIColor.systemTeal.setFill(); context.fill(CGRect(x: 0, y: 0, width: 200, height: 130))
@@ -2594,9 +2692,20 @@ final class AppViewModel: ObservableObject {
         selectedProjectCWD = cwd
     }
 
-    func openThread(_ thread: CloudexThread, projectCWD: String?) async {
+    func openThread(_ thread: CloudexThread, projectCWD: String?, initialDetail: ThreadDetail? = nil,
+                    pendingMessage: ChatMessage? = nil) async {
         #if DEBUG
-        if ProcessInfo.processInfo.arguments.contains("--ui-fixture") { await loadUIFixture(thread: thread); return }
+        if ProcessInfo.processInfo.arguments.contains("--ui-fixture") {
+            await loadUIFixture(thread: thread)
+            if let initialDetail {
+                detail = initialDetail
+                pendingOutgoing = pendingMessage
+                liveRunning = pendingMessage != nil
+                threadNavigationRequest = ThreadNavigationRequest(threadID: thread.id)
+                startUIEditedReply(threadID: thread.id)
+            }
+            return
+        }
         #endif
         checkpointConversation()
         searchReturnDetail = nil
@@ -2623,15 +2732,15 @@ final class AppViewModel: ObservableObject {
         }
         selectedProjectCWD = projectCWD
         selectedThreadID = thread.id
-        pendingOutgoing = nil
+        pendingOutgoing = pendingMessage
         presentedInput = isReadOnlyConversation ? nil : pendingInputs.first { $0.threadId == thread.id }
         selectedAgentProvider = thread.agentProvider
         if !isReadOnlyViewer { UserDefaults.standard.set(selectedAgentProvider.rawValue, forKey: "cloudex.agentProvider") }
         isCreatingNew = false
         clearLiveMessages()
         localError = nil
-        attachedFiles = []
-        detail = ThreadDetail(thread: thread, turns: [])
+        if initialDetail == nil { attachedFiles = [] }
+        detail = initialDetail ?? ThreadDetail(thread: thread, turns: [])
         // Do not carry the previous conversation's model into this one.
         selectedModelID = ""
         selectedEffortID = ""
@@ -2644,14 +2753,14 @@ final class AppViewModel: ObservableObject {
             }
         }
         applyConversationModel(thread.model)
-        liveRunning = thread.isActive
+        liveRunning = pendingMessage != nil || thread.isActive
         messageIndex = []
         let cache = conversationCache
         let profileID = selectedServerProfileID ?? "default"
         let pageClient = client
         initialCacheLoadGeneration = openGeneration
         var acceptedNetwork = false
-        var acceptedCache = false
+        var acceptedCache = initialDetail != nil
         var subscribed = false
         func startUpdates() {
             guard !subscribed, isForeground, connectionGeneration == connection,
@@ -2660,6 +2769,12 @@ final class AppViewModel: ObservableObject {
             connectThreadStream(threadID: thread.id)
             if active { startPolling(threadID: thread.id) }
         }
+        if initialDetail != nil {
+            conversationLoadState = .syncing
+            isOpeningThread = false
+            threadNavigationRequest = ThreadNavigationRequest(threadID: thread.id)
+            startUpdates()
+        }
         let cacheTask = Task { @MainActor in
             defer {
                 if initialCacheLoadGeneration == openGeneration {
@@ -2667,6 +2782,8 @@ final class AppViewModel: ObservableObject {
                     checkpointConversation()
                 }
             }
+            // A newly forked conversation already has a precise local prefix.
+            if initialDetail != nil { return }
             #if DEBUG
             if uiCacheReadDelay != .zero { try? await Task.sleep(for: uiCacheReadDelay) }
             #endif
@@ -3493,20 +3610,146 @@ final class AppViewModel: ObservableObject {
         )
     }
 
-    func editUserMessage(_ message: ChatMessage, replacement: String) async -> Bool {
-        guard let threadID = selectedThreadID,
-              let turnID = message.sourceTurnID else {
-            status = "无法确定这条消息所属的对话轮次"
-            return false
-        }
+    func canEditUserMessage(_ message: ChatMessage) -> Bool {
+        guard !isReadOnlyConversation, selectedAgentProvider == .codex,
+              message.role == .user, !message.id.hasPrefix("outgoing-"),
+              let turnID = message.sourceTurnID, selectedThreadID != nil,
+              let turn = detail?.turns.first(where: { $0.id == turnID }) else { return false }
+        // Forking before a turn also excludes every steer inside that turn.
+        let inputs = (turn.items ?? []).filter { $0.type == "userMessage" }
+        return inputs.count == 1 && inputs.first?.id == message.id
+            && (inputs.first?.content ?? []).allSatisfy(\.canResend)
+            && message.attachments.allSatisfy { !($0.path ?? "").isEmpty }
+    }
+
+    func sentMessageEditContext(_ message: ChatMessage) -> SentMessageEditContext? {
+        guard canEditUserMessage(message), !isBusy, forkRequestID == nil,
+              let threadID = selectedThreadID, let turnID = message.sourceTurnID else { return nil }
+        return SentMessageEditContext(sourceThreadID: threadID, turnID: turnID,
+            connectionGeneration: connectionGeneration, openGeneration: threadOpenGeneration,
+            client: client, projectCWD: selectedProjectCWD, message: message)
+    }
+
+    private func isCurrentEdit(_ context: SentMessageEditContext) -> Bool {
+        context.connectionGeneration == connectionGeneration && context.openGeneration == threadOpenGeneration
+            && context.sourceThreadID == selectedThreadID
+            && context.client.serverURL == client.serverURL && context.client.token == client.token
+            && !isReadOnlyConversation && selectedAgentProvider == .codex
+    }
+
+    func editUserMessage(_ context: SentMessageEditContext, replacement: String,
+                         attachments: [MessageAttachment], retryFork: CloudexThread? = nil) async -> SentMessageEditResult {
         let trimmed = replacement.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return false }
-        return await forkThread(
-            threadID: threadID,
-            turnID: turnID,
-            position: "before",
-            editedMessage: trimmed
-        )
+        guard !trimmed.isEmpty || !attachments.isEmpty else {
+            return .failed(message: cloudexLocalized("消息或附件不能为空"), fork: retryFork, unconfirmed: false)
+        }
+        guard attachments.allSatisfy({ !($0.path?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) }) else {
+            return .failed(message: cloudexLocalized("部分附件无法重新发送，请移除后再试"), fork: retryFork, unconfirmed: false)
+        }
+        guard isCurrentEdit(context), !isBusy, forkRequestID == nil else {
+            return .failed(message: cloudexLocalized("对话或连接已变化，请回到原会话后重新修改"), fork: retryFork, unconfirmed: false)
+        }
+        let requestID = UUID()
+        forkRequestID = requestID
+        isBusy = true
+        defer {
+            if forkRequestID == requestID {
+                forkRequestID = nil
+                if isCurrentEdit(context) { isBusy = false }
+            }
+        }
+        var payload: [String: Any] = ["message": replacement,
+            "files": attachments.map { attachment in
+                let path = attachment.path!
+                let resolved = URL(string: path).flatMap { $0.isFileURL ? $0.path : nil } ?? path
+                return ["path": resolved, "kind": attachment.kind.rawValue]
+            }]
+        if !selectedModelID.isEmpty { payload["model"] = selectedModelID }
+        if !selectedEffortID.isEmpty { payload["effort"] = selectedEffortID }
+        payload.merge(agentModePayload) { _, new in new }
+        if retryFork == nil { payload["turnId"] = context.turnID; payload["position"] = "before" }
+        do {
+            let result = try await postEditedMessage(context: context, retryFork: retryFork, payload: payload)
+            guard isCurrentEdit(context) else {
+                return .failed(message: cloudexLocalized("对话或连接已变化，新分支已保存在原服务器"), fork: result.thread, unconfirmed: true)
+            }
+            rememberFork(result.thread)
+            if let error = result.sendError {
+                return .failed(message: error, fork: result.thread, unconfirmed: result.sendUnconfirmed == true)
+            }
+            if result.sendUnconfirmed == true {
+                return .failed(message: cloudexLocalized("发送结果尚未确认，请查看分支核对，避免重复发送"), fork: result.thread, unconfirmed: true)
+            }
+            let cutoff = detail?.turns.firstIndex { $0.id == context.turnID } ?? 0
+            let prefix = Array((detail?.turns ?? []).prefix(cutoff))
+            let outgoing = ChatMessage(id: "outgoing-\(UUID().uuidString)", role: .user, text: replacement,
+                executionStatus: "sent", createdAt: Date().timeIntervalSince1970,
+                sourceTurnID: result.turn?.id, attachments: attachments)
+            startForkConversation(result.thread, turns: prefix, outgoing: outgoing, context: context)
+            status = cloudexLocalized("已从修改后的消息继续对话")
+            return .sent
+        } catch {
+            guard isCurrentEdit(context) else {
+                return .failed(message: cloudexLocalized("对话或连接已变化，请在原服务器核对发送结果"), fork: retryFork, unconfirmed: true)
+            }
+            let unconfirmed: Bool
+            if case let APIClientError.submission(_, unknown) = error { unconfirmed = unknown }
+            else { unconfirmed = error is URLError || !(error is APIClientError) || isInvalidWriteResponse(error) }
+            return .failed(message: unconfirmed
+                ? cloudexLocalized("发送结果尚未确认，请检查会话列表后再决定是否重发")
+                : error.localizedDescription, fork: retryFork, unconfirmed: unconfirmed)
+        }
+    }
+
+    private func isInvalidWriteResponse(_ error: Error) -> Bool {
+        if case APIClientError.invalidResponse = error { return true }
+        return false
+    }
+
+    private func postEditedMessage(context: SentMessageEditContext, retryFork: CloudexThread?,
+                                   payload: [String: Any]) async throws -> ForkThreadResponse {
+        #if DEBUG
+        if let uiForkResult { return try JSONDecoder().decode(ForkThreadResponse.self, from: await uiForkResult.value) }
+        if ProcessInfo.processInfo.arguments.contains("--ui-edit-message-fixture") {
+            return try await mockEditedMessage(context: context, retryFork: retryFork, payload: payload)
+        }
+        #endif
+        if let retryFork {
+            let response: SendMessageResponse = try await context.client.post(
+                context.client.threadPath(retryFork.id, action: "message"), json: payload)
+            return ForkThreadResponse(thread: retryFork, turn: response.turn)
+        }
+        return try await context.client.post(context.client.threadPath(context.sourceThreadID, action: "fork"), json: payload)
+    }
+
+    private func rememberFork(_ thread: CloudexThread) {
+        let cwd = thread.cwd ?? selectedProjectCWD ?? ""
+        if let index = projects.firstIndex(where: { $0.cwd == cwd }) {
+            let project = projects[index]
+            projects[index] = CloudexProject(id: project.id, name: project.name, cwd: project.cwd,
+                threads: [thread] + project.threads.filter { $0.id != thread.id }, updatedAt: thread.updatedAt)
+        } else {
+            projects.append(CloudexProject(id: "fork-\(thread.id)", name: (cwd as NSString).lastPathComponent,
+                cwd: cwd, threads: [thread], updatedAt: thread.updatedAt))
+        }
+    }
+
+    private func startForkConversation(_ thread: CloudexThread, turns: [CloudexTurn], outgoing: ChatMessage?,
+                                       context: SentMessageEditContext) {
+        clearMessageJumpRequest()
+        let snapshot = ThreadDetail(thread: thread, turns: turns)
+        Task { [weak self] in
+            guard let self, self.isCurrentEdit(context) else { return }
+            await self.openThread(thread, projectCWD: context.projectCWD, initialDetail: snapshot, pendingMessage: outgoing)
+        }
+    }
+
+    func inspectEditedFork(_ thread: CloudexThread, context: SentMessageEditContext,
+                           replacement: String, attachments: [MessageAttachment]) {
+        guard isCurrentEdit(context), forkRequestID == nil else { return }
+        let outgoing = ChatMessage(id: "outgoing-\(UUID().uuidString)", role: .user, text: replacement,
+            executionStatus: "unconfirmed", createdAt: Date().timeIntervalSince1970, attachments: attachments)
+        startForkConversation(thread, turns: [], outgoing: outgoing, context: context)
     }
 
     private func forkThread(
@@ -3515,30 +3758,36 @@ final class AppViewModel: ObservableObject {
         position: String,
         editedMessage: String?
     ) async -> Bool {
-        guard !isReadOnlyConversation else { return false }
+        guard !isReadOnlyConversation, selectedAgentProvider == .codex, !isBusy,
+              forkRequestID == nil, selectedThreadID == threadID else { return false }
+        let context = SentMessageEditContext(sourceThreadID: threadID, turnID: turnID,
+            connectionGeneration: connectionGeneration, openGeneration: threadOpenGeneration,
+            client: client, projectCWD: selectedProjectCWD,
+            message: ChatMessage(id: "fork-source", role: .assistant, text: ""))
+        let requestID = UUID()
+        forkRequestID = requestID
         isBusy = true
-        defer { isBusy = false }
-        var payload: [String: Any] = [
-            "turnId": turnID,
-            "position": position,
-        ]
+        defer {
+            if forkRequestID == requestID {
+                forkRequestID = nil
+                if isCurrentEdit(context) { isBusy = false }
+            }
+        }
+        var payload: [String: Any] = ["turnId": turnID, "position": position]
         if let editedMessage { payload["message"] = editedMessage }
         if !selectedModelID.isEmpty { payload["model"] = selectedModelID }
         if !selectedEffortID.isEmpty { payload["effort"] = selectedEffortID }
         payload.merge(agentModePayload) { _, new in new }
         do {
-            let result: ForkThreadResponse = try await client.post(
-                client.threadPath(threadID, action: "fork"),
-                json: payload
-            )
-            clearMessageJumpRequest()
-            let projectCWD = selectedProjectCWD
-            await openThread(result.thread, projectCWD: projectCWD)
-            threadNavigationRequest = ThreadNavigationRequest(threadID: result.thread.id)
-            await refresh()
-            status = editedMessage == nil ? "已分叉对话" : "已从修改后的消息继续对话"
+            let result: ForkThreadResponse = try await context.client.post(context.client.threadPath(threadID, action: "fork"), json: payload)
+            guard isCurrentEdit(context) else { return false }
+            rememberFork(result.thread)
+            let cutoff = (detail?.turns.firstIndex { $0.id == turnID }).map { $0 + (position == "before" ? 0 : 1) } ?? 0
+            startForkConversation(result.thread, turns: Array((detail?.turns ?? []).prefix(cutoff)), outgoing: nil, context: context)
+            status = cloudexLocalized("已分叉对话")
             return true
         } catch {
+            guard isCurrentEdit(context) else { return false }
             status = "分叉对话失败：\(error.localizedDescription)"
             return false
         }

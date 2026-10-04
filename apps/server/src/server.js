@@ -34,6 +34,7 @@ const execFile = promisify(execFileCallback);
 const subscribers = new Map();
 const unsubscribeTimers = new Map();
 const ownedRunningThreads = new Set();
+const unconfirmedForkWrites = new Set();
 const streamLeaseTimers = new Map();
 const globalSubscribers = new Set();
 const eventHistory = new Map();
@@ -372,7 +373,15 @@ export function errorResponse(res, error) {
   const status = writerBusy ? 409 : error.status || (error instanceof CodexError ? 502 : 400);
   json(res, status, { error: writerBusy
     ? "此会话正由其他客户端占用写入权。仅切换电脑端对话不会释放；请关闭占用该会话的客户端后重试。"
-    : error.message || "Request failed" });
+    : error.message || "Request failed",
+    ...(error.sendUnconfirmed === undefined ? {} : { sendUnconfirmed: error.sendUnconfirmed }),
+  });
+}
+
+function writeResultUnconfirmed(error) {
+  // A JSON-RPC rejection is a confirmed failure; a lost transport reply may
+  // have followed an accepted write and must never cause an automatic retry.
+  return !error.error && !(error.status >= 400 && error.status < 500);
 }
 
 function isImage(filePath) {
@@ -507,7 +516,11 @@ function publish(message) {
     scheduleThreadSync("subagent-status", 100);
   }
   const record = remember(message);
+  if (threadId && message.method === "thread/status/changed" && ["idle", "systemError"].includes(message.params?.status?.type)) {
+    resolveUnconfirmedForkWrite(threadId);
+  }
   if (threadId && ["turn/completed", "turn/failed", "turn/interrupted", "turn/cancelled", "turn/canceled"].includes(message.method)) {
+    unconfirmedForkWrites.delete(threadId);
     ownedRunningThreads.delete(threadId);
     scheduleThreadUnsubscribe(threadId);
     const turnId = message.params?.turn?.id || message.params?.turnId;
@@ -632,11 +645,18 @@ client.on("notification", (message) => {
 
 client.on("disconnected", () => {
   ownedRunningThreads.clear();
+  for (const threadId of unconfirmedForkWrites) ownedRunningThreads.add(threadId);
   for (const id of pendingInputs.keys()) broadcastGlobal("input/resolved", { id });
   pendingInputs.clear();
   for (const id of pendingApprovals.keys()) broadcastGlobal("approval/resolved", { id });
   pendingApprovals.clear();
 });
+
+function resolveUnconfirmedForkWrite(threadId) {
+  if (!unconfirmedForkWrites.delete(threadId)) return;
+  ownedRunningThreads.delete(threadId);
+  scheduleThreadUnsubscribe(threadId);
+}
 
 export function scheduleThreadUnsubscribe(threadId, delay = 250) {
   if (!hasCodexProvider() || usesWindowsCliFallback() || ownedRunningThreads.has(threadId)) return;
@@ -1009,6 +1029,14 @@ async function readThreadDetail(threadId, { limit = Number.MAX_SAFE_INTEGER, bef
         const thread = result.thread || result;
         return { thread, turns: thread.turns || [] };
       });
+  if (unconfirmedForkWrites.has(threadId)) {
+    // Persisted CLI history can lag an accepted write. Ask the live peer only
+    // when opening an uncertain fork, without adding a background poll.
+    const live = config.historySource === "cli-local"
+      ? await client.request("thread/read", { threadId, includeTurns: false }).catch(() => null)
+      : fullDetail;
+    if (["idle", "systemError"].includes(live?.thread?.status?.type)) resolveUnconfirmedForkWrite(threadId);
+  }
   const turns = fullDetail.turns || [];
   const aroundIndex = around ? turns.findIndex((turn) => turn.id === around) : -1;
   const beforeIndex = before ? turns.findIndex((turn) => turn.id === before) : turns.length;
@@ -1381,19 +1409,50 @@ async function normalizeThreadCwd(candidate) {
   }
 }
 
-async function inputFrom(bodyData) {
-  const message = String(bodyData.message || "").trim();
-  if (!message) {
+async function inputFrom(bodyData, { checkFiles = false, preserveWhitespace = false } = {}) {
+  const rawMessage = typeof bodyData.message === "string" ? bodyData.message : "";
+  const message = preserveWhitespace ? rawMessage : rawMessage.trim();
+  if (bodyData.message != null && typeof bodyData.message !== "string") {
+    throw Object.assign(new Error("message must be a string"), { status: 422 });
+  }
+  if (bodyData.files != null && !Array.isArray(bodyData.files)) {
+    throw Object.assign(new Error("files must be an array"), { status: 422 });
+  }
+  if (!message.trim() && !bodyData.files?.length) {
     const error = new Error("message is required");
     error.status = 422;
     throw error;
   }
-  const input = [{ type: "text", text: message }];
+  const input = message.trim() ? [{ type: "text", text: message }] : [];
   for (const file of bodyData.files || []) {
-    const candidate = file.path || file;
+    const candidate = typeof file === "string" ? file : file?.url || file?.path;
+    if (typeof candidate !== "string" || !candidate.trim()) {
+      throw Object.assign(new Error("Attachment path or image URL is required"), { status: 422 });
+    }
+    if (/^(?:https?:\/\/|data:)/i.test(candidate)) {
+      let valid = /^data:image\/(?:png|jpe?g|gif|webp|bmp);base64,[A-Za-z0-9+/=\s]+$/i.test(candidate);
+      if (/^https?:\/\//i.test(candidate)) {
+        try { const url = new URL(candidate); valid = Boolean(url.hostname) && !url.username && !url.password; } catch { /* Invalid URL. */ }
+      }
+      if (!valid || file?.kind !== "image") {
+        throw Object.assign(new Error("Only image attachments support HTTP(S) or image data URLs"), { status: 422 });
+      }
+      input.push({ type: "image", url: candidate });
+      continue;
+    }
     const filePath = await normalizeWorkspacePath(candidate);
+    if (checkFiles) {
+      const metadata = await fs.stat(filePath).catch(error => {
+        if (["ENOENT", "ENOTDIR"].includes(error.code)) throw Object.assign(new Error("Attachment is no longer available"), { status: 422 });
+        throw error;
+      });
+      if (!metadata.isFile()) throw Object.assign(new Error("Attachment path is not a file"), { status: 422 });
+    }
     if (isImage(filePath)) input.push({ type: "localImage", path: filePath });
-    else input[0].text += `\n\n[Attached local file: ${filePath}]`;
+    else {
+      if (input[0]?.type !== "text") input.unshift({ type: "text", text: "" });
+      input[0].text += `${input[0].text ? "\n\n" : ""}[Attached local file: ${filePath}]`;
+    }
   }
   return input;
 }
@@ -1503,7 +1562,7 @@ async function sendThreadMessage(threadId, data) {
       const resume = await client.subscribeThread(threadId);
       const turnResult = await client.request("turn/start", {
         threadId,
-        input: await inputFrom(data),
+        input: await inputFrom(data, { preserveWhitespace: true }),
         clientUserMessageId: data.clientUserMessageId || null,
         ...collaboration,
         model: data.model || null,
@@ -1868,7 +1927,10 @@ export async function handle(req, res, url) {
       if (queue.items.some(item => ["pending", "running", "dispatching", "blocked", "unconfirmed"].includes(item.status))) {
         throw Object.assign(new Error("此会话已有排队消息，请加入队列或先处理现有队列"), { status: 409 });
       }
-      const { thread, turn } = await sendThreadMessage(threadId, data);
+      let result;
+      try { result = await sendThreadMessage(threadId, data); }
+      catch (error) { error.sendUnconfirmed = writeResultUnconfirmed(error); throw error; }
+      const { thread, turn } = result;
       scheduleThreadSync("message-sent", 100);
       return json(res, 202, { thread, turn });
     }
@@ -1941,28 +2003,49 @@ export async function handle(req, res, url) {
         throw error;
       }
       const data = await body(req);
-      const turnId = String(data.turnId || "").trim();
+      const turnId = typeof data.turnId === "string" ? data.turnId.trim() : "";
       if (!turnId) {
         const error = new Error("turnId is required");
         error.status = 422;
         throw error;
       }
-      const forkParams = { threadId };
+      const position = data.position ?? "through";
+      if (!["before", "through", "after"].includes(position)) {
+        throw Object.assign(new Error("position must be before or through"), { status: 422 });
+      }
+      const hasEditedMessage = Object.hasOwn(data, "message");
+      const input = hasEditedMessage ? await inputFrom(data, { checkFiles: true, preserveWhitespace: true }) : null;
+      if (!hasEditedMessage && data.files != null && (!Array.isArray(data.files) || data.files.length)) {
+        throw Object.assign(new Error("message is required with attachments"), { status: 422 });
+      }
+      // Metadata is enough for API-only history: Codex validates the native
+      // turn boundary before creating a fork. Avoid hydrating a large thread.
+      const source = config.historySource === "cli-local"
+        ? await readCliThreadById(threadId, { includeTurns: false })
+        : await client.request("thread/read", { threadId, includeTurns: false });
+      const sourceThread = source.thread || source;
+      if (sourceThread.canAcceptDirectInput === false || threadRelationship(sourceThread).isSubagent) {
+        throw Object.assign(new Error("Subagent conversations are read-only"), { status: 403 });
+      }
+      const forkParams = { threadId, excludeTurns: true, ...(input ? { deferGoalContinuation: true } : {}) };
       const collaboration = await collaborationFor(data);
-      if (data.position === "before") forkParams.beforeTurnId = turnId;
+      if (position === "before") forkParams.beforeTurnId = turnId;
       else forkParams.lastTurnId = turnId;
-      const forkResult = await client.request("thread/fork", forkParams);
+      let forkResult;
+      try { forkResult = await client.request("thread/fork", forkParams); }
+      catch (error) { error.sendUnconfirmed = writeResultUnconfirmed(error); throw error; }
       const forkedThread = forkResult.thread || forkResult;
       client.markThreadSubscribed(forkedThread.id);
 
       let turn = null;
+      let sendError;
+      let sendUnconfirmed;
       try {
-        const editedMessage = String(data.message || "").trim();
-        if (editedMessage) {
+        if (input) {
           ownedRunningThreads.add(forkedThread.id);
           const turnResult = await client.request("turn/start", {
             threadId: forkedThread.id,
-            input: await inputFrom({ message: editedMessage, files: data.files }),
+            input,
             ...collaboration,
             model: data.model || null,
             effort: data.effort || null,
@@ -1973,13 +2056,19 @@ export async function handle(req, res, url) {
           turn = turnResult.turn || turnResult;
         }
       } catch (error) {
-        ownedRunningThreads.delete(forkedThread.id);
-        throw error;
+        sendError = error.message || "Failed to send edited message";
+        sendUnconfirmed = writeResultUnconfirmed(error);
+        if (sendUnconfirmed) {
+          unconfirmedForkWrites.add(forkedThread.id);
+          ownedRunningThreads.add(forkedThread.id);
+        } else {
+          ownedRunningThreads.delete(forkedThread.id);
+        }
       } finally {
         scheduleThreadUnsubscribe(forkedThread.id, 2000);
       }
       scheduleThreadSync("thread-forked", 100);
-      return json(res, 201, { thread: forkedThread, turn });
+      return json(res, 201, { thread: forkedThread, turn, ...(sendError ? { sendError, sendUnconfirmed } : {}) });
     }
     if (req.method === "POST" && action === "stop") {
       await messageQueue.update(threadId, { action: "pause" });

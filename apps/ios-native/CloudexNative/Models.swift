@@ -786,8 +786,35 @@ struct TurnContent: Codable, Equatable {
     let filename: String?
     let mimeType: String?
     let url: String?
+    var hasUnsupportedInput: Bool = false
 
-    private enum CodingKeys: String, CodingKey { case type, text, value, path, name, filename, mimeType, url }
+    private enum CodingKeys: String, CodingKey {
+        case type, text, value, path, name, filename, mimeType, url, hasUnsupportedInput
+        case textElements = "text_elements"
+    }
+
+    var canResend: Bool {
+        guard !hasUnsupportedInput else { return false }
+        switch type?.lowercased() ?? "text" {
+        case "text", "input_text": return true
+        case "image", "input_image", "localimage", "file", "input_file", "document":
+            return !(path ?? url ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        default: return false
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encodeIfPresent(type, forKey: .type)
+        try values.encodeIfPresent(text, forKey: .text)
+        try values.encodeIfPresent(value, forKey: .value)
+        try values.encodeIfPresent(path, forKey: .path)
+        try values.encodeIfPresent(name, forKey: .name)
+        try values.encodeIfPresent(filename, forKey: .filename)
+        try values.encodeIfPresent(mimeType, forKey: .mimeType)
+        try values.encodeIfPresent(url, forKey: .url)
+        if hasUnsupportedInput { try values.encode(true, forKey: .hasUnsupportedInput) }
+    }
 }
 
 extension TurnContent {
@@ -805,6 +832,8 @@ extension TurnContent {
                   filename: try? values.decode(String.self, forKey: .filename),
                   mimeType: try? values.decode(String.self, forKey: .mimeType),
                   url: try? values.decode(String.self, forKey: .url))
+        hasUnsupportedInput = (try? values.decode(Bool.self, forKey: .hasUnsupportedInput)) == true
+            || !((try? values.decode([EmptyResponse].self, forKey: .textElements)) ?? []).isEmpty
     }
 }
 
@@ -986,6 +1015,25 @@ struct SubmittedTurn: Codable {
 
 struct ForkThreadResponse: Codable {
     let thread: CloudexThread
+    var turn: SubmittedTurn? = nil
+    var sendError: String? = nil
+    var sendUnconfirmed: Bool? = nil
+}
+
+struct SentMessageEditContext: Identifiable {
+    let id = UUID()
+    let sourceThreadID: String
+    let turnID: String
+    let connectionGeneration: Int
+    let openGeneration: Int
+    let client: APIClient
+    let projectCWD: String?
+    let message: ChatMessage
+}
+
+enum SentMessageEditResult {
+    case sent
+    case failed(message: String, fork: CloudexThread?, unconfirmed: Bool)
 }
 
 struct EmptyResponse: Codable {}

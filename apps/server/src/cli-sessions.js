@@ -1212,7 +1212,7 @@ export function watchCliSessions(onChange, { getObservedThreadIds = () => [] } =
   };
 }
 
-export async function readCliThreadById(threadId) {
+export async function readCliThreadById(threadId, options = {}) {
   const files = await findSessionFiles();
   const matches = files.filter((candidate) => threadIdFromPath(candidate) === threadId);
   if (matches.length === 0) {
@@ -1220,5 +1220,5 @@ export async function readCliThreadById(threadId) {
     error.status = 404;
     throw error;
   }
-  return readCliThread(matches);
+  return readCliThread(matches, options);
 }
