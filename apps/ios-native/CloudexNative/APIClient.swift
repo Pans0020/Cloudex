@@ -4,6 +4,7 @@ enum APIClientError: LocalizedError {
     case invalidServerURL
     case invalidResponse
     case server(status: Int, message: String)
+    case submission(message: String, unconfirmed: Bool)
 
     var errorDescription: String? {
         switch self {
@@ -13,6 +14,8 @@ enum APIClientError: LocalizedError {
             return "服务器返回了无法识别的响应"
         case let .server(status, message):
             return message.isEmpty ? "HTTP \(status)" : message
+        case let .submission(message, _):
+            return message
         }
     }
 }
@@ -148,6 +151,9 @@ struct APIClient {
         guard (200..<300).contains(http.statusCode) else {
             let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
             let message = object?["error"] as? String ?? String(data: data, encoding: .utf8) ?? ""
+            if let unconfirmed = object?["sendUnconfirmed"] as? Bool {
+                throw APIClientError.submission(message: message, unconfirmed: unconfirmed)
+            }
             throw APIClientError.server(status: http.statusCode, message: message)
         }
         do {

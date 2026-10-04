@@ -1,6 +1,107 @@
 import XCTest
 
 final class CloudexUITests: XCTestCase {
+    func testSentMessageEditorPreservesDraftAndResendsSelectedContent() {
+        let app = sentMessageEditingApp()
+        let composer = app.textViews["message-input"]
+        composer.tap(); composer.typeText("unfinished parent draft")
+        app.buttons["edit-message-ui-user-5"].tap()
+        let editor = app.textViews["sent-message-edit-input"]
+        XCTAssertTrue(editor.waitForExistence(timeout: 5))
+        XCTAssertEqual(editor.value as? String, "检查第 6 轮消息")
+        XCTAssertTrue(app.staticTexts["原消息图片.png"].exists)
+        snapshot("sent-message-editor-prefilled")
+        app.buttons["sent-message-edit-cancel"].tap()
+        XCTAssertTrue(composer.waitForExistence(timeout: 5))
+        XCTAssertEqual(composer.value as? String, "unfinished parent draft")
+        XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "attachment-thumbnail").firstMatch.exists)
+
+        app.buttons["edit-message-ui-user-5"].tap()
+        XCTAssertTrue(editor.waitForExistence(timeout: 5))
+        replaceText(editor, with: "")
+        XCTAssertTrue(app.buttons["sent-message-edit-send"].isEnabled, "A retained attachment alone is valid input")
+        app.buttons["sent-message-edit-remove-attachment"].tap()
+        XCTAssertFalse(app.buttons["sent-message-edit-send"].isEnabled)
+        editor.typeText("revised question")
+        app.buttons["sent-message-edit-send"].tap()
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "修改后的回复：revised question")).firstMatch.waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "保留附件：0")).firstMatch.exists)
+        snapshot("sent-message-edited-branch")
+        app.navigationBars.buttons.firstMatch.tap()
+        XCTAssertTrue(app.buttons.containing(.staticText, identifier: "布局回归 CV").firstMatch.waitForExistence(timeout: 5))
+        app.buttons.containing(.staticText, identifier: "布局回归 CV").firstMatch.tap()
+        XCTAssertTrue(app.staticTexts["检查第 6 轮消息"].waitForExistence(timeout: 5))
+        XCTAssertEqual(composer.value as? String, "unfinished parent draft")
+    }
+
+    func testSentMessageEditRejectionKeepsTextAndAttachments() {
+        let app = sentMessageEditingApp(extraArguments: ["--ui-edit-message-reject-before-fork"])
+        app.buttons["edit-message-ui-user-5"].tap()
+        let editor = app.textViews["sent-message-edit-input"]
+        XCTAssertTrue(editor.waitForExistence(timeout: 5))
+        replaceText(editor, with: "keep revised text")
+        app.buttons["sent-message-edit-send"].tap()
+        XCTAssertTrue(app.staticTexts["sent-message-edit-error"].waitForExistence(timeout: 5))
+        XCTAssertEqual(editor.value as? String, "keep revised text")
+        XCTAssertTrue(app.staticTexts["原消息图片.png"].exists)
+        XCTAssertTrue(app.buttons["sent-message-edit-send"].isEnabled)
+        XCTAssertFalse(app.buttons["sent-message-edit-inspect-fork"].exists)
+        app.buttons["sent-message-edit-send"].tap()
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "修改后的回复：keep revised text")).firstMatch.waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "保留附件：1")).firstMatch.exists)
+    }
+
+    func testSentMessageEditRetryUsesCreatedFork() {
+        let app = sentMessageEditingApp(extraArguments: ["--ui-edit-message-fail-once"])
+        app.buttons["edit-message-ui-user-5"].tap()
+        let editor = app.textViews["sent-message-edit-input"]
+        XCTAssertTrue(editor.waitForExistence(timeout: 5))
+        replaceText(editor, with: "retry the same branch")
+        app.buttons["sent-message-edit-send"].tap()
+        XCTAssertTrue(app.staticTexts["sent-message-edit-error"].waitForExistence(timeout: 5))
+        XCTAssertEqual(editor.value as? String, "retry the same branch")
+        XCTAssertTrue(app.buttons["sent-message-edit-send"].isEnabled)
+        snapshot("sent-message-retry-preserved")
+        app.buttons["sent-message-edit-send"].tap()
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "修改后的回复：retry the same branch")).firstMatch.waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "保留附件：1")).firstMatch.exists)
+    }
+
+    func testUnconfirmedSentMessageEditRequiresHistoryCheck() {
+        let app = sentMessageEditingApp(extraArguments: ["--ui-edit-message-unconfirmed"])
+        app.buttons["edit-message-ui-user-5"].tap()
+        let editor = app.textViews["sent-message-edit-input"]
+        XCTAssertTrue(editor.waitForExistence(timeout: 5))
+        replaceText(editor, with: "check before retry")
+        app.buttons["sent-message-edit-send"].tap()
+        XCTAssertTrue(app.staticTexts["sent-message-edit-error"].waitForExistence(timeout: 5))
+        XCTAssertEqual(editor.value as? String, "check before retry")
+        XCTAssertFalse(app.buttons["sent-message-edit-send"].isEnabled)
+        XCTAssertTrue(app.buttons["sent-message-edit-inspect-fork"].isEnabled)
+        snapshot("sent-message-unconfirmed")
+        app.buttons["sent-message-edit-inspect-fork"].tap()
+        XCTAssertTrue(app.staticTexts["修改后的分支"].waitForExistence(timeout: 5))
+        XCTAssertFalse(editor.isHittable)
+    }
+
+    private func sentMessageEditingApp(extraArguments: [String] = []) -> XCUIApplication {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--ui-fixture", "--ui-edit-message-fixture", "-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN"] + extraArguments
+        app.launch()
+        XCTAssertTrue(app.buttons["展开CV"].waitForExistence(timeout: 10))
+        app.buttons["展开CV"].tap()
+        app.buttons.containing(.staticText, identifier: "布局回归 CV").firstMatch.tap()
+        XCTAssertTrue(app.buttons["edit-message-ui-user-5"].waitForExistence(timeout: 10))
+        return app
+    }
+
+    private func replaceText(_ element: XCUIElement, with text: String) {
+        element.tap()
+        let current = element.value as? String ?? ""
+        element.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: current.count) + text)
+    }
+
     func testSubagentsStayInsideParentAndOpenReadOnlyHistory() {
         continueAfterFailure = false
         let app = XCUIApplication()
@@ -33,6 +134,7 @@ final class CloudexUITests: XCTestCase {
         XCTAssertFalse(app.textViews["message-input"].isHittable)
         XCTAssertFalse(app.buttons["发送消息"].isHittable)
         XCTAssertFalse(app.buttons["切换模型和推理强度"].isHittable)
+        XCTAssertFalse(app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "edit-message-")).allElementsBoundByIndex.contains { $0.isHittable })
         XCTAssertTrue(app.staticTexts["子智能体思考摘要"].isHittable)
         XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "pwd")).allElementsBoundByIndex.contains { $0.isHittable })
         snapshot("subagents-child-readonly-history")

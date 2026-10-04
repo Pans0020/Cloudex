@@ -91,7 +91,10 @@ struct CloudexRootView: View {
                 selectProjectContainingThread(request.threadID)
                 iPadPreferredCompactColumn = .detail
             } else {
-                navigationPath.append(request.threadID)
+                // The shared model has already switched to this fork. Replace
+                // the old route so Back returns to the conversation directory.
+                if navigationPath.isEmpty { navigationPath.append(request.threadID) }
+                else { navigationPath[navigationPath.count - 1] = request.threadID }
             }
             viewModel.clearThreadNavigationRequest()
         }

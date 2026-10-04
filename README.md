@@ -25,6 +25,7 @@ The access path is `Codex CLI ⇄ local server ⇄ iOS app`. The server runs onl
 
 - Create, resume (steer), stop, and archive Codex tasks
 - Model and reasoning effort selection, with task forking
+- Edit and resend sent Codex messages into a new branch, preserving the original conversation and selected attachments
 - SSE live streaming of replies, task status, and errors
 - Command execution approvals: allow, deny, or "allow for this session" from the app or a lock-screen notification
 

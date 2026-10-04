@@ -264,3 +264,21 @@
 "暂无子智能体" = "No subagents";
 "查看子智能体的状态与活动过程" = "View subagent status and activity";
 "子智能体开始活动后，过程会显示在这里。" = "Activity will appear here when this subagent starts.";
+
+"修改并重新发送" = "Edit and resend";
+"修改消息内容" = "Edit message content";
+"会从这条消息重新开始，原对话保留。" = "Continue from this message in a new conversation. The original is kept.";
+"附件" = "Attachments";
+"移除附件：%@" = "Remove attachment: %@";
+"重新发送" = "Resend";
+"查看分支" = "View new conversation";
+"请先核对分支中的消息，避免重复发送。" = "Check messages in the new conversation before sending again.";
+"消息或附件不能为空" = "Enter a message or keep an attachment.";
+"部分附件无法重新发送，请移除后再试" = "Some attachments cannot be resent. Remove them and try again.";
+"对话或连接已变化，请回到原会话后重新修改" = "The conversation or connection changed. Return to the original conversation to edit.";
+"对话或连接已变化，新分支已保存在原服务器" = "The conversation or connection changed. The new conversation is saved on the original server.";
+"发送结果尚未确认，请查看分支核对，避免重复发送" = "Delivery is unconfirmed. Check the new conversation before resending.";
+"对话或连接已变化，请在原服务器核对发送结果" = "The conversation or connection changed. Check delivery on the original server.";
+"发送结果尚未确认，请检查会话列表后再决定是否重发" = "Delivery is unconfirmed. Check your conversations before deciding to resend.";
+"已从修改后的消息继续对话" = "Continued from the edited message";
+"已分叉对话" = "Created a new conversation";

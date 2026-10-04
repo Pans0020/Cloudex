@@ -151,6 +151,7 @@ struct ContentView: View {
     @State private var taskTimerHidden = true
     @State private var composerFocused = false
     @State private var showingSubagents = false
+    @State private var editingUserMessage: SentMessageEditContext?
 
     init(
         expectedThreadID: String? = nil,
@@ -252,6 +253,9 @@ struct ContentView: View {
             return ["http", "https", "mailto"].contains(url.scheme ?? "") ? .systemAction : .discarded
         })
         .sheet(item: $filePreview) { FilePreviewSheet(request: $0) }
+        .sheet(item: $editingUserMessage) { context in
+            SentMessageEditor(viewModel: viewModel, context: context)
+        }
         .sheet(isPresented: $showingSubagents) {
             SubagentDirectoryView(parent: viewModel)
         }
@@ -480,10 +484,15 @@ struct ContentView: View {
                 MessageBubble(
                     viewModel: viewModel, client: viewModel.client, isActive: viewModel.active,
                     allowsConversationActions: !viewModel.isReadOnlyConversation,
+                    allowsMessageEdit: viewModel.canEditUserMessage(message),
                     message: message, preferences: viewModel.chatDetails,
                     highlightQuery: messageTextHighlight?.messageID == message.id ? messageTextHighlight?.query : nil,
                     collapseRequest: $collapseProcessRequest,
                     onQuickFill: { text in viewModel.draft = text; composerFocused = true },
+                    onEdit: {
+                        composerFocused = false
+                        editingUserMessage = viewModel.sentMessageEditContext(message)
+                    },
                     onFork: { await viewModel.forkAssistantMessage(message) },
                     onProcessInteraction: { _ in chatListActions.preserveReadingPosition() },
                     onFloatingProcessCollapse: { chatListActions.preserveReadingPosition() },
@@ -1497,17 +1506,138 @@ private struct SubagentConversationView: View {
     }
 }
 
+private struct SentMessageEditor: View {
+    @ObservedObject var viewModel: AppViewModel
+    let context: SentMessageEditContext
+    @Environment(\.dismiss) private var dismiss
+    @State private var text: String
+    @State private var attachments: [MessageAttachment]
+    @State private var isSubmitting = false
+    @State private var error: String?
+    @State private var retryFork: CloudexThread?
+    @State private var unconfirmed = false
+    @FocusState private var focused: Bool
+
+    init(viewModel: AppViewModel, context: SentMessageEditContext) {
+        self.viewModel = viewModel
+        self.context = context
+        _text = State(initialValue: context.message.text)
+        _attachments = State(initialValue: context.message.attachments)
+    }
+
+    private var canSend: Bool {
+        !isSubmitting && !unconfirmed
+            && (!text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty)
+            && attachments.allSatisfy { !($0.path ?? "").isEmpty }
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextEditor(text: $text)
+                        .frame(minHeight: 160)
+                        .focused($focused)
+                        .disabled(isSubmitting || unconfirmed)
+                        .accessibilityLabel(cloudexLocalized("修改消息内容"))
+                        .accessibilityIdentifier("sent-message-edit-input")
+                } footer: {
+                    Text(cloudexLocalized("会从这条消息重新开始，原对话保留。"))
+                }
+                if !attachments.isEmpty {
+                    Section(cloudexLocalized("附件")) {
+                        ForEach(attachments) { attachment in
+                            HStack(spacing: 10) {
+                                Image(systemName: attachment.systemImage).foregroundStyle(.secondary)
+                                Text(attachment.name).lineLimit(2)
+                                Spacer()
+                                Button {
+                                    attachments.removeAll { $0.id == attachment.id }
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(isSubmitting || unconfirmed)
+                                .accessibilityLabel(cloudexLocalized("移除附件：%@", attachment.name))
+                                .accessibilityIdentifier("sent-message-edit-remove-attachment")
+                            }
+                        }
+                    }
+                }
+                if let error {
+                    Section {
+                        Text(error).foregroundStyle(.red)
+                            .accessibilityIdentifier("sent-message-edit-error")
+                        if unconfirmed {
+                            Text(cloudexLocalized("请先核对分支中的消息，避免重复发送。"))
+                                .foregroundStyle(.secondary)
+                        }
+                        if unconfirmed, let retryFork {
+                            Button(cloudexLocalized("查看分支")) {
+                                focused = false
+                                viewModel.inspectEditedFork(retryFork, context: context,
+                                    replacement: text, attachments: attachments)
+                                dismiss()
+                            }
+                            .accessibilityIdentifier("sent-message-edit-inspect-fork")
+                        }
+                    }
+                }
+            }
+            .navigationTitle(cloudexLocalized("修改并重新发送"))
+            .navigationBarTitleDisplayMode(.inline)
+            .accessibilityIdentifier("sent-message-editor")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(cloudexLocalized("取消")) { dismiss() }
+                        .disabled(isSubmitting)
+                        .accessibilityIdentifier("sent-message-edit-cancel")
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button {
+                        guard canSend else { return }
+                        focused = false
+                        isSubmitting = true
+                        error = nil
+                        Task {
+                            let result = await viewModel.editUserMessage(context, replacement: text,
+                                attachments: attachments, retryFork: retryFork)
+                            isSubmitting = false
+                            switch result {
+                            case .sent: dismiss()
+                            case let .failed(message, fork, unknown):
+                                error = message
+                                retryFork = fork
+                                unconfirmed = unknown
+                            }
+                        }
+                    } label: {
+                        if isSubmitting { ProgressView().controlSize(.small) }
+                        else { Text(cloudexLocalized("重新发送")) }
+                    }
+                    .disabled(!canSend)
+                    .accessibilityIdentifier("sent-message-edit-send")
+                }
+            }
+            .interactiveDismissDisabled(isSubmitting)
+            .task { focused = true }
+        }
+    }
+}
+
 private struct MessageBubble: View, Equatable {
     // Used for user actions only; unrelated model publications must not invalidate every row.
     let viewModel: AppViewModel
     let client: APIClient
     let isActive: Bool
     let allowsConversationActions: Bool
+    let allowsMessageEdit: Bool
     let message: ChatMessage
     let preferences: ChatDetailPreferences
     let highlightQuery: String?
     @Binding var collapseRequest: Int
     let onQuickFill: (String) -> Void
+    let onEdit: () -> Void
     let onFork: () async -> Bool
     let onProcessInteraction: (Bool) -> Void
     let onFloatingProcessCollapse: () -> Void
@@ -1519,6 +1649,7 @@ private struct MessageBubble: View, Equatable {
         lhs.viewModel === rhs.viewModel && lhs.client.serverURL == rhs.client.serverURL
             && lhs.client.token == rhs.client.token && lhs.isActive == rhs.isActive
             && lhs.allowsConversationActions == rhs.allowsConversationActions
+            && lhs.allowsMessageEdit == rhs.allowsMessageEdit
             && lhs.message == rhs.message && lhs.highlightQuery == rhs.highlightQuery
             && lhs.preferences == rhs.preferences
             && lhs.collapseRequest == rhs.collapseRequest
@@ -1727,6 +1858,15 @@ private struct MessageBubble: View, Equatable {
                 .accessibilityLabel("复制消息")
 
                 if allowsConversationActions, message.role == .user {
+                    if allowsMessageEdit {
+                        Button(action: onEdit) {
+                            Image(systemName: "pencil").footerHitTarget()
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel(cloudexLocalized("修改并重新发送"))
+                        .accessibilityIdentifier("edit-message-\(message.id)")
+                    }
                     Button {
                         onQuickFill(message.text)
                     } label: {
